@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+venv3/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Файлы данных бота
+iris_data.json
+iris_bot.log
+backups/
+*.log
+
+# Конфиденциальные данные
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Тесты и отладка
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Другое
+*.db
+*.sqlite3
+*.pid
+*.lock
