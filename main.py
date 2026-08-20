@@ -4,12 +4,14 @@
 import re
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
 import random
 import signal
 import sys
+import textwrap
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -17,6 +19,14 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Set
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+    ImageFilter = None
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
@@ -29,6 +39,15 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# Force UTF-8 output for terminals with non-UTF locales (common on Linux servers)
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
 # ==================== Кэширование ====================
 
@@ -106,8 +125,8 @@ if MAIN_GROUP_ID:
     except ValueError:
         MAIN_GROUP_ID = None
 
-DATA_FILE = os.getenv('DATA_FILE', 'iris_data.json')
-LOG_FILE = os.getenv('LOG_FILE', 'iris_bot.log')
+DATA_FILE = os.getenv('DATA_FILE', 'valera_data.json')
+LOG_FILE = os.getenv('LOG_FILE', 'valera_bot.log')
 BACKUP_DIR = os.getenv('BACKUP_DIR', 'backups')
 DEFAULT_MUTE_MINUTES = int(os.getenv('DEFAULT_MUTE_MINUTES', '30'))
 DEFAULT_WARN_DAYS = int(os.getenv('DEFAULT_WARN_DAYS', '30'))
@@ -117,6 +136,7 @@ REPUTATION_DAILY_LIMIT = int(os.getenv('REPUTATION_DAILY_LIMIT', '15'))
 MUTE_CHECK_INTERVAL = int(os.getenv('MUTE_CHECK_INTERVAL', '60'))
 VIP_RP_RANK = int(os.getenv('VIP_RP_RANK', '2'))
 AUTO_SAVE_INTERVAL = int(os.getenv('AUTO_SAVE_INTERVAL', '300'))
+MAX_TAG_LENGTH = int(os.getenv('MAX_TAG_LENGTH', '32'))
 ANTI_SPAM_ENABLED = os.getenv('ANTI_SPAM_ENABLED', 'true').lower() == 'true'
 
 Path(BACKUP_DIR).mkdir(exist_ok=True)
@@ -143,7 +163,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 print("=" * 60)
-print("🌸 Iris Bot v3.0 - Полная версия")
+print("🐻 Обкуренный Валера v3.0 - Полная версия")
 print("=" * 60)
 print(f"👑 Главный админ ID: {MAIN_ADMIN_ID}")
 print(f"🏠 Основная группа ID: {MAIN_GROUP_ID or 'не указана (статистика везде)'}")
@@ -256,17 +276,27 @@ anti_spam = AntiSpamSystem()
 
 class DataStorage:
     def __init__(self):
-        self.data: Dict[str, Any] = {
-            'users': {}, 'command_access': {}, 'personal_access': {},
-            'mutes': {}, 'closed_topics': {}, 'phrases': {},
-            'welcome_settings': {}, 'marriages': {}, 'isolation': {},
-            'games': {}, 'backups': [], 'chat_settings': {}, 'rules': {}, 'polls': {}
-        }
+        self.data: Dict[str, Any] = self._get_default_data()
         self._lock = asyncio.Lock()
         self._dirty = False
+        self._last_backup_ts = 0
+        self._last_save_time = 0.0
+        self._save_cooldown = 1.0
+        self._save_task: Optional[asyncio.Task] = None
+        self._chat_user_index: Dict[str, Dict[str, Dict[str, int]]] = {}
         import atexit
         atexit.register(self.save_sync)
         self.load()
+
+    @staticmethod
+    def _get_default_data() -> dict:
+        return {
+            'users': {}, 'command_access': {}, 'personal_access': {},
+            'mutes': {}, 'closed_topics': {}, 'phrases': {},
+            'welcome_settings': {}, 'marriages': {}, 'isolation': {},
+            'games': {}, 'backups': [], 'chat_settings': {}, 'rules': {}, 'polls': {},
+            'rank_names': {}, 'rank_emoji': {}
+        }
 
     @staticmethod
     def _create_default_user(uid: int) -> dict:
@@ -279,7 +309,7 @@ class DataStorage:
             'violations_count': 0, 'last_violation_time': 0, 'isolation': None,
             'activity': {}, 'ttt_games': 0, 'ttt_wins': 0, 'rps_games': 0,
             'rps_wins': 0, 'rps_current_streak': 0, 'rps_best_streak': 0,
-            'custom_name': '', 'total_mutes_survived': 0, 'first_seen': time.time(),
+            'custom_name': '', 'custom_tag': '', 'total_mutes_survived': 0, 'first_seen': time.time(),
             'last_seen': time.time(), 'night_messages': 0,
             'early_messages': 0, 'reports_sent': 0, 'phrases_added': 0,
             'marriage_count': 0, 'divorced_count': 0, 'proposals_sent': 0,
@@ -288,7 +318,7 @@ class DataStorage:
         }
 
     def load(self):
-        """Загружает данные из файла"""
+        """Стартовая загрузка без долгой нормализации всех пользователей."""
         try:
             if not os.path.exists(DATA_FILE):
                 return
@@ -296,70 +326,71 @@ class DataStorage:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 loaded = json.load(f)
 
-            # Просто заменяем данные
-            self.data = loaded
+            if isinstance(loaded, dict):
+                self.data = loaded
+            else:
+                self.data = self._get_default_data()
 
-            # === Миграция: старый формат users был плоским {uid: user_dict}.
-            # Новый формат — per-chat: {chat_id: {uid: user_dict}}.
-            # Определяем старый формат по тому, что значения верхнего уровня
-            # сами являются "плоскими" пользователями (есть ключ 'id' и НЕТ
-            # вложенных uid-ключей).
+            for key, default_value in self._get_default_data().items():
+                if isinstance(default_value, dict):
+                    self.data.setdefault(key, {})
+                elif isinstance(default_value, list):
+                    self.data.setdefault(key, [])
+                else:
+                    self.data.setdefault(key, default_value)
+
             users = self.data.get('users', {})
             legacy_chat_key = str(MAIN_GROUP_ID) if MAIN_GROUP_ID else 'legacy'
             is_old_format = False
             for k, v in users.items():
                 if isinstance(v, dict) and 'id' in v and 'rank' in v:
                     is_old_format = True
-                break
+                    break
             if is_old_format and users:
                 logger.info("Обнаружен старый формат данных пользователей — переношу в per-chat формат")
                 self.data['users'] = {legacy_chat_key: users}
-                users = self.data['users']
 
-            # Добавляем недостающие поля пользователям в каждом чате
-            default_user = self._create_default_user(0)
-            total_users = 0
-            for chat_id, chat_users in users.items():
-                if not isinstance(chat_users, dict):
-                    continue
-                for uid, user_data in chat_users.items():
-                    if not isinstance(user_data, dict):
-                        continue
-                    for field, default_value in default_user.items():
-                        if field not in user_data:
-                            user_data[field] = default_value
-                    user_data['id'] = int(uid)
-                    total_users += 1
-
-            logger.info(f"Загружено {total_users} пользователей в {len(users)} чат(ах)")
+            self._chat_user_index.clear()
+            logger.info(f"Загружены данные: {len(self.data.get('users', {}))} чат(ов)")
 
         except Exception as e:
             logger.error(f"Ошибка загрузки: {e}")
+            self.data = self._get_default_data()
 
     async def save(self):
-        """Сохраняет данные - С БЭКАПОМ"""
-        async with self._lock:
-            try:
-                # Создаём бэкап перед сохранением
+        """Сохраняет текущее состояние и не теряет изменения при частых вызовах."""
+        self._dirty = True
+        if self._save_task and not self._save_task.done():
+            return
+
+        self._save_task = asyncio.create_task(self._background_save())
+        await self._save_task
+
+    async def _background_save(self):
+        try:
+            async with self._lock:
                 if os.path.exists(DATA_FILE):
-                    backup_name = f"{BACKUP_DIR}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                    import shutil
-                    shutil.copy(DATA_FILE, backup_name)
+                    now_ts = time.time()
+                    if now_ts - self._last_backup_ts >= 300:
+                        backup_name = f"{BACKUP_DIR}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                        import shutil
+                        shutil.copy(DATA_FILE, backup_name)
+                        self._last_backup_ts = now_ts
+                        backups = sorted(Path(BACKUP_DIR).glob("backup_*.json"))
+                        for old_backup in backups[:-5]:
+                            old_backup.unlink()
 
-                    # Оставляем только последние 5 бэкапов
-                    backups = sorted(Path(BACKUP_DIR).glob("backup_*.json"))
-                    for old_backup in backups[:-5]:
-                        old_backup.unlink()
-
-                # Сохраняем данные
                 with open(DATA_FILE, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2, default=str)
 
+                self._last_save_time = time.monotonic()
                 self._dirty = False
                 logger.debug("Данные сохранены")
 
-            except Exception as e:
-                logger.error(f"Ошибка сохранения: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения: {e}")
+        finally:
+            self._save_task = None
 
     def save_sync(self):
         try:
@@ -381,6 +412,48 @@ class DataStorage:
             for gid in expired:
                 del self.data['games'][gid]
 
+    def invalidate_chat_user_index(self, chat_id: int):
+        self._chat_user_index.pop(str(chat_id), None)
+
+    def _rebuild_chat_user_index(self, chat_id: int) -> Dict[str, Dict[str, int]]:
+        chat_key = str(chat_id)
+        users = self.data.get('users', {}).get(chat_key, {})
+        index = {'username': {}, 'names': {}}
+
+        for uid_str, user_data in users.items():
+            if not isinstance(user_data, dict):
+                continue
+            uid = int(uid_str)
+            username = (user_data.get('username') or '').strip().lower()
+            if username:
+                index['username'][username] = uid
+
+            for field_name in ('custom_name', 'first_name'):
+                name = (user_data.get(field_name) or '').strip().lower()
+                if name:
+                    index['names'].setdefault(name, uid)
+
+        self._chat_user_index[chat_key] = index
+        return index
+
+    def get_user_by_username(self, chat_id: int, username: str) -> Optional[int]:
+        if not username:
+            return None
+        chat_key = str(chat_id)
+        index = self._chat_user_index.get(chat_key)
+        if index is None:
+            index = self._rebuild_chat_user_index(chat_id)
+        return index['username'].get(username.strip().lower())
+
+    def get_user_by_name(self, chat_id: int, name: str) -> Optional[int]:
+        if not name:
+            return None
+        chat_key = str(chat_id)
+        index = self._chat_user_index.get(chat_key)
+        if index is None:
+            index = self._rebuild_chat_user_index(chat_id)
+        return index['names'].get(name.strip().lower())
+
     def get_user(self, chat_id: int, uid: int, use_cache: bool = True) -> dict:
         chat_str, uid_str = str(chat_id), str(uid)
         cache_key = f"{chat_str}:{uid_str}"
@@ -396,8 +469,11 @@ class DataStorage:
         if uid_str not in self.data['users'][chat_str]:
             self.data['users'][chat_str][uid_str] = self._create_default_user(uid)
 
-        # Убеждаемся, что все поля есть
         user = self.data['users'][chat_str][uid_str]
+        if not isinstance(user, dict):
+            user = self._create_default_user(uid)
+            self.data['users'][chat_str][uid_str] = user
+
         default_fields = {
             'chats_activity': {},
             'night_messages': 0,
@@ -408,9 +484,19 @@ class DataStorage:
             'divorced_count': 0,
             'proposals_sent': 0,
             'proposals_rejected': 0,
-            'total_mutes_survived': 0
+            'total_mutes_survived': 0,
+            'custom_tag': '',
+            'custom_name': '',
+            'first_name': '',
+            'username': '',
+            'rank': 0,
+            'reputation': 0,
+            'warnings': [],
+            'awards': [],
+            'activity': {},
+            'isolation': None,
+            'marriage_partner': None
         }
-
         for field, default_value in default_fields.items():
             if field not in user:
                 user[field] = default_value
@@ -422,6 +508,7 @@ class DataStorage:
     def invalidate_user_cache(self, chat_id: int, uid: int):
         user_cache.invalidate(f"{chat_id}:{uid}")
         mention_cache.invalidate(f"mention_{chat_id}_{uid}")
+        self.invalidate_chat_user_index(chat_id)
 
     def update_user_from_message(self, msg: Message):
         if msg.from_user.is_bot:
@@ -500,25 +587,33 @@ RANK_EMOJI = {
     0: "👤",  # Обычный
     1: "🪪",  # Стажёр
     2: "👨‍👦",  # Папаша
-    3: "👨‍👧",  # Отчим
-    4: "👨‍👧‍👦",  # Батька
-    5: "👑",  # Батя
-    6: "⭐",  # Главный Отец
-    7: "💫",  # Заместитель
-    8: "🔥"  # Отец Нации
+    3: "👑",  # Батя
+    4: "⭐",  # Главный Отец
+    5: "🔥"  # Отец Нации
 }
 
 RANK_NAMES = {
     0: "Обычный",
     1: "Стажёр",
     2: "Папаша",
-    3: "Отчим",
-    4: "Батька",
-    5: "Батя",
-    6: "Главный Отец",
-    7: "Заместитель",
-    8: "Отец Нации"
+    3: "Батя",
+    4: "Главный Отец",
+    5: "Отец Нации"
 }
+
+MAX_RANK = 5
+
+
+def get_rank_name(chat_id: int, level: int) -> str:
+    """Возвращает название ранга с учётом кастомных настроек чата"""
+    custom = storage.data.get('rank_names', {}).get(str(chat_id), {})
+    return custom.get(str(level)) or RANK_NAMES.get(level, "Обычный")
+
+
+def get_rank_emoji(chat_id: int, level: int) -> str:
+    """Возвращает эмодзи ранга с учётом кастомных настроек чата"""
+    custom = storage.data.get('rank_emoji', {}).get(str(chat_id), {})
+    return custom.get(str(level)) or RANK_EMOJI.get(level, "👤")
 
 
 # ==================== Вспомогательные функции ====================
@@ -528,9 +623,18 @@ def parse_time(s: str) -> int:
         return DEFAULT_MUTE_MINUTES
     s = s.lower().strip()
     total_minutes = 0
-    for pattern, multiplier in [(r'(\d+)\s*д', 1440), (r'(\d+)\s*ч', 60), (r'(\d+)\s*м(?!\w)', 1)]:
-        match = re.search(pattern, s)
-        if match:
+    # Тысячелетия, века, годы, месяцы, дни, часы, минуты со всеми падежами
+    for pattern, multiplier in [
+        (r'(\d+)\s*(?:тысячелети(?:й|и|е)?|тыс\.?(?!\w))', 525600000),  # тысячелетия
+        (r'(\d+)\s*(?:век(?:а|ов)?|в\.?(?!\w))', 52560000),  # века
+        (r'(\d+)\s*(?:год(?:а|ов)?|л(?:ет)?|г(?!\w))', 525600),  # годы, лет, г
+        (r'(\d+)\s*(?:месяц(?:а|ев)?|мес\.?(?!\w))', 43800),  # месяцы
+        (r'(\d+)\s*(?:дн?(?:и|ей)?|д(?!\w))', 1440),  # дни, день, дня, дней, д
+        (r'(\d+)\s*(?:ча?(?:с(?:а|ов)?)?|ч(?!\w))', 60),  # часы, час, часа, часов, ч
+        (r'(\d+)\s*(?:минут(?:ы|)?|минута|м(?!\w))', 1)   # минуты, минута, минут, м
+    ]:
+        matches = re.finditer(pattern, s)
+        for match in matches:
             total_minutes += int(match.group(1)) * multiplier
     if total_minutes > 0:
         return total_minutes
@@ -555,7 +659,9 @@ def mention(chat_id: int, user: Union[User, int, str]) -> str:
                 return cached
             u = storage.get_user(chat_id, user)
             username = u.get('username', '')
-            display = u.get('custom_name') or u.get('first_name') or username or f"ID:{user}"
+            base_display = u.get('custom_name') or u.get('first_name') or username or f"ID:{user}"
+            tag = (u.get('custom_tag') or '').strip()
+            display = f"{base_display} • {tag}" if tag else base_display
             if username:
                 result = f'<a href="https://t.me/{username}">{display}</a>'
             else:
@@ -568,9 +674,11 @@ def mention(chat_id: int, user: Union[User, int, str]) -> str:
 
 
 def get_display_name(chat_id: int, uid: int) -> str:
-    """Возвращает отображаемое имя пользователя (кастомное или реальное)"""
+    """Возвращает отображаемое имя пользователя (тег + кастомное или реальное имя)"""
     u = storage.get_user(chat_id, uid)
-    return u.get('custom_name') or u.get('first_name') or u.get('username') or f"ID:{uid}"
+    base = u.get('custom_name') or u.get('first_name') or u.get('username') or f"ID:{uid}"
+    tag = (u.get('custom_tag') or '').strip()
+    return f"{base} • {tag}" if tag else base
 
 
 async def get_target(msg: Message, arg: str = None) -> Optional[int]:
@@ -589,11 +697,9 @@ async def get_target(msg: Message, arg: str = None) -> Optional[int]:
     # Если это @username
     if arg.startswith('@'):
         username = arg[1:].lower()
-
-        # Сначала ищем в сохранённых пользователях
-        for uid, data in storage.data['users'].get(str(msg.chat.id), {}).items():
-            if data.get('username', '').lower() == username:
-                return int(uid)
+        uid = storage.get_user_by_username(msg.chat.id, username)
+        if uid is not None:
+            return uid
 
         # Если не нашли в базе - пробуем найти через API Telegram
         try:
@@ -614,9 +720,9 @@ async def get_target(msg: Message, arg: str = None) -> Optional[int]:
 
     # Поиск по имени (только в сохранённых)
     search = arg.lower()
-    for uid, data in storage.data['users'].get(str(msg.chat.id), {}).items():
-        if data.get('custom_name', '').lower() == search or data.get('first_name', '').lower() == search:
-            return int(uid)
+    uid = storage.get_user_by_name(msg.chat.id, search)
+    if uid is not None:
+        return uid
 
     return None
 
@@ -690,22 +796,25 @@ def create_graph(chat_id: int, uid: int, days: int = 7) -> Optional[BytesIO]:
         reps.append(act.get(ds, {}).get('reputation', 0))
     try:
         plt.style.use('dark_background')
-        fig, ax1 = plt.subplots(figsize=(10, 5), facecolor='#1e1e1e')
-        ax1.bar(dates, msgs, alpha=0.7, color='#7289DA')
-        ax1.set_ylabel('Сообщения', color='#7289DA')
-        ax1.tick_params(axis='y', labelcolor='#7289DA')
-        ax1.tick_params(axis='x', colors='white', rotation=45)
+        fig, ax1 = plt.subplots(figsize=(10, 5), facecolor='#1a170d')
+        ax1.set_facecolor('#1a170d')
+        ax1.plot(dates, msgs, color='#ebaa47', linewidth=2.5, marker='o', markersize=6, label='Сообщения')
+        ax1.fill_between(dates, msgs, color='#604e29', alpha=0.4)
+        ax1.set_ylabel('Сообщения', color='#ebaa47')
+        ax1.tick_params(axis='y', labelcolor='#ebaa47')
+        ax1.tick_params(axis='x', colors='#ebaa47', rotation=45)
         ax2 = ax1.twinx()
-        ax2.plot(dates, reps, color='#FFD700', linewidth=2, marker='o')
-        ax2.set_ylabel('Репутация', color='#FFD700')
-        ax2.tick_params(axis='y', labelcolor='#FFD700')
+        ax2.plot(dates, reps, color='#604e29', linewidth=2.5, marker='o', markersize=6, label='Репутация')
+        ax2.set_ylabel('Репутация', color='#604e29')
+        ax2.tick_params(axis='y', labelcolor='#604e29')
         ax1.set_ylim(bottom=0)
         ax2.set_ylim(bottom=0)
+        ax1.grid(True, color='#604e29', alpha=0.2)
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m'))
-        plt.title(f'Активность: {get_display_name(chat_id, uid)}', color='white', fontsize=14)
+        plt.title(f'Активность: {get_display_name(chat_id, uid)}', color='#ebaa47', fontsize=14)
         plt.tight_layout()
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1e1e1e')
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a170d')
         buf.seek(0)
         plt.close()
         return buf
@@ -735,181 +844,182 @@ async def get_user_status(uid: int, user_data: dict) -> str:
 
 # ==================== РП-команды ====================
 
-RP = {
-    # Существующие
-    'обнять': ('обнял(а)', '🤗'),
-    'поцеловать': ('поцеловал(а)', '💋'),
-    'ударить': ('ударил(а)', '👊'),
-    'убить': ('убил(а)', '💀'),
-    'пнуть': ('пнул(а)', '🦶'),
-    'укусить': ('укусил(а)', '🦷'),
-    'лизнуть': ('лизнул(а)', '👅'),
-    'погладить': ('погладил(а)', '🖐️'),
-    'ущипнуть': ('ущипнул(а)', '👌'),
-    'шлёпнуть': ('шлёпнул(а)', '✋'),
-    'дать пять': ('дал(а) пять', '✋'),
-    'извиниться': ('извинился(ась) перед', '🙏'),
-    'похвалить': ('похвалил(а)', '👏'),
-    'поздравить': ('поздравил(а)', '🎉'),
-    'испугать': ('испугал(а)', '😱'),
-    'прижать': ('прижал(а)', '🤜'),
-    'потрогать': ('потрогал(а)', '👆'),
-    'пожать руку': ('пожал(а) руку', '🤝'),
-    'понюхать': ('понюхал(а)', '👃'),
-    'покормить': ('покормил(а)', '🍽️'),
-    'сжечь': ('сжёг(жгла)', '🔥'),
-    'расстрелять': ('расстрелял(а)', '🔫'),
-    'отравить': ('отравил(а)', '☠️'),
-    'послать нахуй': ('послал(а) нахуй', '🖕'),
-    'пригласить на чаёк': ('пригласил(а) на чаёк', '☕'),
-    'выебать': ('выебал(а)', '🔞'),
-    'трахнуть': ('трахнул(а)', '🔞'),
-    'кастрировать': ('кастрировал(а)', '🔪'),
-    'отдаться': ('отдался(лась)', '💫'),
+# Категоризированные обычные команды
+RP_FRIENDLY = {
+    'обнять': (['обнял(а)', 'крепко обнял(а) в объятия'], '🤗'),
+    'поцеловать': (['поцеловал(а)', 'нежно поцеловал(а)'], '💋'),
+    'ударить': (['ударил(а)', 'отвесил(а) удар'], '👊'),
+    'убить': (['убил(а)', 'отправил(а) на тот свет'], '💀'),
+    'пнуть': (['пнул(а)', 'дал(а) пинка'], '🦶'),
+    'укусить': (['укусил(а)', 'цапнул(а) зубами'], '🦷'),
+    'лизнуть': (['лизнул(а)', 'провёл(а) языком по'], '👅'),
+    'погладить': (['погладил(а)', 'ласково погладил(а)'], '🖐️'),
+    'ущипнуть': (['ущипнул(а)', 'больно ущипнул(а)'], '👌'),
+    'шлёпнуть': (['шлёпнул(а)', 'отвесил(а) шлепок'], '✋'),
+    'дать пять': (['дал(а) пять', 'хлопнул(а) по ладони'], '✋'),
+    'извиниться': (['извинился(ась) перед', 'повинился(ась) перед'], '🙏'),
+    'похвалить': (['похвалил(а)', 'искренне похвалил(а)'], '👏'),
+    'поздравить': (['поздравил(а)', 'тепло поздравил(а)'], '🎉'),
+    'испугать': (['испугал(а)', 'внезапно напугал(а)'], '😱'),
+    'прижать': (['прижал(а)', 'крепко прижал(а) к себе'], '🤜'),
+    'потрогать': (['потрогал(а)', 'аккуратно потрогал(а)'], '👆'),
+    'пожать руку': (['пожал(а) руку', 'крепко пожал(а) руку'], '🤝'),
+    'понюхать': (['понюхал(а)', 'принюхался(лась) к'], '👃'),
+    'покормить': (['покормил(а)', 'с ложечки покормил(а)'], '🍽️'),
+    'сжечь': (['сжёг(жгла)', 'спалил(а) дотла'], '🔥'),
+    'расстрелять': (['расстрелял(а)', 'открыл(а) огонь по'], '🔫'),
+    'отравить': (['отравил(а)', 'подсыпал(а) яд', 'коварно отравил(а)'], '☠️'),
+    'послать нахуй': (['послал(а) нахуй', 'отправил(а) по известному адресу'], '🖕'),
+    'пригласить на чаёк': (['пригласил(а) на чаёк', 'позвал(а) на чашечку чая'], '☕'),
+    'выебать': (['выебал(а)', 'оттрахал(а)'], '🔞'),
+    'трахнуть': (['трахнул(а)', 'оттрахал(а)'], '🔞'),
+    'кастрировать': (['кастрировал(а)', 'лишил(а) достоинства'], '🔪'),
+    'отдаться': (['отдался(лась)', 'полностью отдался(лась)'], '💫'),
 
     # ===== НОВЫЕ КОМАНДЫ =====
 
     # Дружеские
-    'обнять крепко': ('крепко обнял(а)', '🫂'),
-    'поцеловать в щёку': ('поцеловал(а) в щёку', '😊'),
-    'поцеловать в лоб': ('поцеловал(а) в лоб', '😇'),
-    'пожать руку': ('пожал(а) руку', '🤝'),
-    'подмигнуть': ('подмигнул(а)', '😉'),
-    'помахать': ('помахал(а)', '👋'),
-    'улыбнуться': ('улыбнулся(ась)', '😊'),
-    'поддержать': ('поддержал(а)', '💪'),
-    'поблагодарить': ('поблагодарил(а)', '🙏'),
-    'похлопать': ('похлопал(а)', '👏'),
-    'ободрить': ('ободрил(а)', '🌟'),
+    'обнять крепко': (['крепко обнял(а)', 'сжал(а) в медвежьих объятиях'], '🫂'),
+    'поцеловать в щёку': (['поцеловал(а) в щёку', 'чмокнул(а) в щёчку'], '😊'),
+    'поцеловать в лоб': (['поцеловал(а) в лоб', 'нежно поцеловал(а) в лоб'], '😇'),
+    'подмигнуть': (['подмигнул(а)', 'хитро подмигнул(а)'], '😉'),
+    'помахать': (['помахал(а)', 'радостно помахал(а) рукой'], '👋'),
+    'улыбнуться': (['улыбнулся(ась)', 'тепло улыбнулся(ась)'], '😊'),
+    'поддержать': (['поддержал(а)', 'оказал(а) поддержку'], '💪'),
+    'поблагодарить': (['поблагодарил(а)', 'сказал(а) спасибо'], '🙏'),
+    'похлопать': (['похлопал(а)', 'зааплодировал(а)'], '👏'),
+    'ободрить': (['ободрил(а)', 'подбодрил(а)'], '🌟'),
 
     # Агрессивные
-    'дать леща': ('дал(а) леща', '👋'),
-    'дать подзатыльник': ('дал(а) подзатыльник', '🤕'),
-    'задушить': ('задушил(а)', '😤'),
-    'придушить': ('придушил(а)', '🤯'),
-    'избить': ('избил(а)', '👊'),
-    'покалечить': ('покалечил(а)', '🤕'),
-    'обезглавить': ('обезглавил(а)', '🗡️'),
-    'закопать': ('закопал(а)', '⚰️'),
-    'утопить': ('утопил(а)', '🌊'),
-    'повесить': ('повесил(а)', '🪢'),
-    'запытать': ('запытал(а)', '😈'),
-    'растоптать': ('растоптал(а)', '👣'),
-    'раздавить': ('раздавил(а)', '🔨'),
-    'прибить': ('прибил(а)', '🔨'),
-    'зарезать': ('зарезал(а)', '🔪'),
+    'дать леща': (['дал(а) леща', 'отвесил(а) знатного леща'], '👋'),
+    'дать подзатыльник': (['дал(а) подзатыльник', 'отвесил(а) подзатыльник'], '🤕'),
+    'задушить': (['задушил(а)', 'сжал(а) горло'], '😤'),
+    'придушить': (['придушил(а)', 'чуть придушил(а)'], '🤯'),
+    'избить': (['избил(а)', 'жестоко избил(а)'], '👊'),
+    'покалечить': (['покалечил(а)', 'нанёс(ла) увечья'], '🤕'),
+    'обезглавить': (['обезглавил(а)', 'снёс(ла) голову'], '🗡️'),
+    'закопать': (['закопал(а)', 'зарыл(а) в землю'], '⚰️'),
+    'утопить': (['утопил(а)', 'утащил(а) на дно'], '🌊'),
+    'повесить': (['повесил(а)', 'вздёрнул(а) на виселице'], '🪢'),
+    'запытать': (['запытал(а)', 'замучил(а) пытками'], '😈'),
+    'растоптать': (['растоптал(а)', 'втоптал(а) в грязь'], '👣'),
+    'раздавить': (['раздавил(а)', 'расплющил(а)'], '🔨'),
+    'прибить': (['прибил(а)', 'приколотил(а)'], '🔨'),
+    'зарезать': (['зарезал(а)', 'пустил(а) под нож'], '🔪'),
 
     # Шуточные
-    'потроллить': ('потроллил(а)', '😏'),
-    'затроллить': ('затроллил(а)', '🤪'),
-    'подколоть': ('подколол(а)', '😜'),
-    'разыграть': ('разыграл(а)', '🎭'),
-    'напугать': ('напугал(а)', '👻'),
-    'рассмешить': ('рассмешил(а)', '😂'),
-    'удивить': ('удивид(а)', '😲'),
-    'заинтриговать': ('заинтриговал(а)', '🤔'),
-    'смутить': ('смутил(а)', '😳'),
-    'покраснеть': ('покраснел(а) от', '😊'),
+    'потроллить': (['потроллил(а)', 'знатно потроллил(а)'], '😏'),
+    'затроллить': (['затроллил(а)', 'жёстко затроллил(а)'], '🤪'),
+    'подколоть': (['подколол(а)', 'вставил(а) шпильку'], '😜'),
+    'разыграть': (['разыграл(а)', 'устроил(а) розыгрыш над'], '🎭'),
+    'напугать': (['напугал(а)', 'до смерти напугал(а)'], '👻'),
+    'рассмешить': (['рассмешил(а)', 'довёл(а) до слёз со смеху'], '😂'),
+    'удивить': (['удивил(а)', 'поразил(а)'], '😲'),
+    'заинтриговать': (['заинтриговал(а)', 'заинтересовал(а)'], '🤔'),
+    'смутить': (['смутил(а)', 'вогнал(а) в краску'], '😳'),
+    'покраснеть': (['покраснел(а) от', 'залился(лась) краской от'], '😊'),
 
     # Забота
-    'угостить': ('угостил(а)', '🍕'),
-    'накормить': ('накормил(а)', '🍜'),
-    'напоить': ('напоил(а)', '🥤'),
-    'согреть': ('согрел(а)', '🔥'),
-    'укрыть': ('укрыл(а)', '🛌'),
-    'полечить': ('полечил(а)', '💊'),
-    'защитить': ('защитил(а)', '🛡️'),
-    'спасти': ('спас(ла)', '🦸'),
-    'помочь': ('помог(ла)', '🤝'),
-    'успокоить': ('успокоил(а)', '😌'),
+    'угостить': (['угостил(а)', 'поделился(лась) угощением с'], '🍕'),
+    'накормить': (['накормил(а)', 'сытно накормил(а)'], '🍜'),
+    'напоить': (['напоил(а)', 'налил(а) напиток'], '🥤'),
+    'согреть': (['согрел(а)', 'укутал(а) в тепло'], '🔥'),
+    'укрыть': (['укрыл(а)', 'заботливо укрыл(а) одеялом'], '🛌'),
+    'полечить': (['полечил(а)', 'оказал(а) первую помощь'], '💊'),
+    'защитить': (['защитил(а)', 'встал(а) на защиту'], '🛡️'),
+    'спасти': (['спас(ла)', 'вытащил(а) из беды'], '🦸'),
+    'помочь': (['помог(ла)', 'протянул(а) руку помощи'], '🤝'),
+    'успокоить': (['успокоил(а)', 'унял(а) тревогу'], '😌'),
 
     # Странные
-    'загипнотизировать': ('загипнотизировал(а)', '🌀'),
-    'заколдовать': ('заколдовал(а)', '🪄'),
-    'проклясть': ('проклял(а)', '🧙'),
-    'благословить': ('благословил(а)', '✝️'),
-    'крестить': ('крестил(а)', '⛪'),
-    'похитить': ('похитил(а)', '🕵️'),
-    'украсть': ('украл(а)', '🥷'),
-    'обокрасть': ('обокрал(а)', '💰'),
-    'завербовать': ('завербовал(а)', '🕴️'),
-    'заблокировать': ('заблокировал(а)', '🚫'),
+    'загипнотизировать': (['загипнотизировал(а)', 'ввёл(а) в транс'], '🌀'),
+    'заколдовать': (['заколдовал(а)', 'наложил(а) чары на'], '🪄'),
+    'проклясть': (['проклял(а)', 'наложил(а) проклятие на'], '🧙'),
+    'благословить': (['благословил(а)', 'даровал(а) благословение'], '✝️'),
+    'крестить': (['крестил(а)', 'провёл(а) обряд крещения над'], '⛪'),
+    'похитить': (['похитил(а)', 'выкрал(а)'], '🕵️'),
+    'украсть': (['украл(а)', 'стащил(а)'], '🥷'),
+    'обокрасть': (['обокрал(а)', 'очистил(а) карманы'], '💰'),
+    'завербовать': (['завербовал(а)', 'переманил(а) на свою сторону'], '🕴️'),
+    'заблокировать': (['заблокировал(а)', 'внёс(ла) в чёрный список'], '🚫'),
 }
 
 # Дополнительные VIP команды (ранг 2+)
 VIP_RP = {
     # Существующие
-    'связать': ('связал(а)', '🪢'),
-    'заставить': ('заставил(а)', '⚠️'),
-    'повесить': ('повесил(а)', '🪢'),
-    'уничтожить': ('уничтожил(а)', '💥'),
-    'продать': ('продал(а)', '💰'),
-    'взорвать': ('взорвал(а)', '💣'),
-    'засосать': ('засосал(а)', '💋'),
-    'унизить': ('унизил(а)', '😤'),
-    'арестовать': ('арестовал(а)', '🚔'),
-    'наорать': ('наорал(а) на', '🗣️'),
+    'связать': (['связал(а)', 'скрутил(а)'], '🪢'),
+    'заставить': (['заставил(а)', 'принудил(а)'], '⚠️'),
+    'повесить': (['повесил(а)', 'вздёрнул(а) на виселице'], '🪢'),
+    'уничтожить': (['уничтожил(а)', 'стёр(ла) с лица земли'], '💥'),
+    'продать': (['продал(а)', 'сбыл(а) с рук'], '💰'),
+    'взорвать': (['взорвал(а)', 'подорвал(а)'], '💣'),
+    'засосать': (['засосал(а)', 'впился(лась) поцелуем в'], '💋'),
+    'унизить': (['унизил(а)', 'растоптал(а) достоинство'], '😤'),
+    'арестовать': (['арестовал(а)', 'заковал(а) в наручники'], '🚔'),
+    'наорать': (['наорал(а) на', 'раскричался(лась) на'], '🗣️'),
 
     # ===== НОВЫЕ VIP КОМАНДЫ =====
-    'депортировать': ('депортировал(а)', '✈️'),
-    'казнить': ('казнил(а)', '⚰️'),
-    'пытать': ('пытал(а)', '🪚'),
-    'забанить': ('забанил(а)', '⛔'),
-    'разжаловать': ('разжаловал(а)', '📉'),
-    'кикнуть': ('кикнул(а)', '👢'),
-    'замутить': ('замутил(а)', '🔇'),
-    'обнулить': ('обнулил(а)', '0️⃣'),
-    'сжечь дотла': ('сжёг(жгла) дотла', '🔥'),
-    'расстрелять в упор': ('расстрелял(а) в упор', '🔫'),
-    'посадить в тюрьму': ('посадил(а) в тюрьму', '⛓️'),
-    'отправить в бан': ('отправил(а) в бан', '🚫'),
+    'депортировать': (['депортировал(а)', 'выслал(а) из страны'], '✈️'),
+    'казнить': (['казнил(а)', 'привёл(а) приговор в исполнение над'], '⚰️'),
+    'пытать': (['пытал(а)', 'устроил(а) допрос с пристрастием'], '🪚'),
+    'забанить': (['забанил(а)', 'выписал(а) бан'], '⛔'),
+    'разжаловать': (['разжаловал(а)', 'лишил(а) звания'], '📉'),
+    'кикнуть': (['кикнул(а)', 'вышвырнул(а) из чата'], '👢'),
+    'замутить': (['замутил(а)', 'заткнул(а) на время'], '🔇'),
+    'обнулить': (['обнулил(а)', 'стёр(ла) всю статистику'], '0️⃣'),
+    'сжечь дотла': (['сжёг(жгла) дотла', 'спалил(а) дотла без остатка'], '🔥'),
+    'расстрелять в упор': (['расстрелял(а) в упор', 'влепил(а) пулю в упор'], '🔫'),
+    'посадить в тюрьму': (['посадил(а) в тюрьму', 'упрятал(а) за решётку'], '⛓️'),
+    'отправить в бан': (['отправил(а) в бан', 'вышвырнул(а) в бан'], '🚫'),
 }
 
 # Дополнительные команды для влюблённых (только в браке)
 LOVE_RP = {
     # Существующие
-    'сделать большой подарок': ('сделал(а) большой подарок для', '🎁'),
-    'устроить сюрприз': ('устроил(а) сюрприз для', '🎊'),
-    'пригласить в клуб': ('пригласил(а) в клуб', '🪩'),
-    'поговорить по душам': ('поговорил(а) по душам с', '💬'),
-    'сходить в кино': ('сходил(а) в кино с', '🎬'),
-    'подарить конфеты': ('подарил(а) конфеты', '🍬'),
-    'сделать завтрак': ('сделал(а) завтрак для', '🍳'),
-    'пригласить погулять': ('пригласил(а) погулять', '🚶'),
+    'сделать большой подарок': (['сделал(а) большой подарок для', 'преподнёс(ла) роскошный подарок'], '🎁'),
+    'устроить сюрприз': (['устроил(а) сюрприз для', 'приготовил(а) сюрприз для'], '🎊'),
+    'пригласить в клуб': (['пригласил(а) в клуб', 'позвал(а) потанцевать в клуб'], '🪩'),
+    'поговорить по душам': (['поговорил(а) по душам с', 'открыл(а) душу'], '💬'),
+    'сходить в кино': (['сходил(а) в кино с', 'позвал(а) на сеанс в кино'], '🎬'),
+    'подарить конфеты': (['подарил(а) конфеты', 'угостил(а) сладостями'], '🍬'),
+    'сделать завтрак': (['сделал(а) завтрак для', 'приготовил(а) романтичный завтрак для'], '🍳'),
+    'пригласить погулять': (['пригласил(а) погулять', 'позвал(а) на прогулку'], '🚶'),
 
     # ===== НОВЫЕ LOVE КОМАНДЫ =====
-    'признаться в любви': ('признался(ась) в любви', '💌'),
-    'подарить цветы': ('подарил(а) цветы', '💐'),
-    'подарить кольцо': ('подарил(а) кольцо', '💍'),
-    'приготовить ужин': ('приготовил(а) ужин для', '🍝'),
-    'устроить свидание': ('устроил(а) свидание с', '🌹'),
-    'станцевать с': ('станцевал(а) с', '💃'),
-    'спеть для': ('спел(а) для', '🎵'),
-    'обнять нежно': ('нежно обнял(а)', '💕'),
-    'поцеловать страстно': ('страстно поцеловал(а)', '💋'),
-    'приласкать': ('приласкал(а)', '🥰'),
-    'заботиться о': ('заботится о', '🤱'),
-    'боготворить': ('боготворит', '🙇'),
-    'носить на руках': ('носит на руках', '👰'),
-    'сделать массаж': ('сделал(а) массаж', '💆'),
-    'подарить сердце': ('подарил(а) сердце', '❤️'),
-    'украсть сердечко': ('украл(а) сердечко у', '💘'),
-    'написать стих': ('написал(а) стих для', '📝'),
-    'посвятить песню': ('посвятил(а) песню', '🎶'),
+    'признаться в любви': (['признался(ась) в любви', 'открыл(а) сердце и признался(ась) в любви'], '💌'),
+    'подарить цветы': (['подарил(а) цветы', 'вручил(а) букет цветов'], '💐'),
+    'подарить кольцо': (['подарил(а) кольцо', 'надел(а) кольцо на палец'], '💍'),
+    'приготовить ужин': (['приготовил(а) ужин для', 'накрыл(а) романтичный стол для'], '🍝'),
+    'устроить свидание': (['устроил(а) свидание с', 'организовал(а) романтичное свидание с'], '🌹'),
+    'станцевать с': (['станцевал(а) с', 'закружил(а) в танце'], '💃'),
+    'спеть для': (['спел(а) для', 'исполнил(а) серенаду для'], '🎵'),
+    'обнять нежно': (['нежно обнял(а)', 'бережно заключил(а) в объятия'], '💕'),
+    'поцеловать страстно': (['страстно поцеловал(а)', 'впился(лась) в страстном поцелуе'], '💋'),
+    'приласкать': (['приласкал(а)', 'нежно приласкал(а)'], '🥰'),
+    'заботиться о': (['заботится о', 'трепетно заботится о'], '🤱'),
+    'боготворить': (['боготворит', 'не может надышаться на'], '🙇'),
+    'носить на руках': (['носит на руках', 'бережно носит на руках'], '👰'),
+    'сделать массаж': (['сделал(а) массаж', 'расслабляюще помассировал(а)'], '💆'),
+    'подарить сердце': (['подарил(а) сердце', 'отдал(а) своё сердце'], '❤️'),
+    'украсть сердечко': (['украл(а) сердечко у', 'похитил(а) сердце у'], '💘'),
+    'написать стих': (['написал(а) стих для', 'сочинил(а) стихотворение для'], '📝'),
+    'посвятить песню': (['посвятил(а) песню', 'написал(а) песню в честь'], '🎶'),
 }
 
 # Объединяем все команды
+RP = RP_FRIENDLY
 ALL_RP = {**RP, **VIP_RP, **LOVE_RP}
 
 
 async def rp_handler(msg: Message):
     if not msg.text:
         return
-    text = msg.text.lower()
+    raw_text = strip_command_prefix(msg.text)
+    text = raw_text.lower()
 
     for act in sorted(ALL_RP.keys(), key=len, reverse=True):
         if text.startswith(act):
-            parts = msg.text.split(maxsplit=2)
+            parts = raw_text.split(maxsplit=2)
 
             tid = None
 
@@ -930,7 +1040,8 @@ async def rp_handler(msg: Message):
             if tid == msg.from_user.id and act not in ['извиниться', 'поздравить']:
                 return await msg.answer("❌ Нельзя с собой")
 
-            action_text, emoji = ALL_RP[act]
+            action_text = random.choice(ALL_RP[act][0])
+            emoji = ALL_RP[act][1]
             save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
             await msg.answer(
@@ -948,6 +1059,9 @@ COMMANDS = {
     'кто ты': 'who_are_you',
     'кто админ': 'who_admin',
     'ранг': 'cmd_rank',
+    'ранги': 'cmd_ranks_list',
+    'название ранга': 'cmd_rank_rename',
+    'переранг': 'cmd_rank_rename',
     '.ид': 'cmd_id',
     'топ': 'cmd_top',
     'статистика чата': 'cmd_chat_stats',
@@ -995,6 +1109,7 @@ COMMANDS = {
     'статистика фраз': 'cmd_phrase_stats',
     'показать фразу': 'cmd_phrase_show',
     'приветствие': 'cmd_welcome',
+    'прощание': 'cmd_farewell',
     'прощание текст': 'cmd_farewell',
     'правила': 'cmd_rules',
     'добавитьправило': 'cmd_add_rule',
@@ -1012,30 +1127,37 @@ COMMANDS = {
     'ttt': 'cmd_ttt_menu',
     'погода': 'cmd_weather',
     'п': 'cmd_weather_short',
+    'шутка': 'cmd_random_joke',
     'опрос': 'cmd_poll',
-    'ирис': 'cmd_iris',
+    'валера': 'cmd_iris',
     'репорт': 'cmd_report',
     'ник': 'cmd_nick',
+    'погоняло': 'cmd_pogonialo',
     'антимодерация': 'cmd_anti_moderation',
-    '!антиспам': 'cmd_anti_spam',
+    'антиспам': 'cmd_anti_spam',
+    'пинг': 'cmd_ping_check',
+    'ping': 'cmd_ping_check',
     'общий сбор': 'cmd_ping',
     'бэкап': 'cmd_backup',
     'восстановить': 'cmd_restore',
-    '!дк': 'cmd_dk_set',
+    'дк': 'cmd_dk_set',
     '+дк': 'cmd_dk_enable',
     '-дк': 'cmd_dk_disable',
     '+лдк': 'cmd_ldk_add',
     '-лдк': 'cmd_ldk_rem',
-    '!перед': 'cmd_forward',
+    'дкм': 'cmd_dk_menu',
+    'перед': 'cmd_forward',
+    'помощь': 'cmd_help',
+    'help': 'cmd_help',
+    'инфо': 'cmd_help',
+    'info': 'cmd_help',
 }
 
 
 def strip_command_prefix(text: str) -> str:
-    """Удаляет префикс команды (!, ?, /) в начале строки"""
+    """Удаляет префикс команды (!) в начале строки"""
     text = text.strip()
-    if text and text[0] in ['!', '?', '/']:
-        if text.startswith('/') and ' ' not in text:
-            return text[1:]
+    if text and text[0] == '!':
         return text[1:] if text[1:2] != ' ' else text[1:].lstrip()
     return text
 
@@ -1051,14 +1173,390 @@ def match_command(text: str) -> tuple:
     return None, None
 
 
+def _quote_find_font(bold: bool, size: int):
+    """На Linux отдаёт приоритет шрифтам с кириллицей и безопасным fallback."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+
+    for path in candidates:
+        try:
+            font = ImageFont.truetype(path, size)
+            for sample in ("Привет", "Тест", "Hello", "Привет мир"):
+                try:
+                    bbox = font.getbbox(sample)
+                    if bbox is not None and bbox[2] > bbox[0]:
+                        return font
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
+
+
+def _quote_wrap_px(draw, text: str, font, max_width: float) -> List[str]:
+    """Переносит текст по словам, укладываясь в max_width пикселей (с разбивкой очень длинных слов)."""
+    words = text.split()
+    if not words:
+        return ['']
+
+    def hard_break(word):
+        parts, cur = [], ''
+        for ch in word:
+            trial = cur + ch
+            if draw.textlength(trial, font=font) <= max_width or not cur:
+                cur = trial
+            else:
+                parts.append(cur)
+                cur = ch
+        if cur:
+            parts.append(cur)
+        return parts
+
+    lines = []
+    current = words[0]
+    if draw.textlength(current, font=font) > max_width:
+        broken = hard_break(current)
+        lines.extend(broken[:-1])
+        current = broken[-1]
+
+    for w in words[1:]:
+        trial = current + ' ' + w
+        if draw.textlength(trial, font=font) <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            if draw.textlength(w, font=font) > max_width:
+                broken = hard_break(w)
+                lines.extend(broken[:-1])
+                current = broken[-1]
+            else:
+                current = w
+    lines.append(current)
+    return lines
+
+
+def _quote_bezier(p0, p1, p2, steps: int):
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
+        y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+        pts.append((x, y))
+    return pts
+
+
+@router.message(Command('start'))
+async def cmd_start(msg: Message):
+    storage.update_user_from_message(msg)
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    await msg.answer(
+        "🐻 <b>Добро пожаловать в Обкуренный Валера!</b>\n\n"
+        "Я помогаю с модерацией, статистикой, играми и шутками.\n\n"
+        "📌 Основные команды:\n"
+        "<code>!помощь</code> — все команды\n"
+        "<code>!кто я</code> — профиль\n"
+        "<code>!опрос</code> — быстрый опрос\n"
+        "<code>!погода</code> — погода\n\n"
+        "Напишите <code>!помощь</code>, чтобы посмотреть всё меню.")
+
+
+# ==================== Справка (блоки + кнопки) ====================
+
+HELP_SECTIONS = {
+    'info': ("📊 Инфо и статистика",
+             "📊 <b>Инфо и статистика</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "👤 <b>Профиль</b>\n"
+             "  <code>!кто я</code> — ваш профиль\n"
+             "  <code>!кто ты @user</code> — профиль пользователя\n"
+             "  <code>!кто админ</code> — список админов\n\n"
+             "🪜 <b>Ранги и активность</b>\n"
+             "  <code>!ранг</code> / <code>!ранги</code> — иерархия рангов\n"
+             "  <code>!топ</code> — топ активности\n"
+             "  <code>!топ день/неделя/месяц/год</code> — за период\n"
+             "  <code>!статистика</code> / <code>!статистика чата</code>\n\n"
+             "🎲 <b>Разное</b>\n"
+             "  <code>!опрос Вопрос? | Да | Нет</code>\n"
+             "  <code>!погода</code>, <code>!шутка</code>"),
+    'moderation': ("🛡️ Модерация",
+             "🛡️ <b>Модерация</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "🔇 <b>Ограничения</b>\n"
+             "  <code>!мут @user</code> / <code>!-мут @user</code> — ограничить доступ\n"
+             "  <code>!бан @user</code> / <code>!-бан @user</code> — заблокировать пользователя\n"
+             "  <code>!бан причина</code> или ответом на сообщение\n\n"
+             "🏷️ <b>Тег/погоняло</b>\n"
+             "  <code>!погоняло Крутой чел</code> — установить свой тег\n"
+             "  <code>!погоняло @user Крутой</code> — поставить тег администратору\n"
+             "  <code>!погоняло сбросить</code> — убрать тег\n"
+             "  <i>Лимит: до {MAX_TAG_LENGTH} символов</i>\n\n"
+             "⚠️ <b>Предупреждения</b>\n"
+             "  <code>!пред @user причина</code> — выдать предупреждение\n"
+             "  <code>!преды @user</code> — посмотреть активные предупреждения\n"
+             "  <code>!снятьпред @user</code> — снять предупреждение\n"
+             "  <code>!снятьпред @user 1</code> — снять только одно\n\n"
+             "🪜 <b>Ранги</b>\n"
+             "  <code>!повысить @user [ранг]</code> — выдать уровень\n"
+             "  <code>!понизить @user [ранг]</code> — понизить\n\n"
+             "🧹 <b>Чистка</b>\n"
+             "  <code>!очистить</code> — очистить чат\n"
+             "  <code>!-смс</code> — удалить сообщение (ответом)\n\n"
+             "💡 При ответе на сообщение многие команды работают без указания @user".format(MAX_TAG_LENGTH=MAX_TAG_LENGTH)),
+    'topics': ("📂 Топики и изоляция",
+             "📂 <b>Топики и изоляция</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "🗂️ <b>Топики</b>\n"
+             "  <code>!закрыть топик</code> — закрыть текущий топик\n"
+             "  <code>!закрыть топик 5</code> — закрыть для ранга 5+\n"
+             "  <code>!открыть топик</code> — открыть топик\n"
+             "  <code>!топики</code> — список закрытых топиков\n\n"
+             "🔒 <b>Изоляция</b>\n"
+             "  <code>!+изоляция @user 60 спам</code> — ограничить на 60 мин\n"
+             "  <code>!-изоляция @user</code> — снять изоляцию\n"
+             "  <code>!изоляция</code> — список изолированных\n\n"
+             "💡 Работает и по ответу на сообщение, и по @username"),
+    'awards': ("🏆 Награды и браки",
+             "🏆 <b>Награды и браки</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "🎖️ <b>Награды</b>\n"
+             "  <code>!наградить @user</code>\n"
+             "  <code>!снять награду @user</code>\n"
+             "  <code>!мои награды</code>\n"
+             "  <code>!топ наград</code>\n\n"
+             "💍 <b>Браки</b>\n"
+             "  <code>!брак @user</code> — предложение\n"
+             "  <code>!развод</code> — расторгнуть\n"
+             "  <code>!браки</code> — список пар"),
+    'games': ("🎮 Игры, РП, репутация",
+             "🎮 <b>Игры, РП, репутация</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "🕹️ <b>Игры</b>\n"
+             "  <code>!игра</code> — меню игр\n"
+             "  <code>!кнб</code> — камень-ножницы-бумага\n"
+             "  <code>!крестики нолики</code> — игра в крестики\n\n"
+             "🎭 <b>РП</b>\n"
+             "  <code>!рп</code> — полный список РП-команд\n\n"
+             "⭐ <b>Репутация</b>\n"
+             "  Ответьте на сообщение символом <code>+</code>\n"
+             "  Или напишите <code>спасибо</code>, <code>плюс</code>, <code>респект</code>\n\n"
+             "🧩 <b>Прочее</b>\n"
+             "  <code>!репорт</code> — сообщить о нарушении\n"
+             "  <code>!ник</code> — сменить никнейм"),
+    'settings': ("⚙️ Настройки и ДК",
+             "⚙️ <b>Настройки и ДК</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "🛠️ <b>Общие настройки</b>\n"
+             "  <code>!антимодерация</code> — включить/выключить анти-модерацию\n"
+             "  <code>!антиспам</code> — включить/выключить анти-спам\n\n"
+             "🔐 <b>Доступ к командам (ДК)</b>\n"
+             "  <code>!дк команда 0-5/откл</code> — задать уровень команды\n"
+             "  <code>!дк инфо</code> — показать текущие настройки\n"
+             "  <code>!+дк команда</code> / <code>!-дк команда</code> — включить/отключить\n"
+             "  <code>!+лдк команда @user</code> / <code>!-лдк команда @user</code> — персональный доступ\n\n"
+             "<i>Примеры: мут, бан, пред, варн, награда, брак, игра, статистика</i>"),
+    'admin': ("🛠️ Админ",
+             "🛠️ <b>Админ</b>\n"
+             "━━━━━━━━━━━━━━━\n\n"
+             "💾 <b>Данные</b>\n"
+             "  <code>!общий сбор</code> — общий список активности\n"
+             "  <code>!бэкап</code> — создать бэкап\n"
+             "  <code>!восстановить</code> — восстановить данные\n\n"
+             "👑 <b>Управление</b>\n"
+             "  <code>!перед @user</code> — переслать сообщение пользователю\n"
+             "  <code>!переранг 0-5 Название</code> — переименовать ранг\n\n"
+             "⚠️ Команды работают только при наличии нужных прав и ранга"),
+}
+
+
+def help_main_text() -> str:
+    total_cmds = len(set(COMMANDS.values()))
+    counter_line = f"📦 <b>{total_cmds} команд</b> в {len(HELP_SECTIONS)} разделах\n\n" if total_cmds else ""
+    return ("🐻 <b>ОБКУРЕННЫЙ ВАЛЕРА</b>\n\n"
+            "<i>Мощный и многофункциональный бот для управления чатом</i>\n\n"
+            f"{counter_line}"
+            "� <b>Основные категории:</b>\n"
+            "• <b>Инфо и статистика</b> — профиль, ранг, топ, статистика\n"
+            "• <b>Модерация</b> — мут, бан, предупреждения, чистка\n"
+            "• <b>Топики и изоляция</b> — закрытие топиков и изоляция\n"
+            "• <b>Награды и браки</b> — награды, браки, любовь\n"
+            "• <b>Фразы и приветствия</b> — автоответы и приветствия\n"
+            "• <b>Игры и РП</b> — игры, репутация, РП-команды\n"
+            "• <b>Настройки и ДК</b> — доступ к командам и права\n\n"
+            "👇 <b>Выберите раздел:</b>\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "💡 Все команды с префиксом <code>!</code>\n"
+            "📌 Примеры: <code>!кто я</code>, <code>!пред @user</code>, <code>!мут @user</code>\n"
+            "🧭 <b>Полезно знать:</b>\n"
+            "• Ответьте на сообщение и напишите команду\n"
+            "• Работают упоминания <code>@username</code>\n"
+            "• Поддерживаются разные падежи и сокращения\n"
+            "• Для перечня команд выберите нужный раздел ниже")
+
+
+def help_main_kb() -> InlineKeyboardMarkup:
+    keys = list(HELP_SECTIONS.keys())
+    rows = []
+    for i in range(0, len(keys), 2):
+        row = []
+        for k in keys[i:i + 2]:
+            row.append(InlineKeyboardButton(text=HELP_SECTIONS[k][0], callback_data=f"help_{k}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="help_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def help_section_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="help_back")]
+    ])
+
+
+@router.callback_query(F.data.startswith('help_'))
+async def help_callback(call: CallbackQuery):
+    try:
+        action = call.data.replace('help_', '', 1)
+        
+        if action == 'close':
+            try:
+                await call.message.delete()
+            except:
+                pass
+        elif action == 'back':
+            await call.message.edit_text(help_main_text(), reply_markup=help_main_kb())
+        elif action in HELP_SECTIONS:
+            await call.message.edit_text(HELP_SECTIONS[action][1], reply_markup=help_section_kb())
+        
+        await call.answer()
+    except Exception as e:
+        logger.error(f"help_callback ошибка: {e}", exc_info=True)
+        try:
+            await call.answer("❌ Ошибка", show_alert=True)
+        except:
+            pass
+
+
+@router.message(Command('помощь', prefix='!'))
+@router.message(Command('help', prefix='!'))
+@router.message(Command('инфо', prefix='!'))
+@router.message(Command('info', prefix='!'))
+async def cmd_help(msg: Message):
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    await msg.answer(help_main_text(), reply_markup=help_main_kb())
+
+
+@router.message(Command('рп', prefix='!'))
+async def cmd_rp_list(msg: Message):
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    
+    # Показываем главное меню РП с кнопками
+    txt = "🎭 <b>РП-команды</b>\n━━━━━━━━━━━━━━━\n"
+    txt += f"Всего команд: <b>{len(ALL_RP)}</b>\n\n"
+    txt += "Выбери раздел ниже 👇"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📌 Обычные ({len(RP)})", callback_data="rp_section:normal")],
+        [InlineKeyboardButton(text=f"⭐ ВИП ({len(VIP_RP)})", callback_data="rp_section:vip")],
+        [InlineKeyboardButton(text=f"💝 Влюблённые ({len(LOVE_RP)})", callback_data="rp_section:love")],
+    ])
+    
+    await msg.answer(txt, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rp_section:"))
+async def handle_rp_section(query: CallbackQuery):
+    section = query.data.split(":")[1]
+    rank = storage.get_user(query.message.chat.id, query.from_user.id).get('rank', 0)
+    married = bool(storage.get_user(query.message.chat.id, query.from_user.id).get('marriage_partner'))
+    
+    if section == "normal":
+        cmds = sorted(RP.keys())
+        title = "📌 <b>Обычные РП-команды</b>"
+        desc = "Доступны всем:"
+    elif section == "vip":
+        if rank < VIP_RP_RANK:
+            return await query.answer(f"❌ Нужен ранг {VIP_RP_RANK}+", show_alert=True)
+        cmds = sorted(VIP_RP.keys())
+        title = "⭐ <b>ВИП РП-команды</b>"
+        desc = f"Доступны с рангом {VIP_RP_RANK}+:"
+    elif section == "love":
+        if not married:
+            return await query.answer("❌ Доступны только в браке", show_alert=True)
+        cmds = sorted(LOVE_RP.keys())
+        title = "💝 <b>РП-команды для влюблённых</b>"
+        desc = "Доступны в браке:"
+    else:
+        return
+    
+    # Форматируем список команд построчно по 3-4 команды
+    txt = f"{title}\n━━━━━━━━━━━━━━━\n{desc}\n\n"
+    for i in range(0, len(cmds), 4):
+        line = ", ".join(f"<code>{c}</code>" for c in cmds[i:i+4])
+        txt += line + "\n"
+    
+    txt += "\n💡 Используй: <code>команда @user</code> или ответь на сообщение"
+    
+    # Клавиатура с кнопкой возврата
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="rp_menu")]
+    ])
+    
+    # Обновляем сообщение
+    await query.message.edit_text(txt, reply_markup=kb)
+    await query.answer()
+
+
+@router.callback_query(F.data == "rp_menu")
+async def handle_rp_menu(query: CallbackQuery):
+    """Возврат в главное меню РП"""
+    txt = "🎭 <b>РП-команды</b>\n━━━━━━━━━━━━━━━\n"
+    txt += f"Всего команд: <b>{len(ALL_RP)}</b>\n\n"
+    txt += "Выбери раздел ниже 👇"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📌 Обычные ({len(RP)})", callback_data="rp_section:normal")],
+        [InlineKeyboardButton(text=f"⭐ ВИП ({len(VIP_RP)})", callback_data="rp_section:vip")],
+        [InlineKeyboardButton(text=f"💝 Влюблённые ({len(LOVE_RP)})", callback_data="rp_section:love")],
+    ])
+    
+    await query.message.edit_text(txt, reply_markup=kb)
+    await query.answer()
+
+
 @router.message(F.text)
 async def main_text_handler(msg: Message):
     if not msg.text or msg.from_user.is_bot:
         return
 
-    main_chat = is_main_chat(msg.chat.id, msg.message_thread_id)
+    # *** ПРОВЕРКА РЕПУТАЦИИ В ПЕРВУЮ ОЧЕРЕДЬ ***
+    # Репутация работает БЕЗ обязательного ! на ответы на сообщения
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if not msg.reply_to_message.from_user.is_bot and msg.from_user.id != msg.reply_to_message.from_user.id:
+            text = msg.text.strip()
+            rep_words = [
+                '+', 'плюс', 'спасибо', 'жиза', 'красава', 'респект',
+                'уважение', 'лайк', 'like', 'топ', 'красавчик',
+                'молодец', 'умница', 'based', 'base', 'огонь',
+                'респектую', '👍', '🔥', '💯', '✅'
+            ]
+            if text.lower() in rep_words or (text.startswith('+') and len(text) <= 3):
+                await give_reputation(msg)
+                return
 
-    settings = storage.get_chat_settings(msg.chat.id)
+    chat_id = msg.chat.id
+    user_id = msg.from_user.id
+    main_chat = is_main_chat(chat_id, msg.message_thread_id)
+
+    settings = storage.get_chat_settings(chat_id)
     if settings.get('anti_spam', {}).get('enabled', True):
         is_spam, _ = anti_spam.check_message(msg)
         if is_spam:
@@ -1068,29 +1566,22 @@ async def main_text_handler(msg: Message):
                 pass
             return
 
-    storage.update_user_from_message(msg)
-
+    user = storage.update_user_from_message(msg)
     if main_chat:
-        save_activity(msg.chat.id, msg.from_user.id, 'messages')
-        storage.get_user(msg.chat.id, msg.from_user.id)['messages_count'] = storage.get_user(msg.chat.id,
-                                                                                             msg.from_user.id).get(
-            'messages_count', 0) + 1
+        save_activity(chat_id, user_id, 'messages')
+        user = storage.get_user(chat_id, user_id)
+        user['messages_count'] = user.get('messages_count', 0) + 1
         storage.mark_dirty()
 
     text = msg.text.strip()
 
-    if text and text[0] in ['!', '?', '/']:
+    if text and text[0] == '!':
         cleaned = strip_command_prefix(text)
         if cleaned:
             cmd_name, args = match_command(cleaned)
             if cmd_name:
                 await execute_command(cmd_name, args, msg, main_chat)
                 return
-
-    cmd_name, args = match_command(text)
-    if cmd_name:
-        await execute_command(cmd_name, args, msg, main_chat)
-        return
 
     await rp_handler(msg)
     await auto_mod(msg)
@@ -1101,73 +1592,75 @@ async def execute_command(cmd_name: str, args: str, msg: Message, main_chat: boo
 
     # Маппинг команд на функции
     handlers = {
-        'who_am_i': lambda: who_am_i(msg),
-        'who_are_you': lambda: who_are_you(msg, args),
+        'who_am_i': lambda: who_am_i(msg, cmd_name),
+        'who_are_you': lambda: who_are_you(msg, args, cmd_name),
         'who_admin': lambda: who_admin(msg),
         'cmd_rank': lambda: cmd_rank(msg),
-        'cmd_id': lambda: cmd_id(msg),
-        'cmd_top': lambda: cmd_top(msg, args),
-        'cmd_chat_stats': lambda: cmd_chat_stats(msg),
-        'cmd_stats': lambda: cmd_stats(msg, args),
-        'cmd_mute': lambda: cmd_mute(msg),
-        'cmd_unmute': lambda: cmd_unmute(msg),
-        'cmd_ban': lambda: cmd_ban(msg),
-        'cmd_unban': lambda: cmd_unban(msg),
-        'cmd_warn': lambda: cmd_warn(msg),
-        'show_warnings': lambda: show_warnings(msg),
-        'cmd_unwarn': lambda: cmd_unwarn(msg),
-        'cmd_del': lambda: cmd_del(msg),
-        'cmd_pin': lambda: cmd_pin(msg),
-        'cmd_purge': lambda: cmd_purge(msg),
-        'cmd_promote': lambda: cmd_promote(msg),
-        'cmd_demote': lambda: cmd_demote(msg),
-        'cmd_close_topic': lambda: cmd_close_topic(msg),
-        'cmd_open_topic': lambda: cmd_open_topic(msg),
-        'cmd_list_topics': lambda: cmd_list_topics(msg),
-        'cmd_add_iso': lambda: cmd_add_iso(msg),
-        'cmd_rem_iso': lambda: cmd_rem_iso(msg),
+        'cmd_ranks_list': lambda: cmd_ranks_list(msg),
+        'cmd_rank_rename': lambda: cmd_rank_rename(msg, cmd_name, args),
+        'cmd_id': lambda: cmd_id(msg, cmd_name),
+        'cmd_top': lambda: cmd_top(msg, args, cmd_name),
+        'cmd_chat_stats': lambda: cmd_chat_stats(msg, cmd_name),
+        'cmd_stats': lambda: cmd_stats(msg, args, cmd_name),
+        'cmd_mute': lambda: cmd_mute(msg, cmd_name),
+        'cmd_unmute': lambda: cmd_unmute(msg, cmd_name),
+        'cmd_ban': lambda: cmd_ban(msg, cmd_name),
+        'cmd_unban': lambda: cmd_unban(msg, cmd_name),
+        'cmd_warn': lambda: cmd_warn(msg, cmd_name),
+        'show_warnings': lambda: show_warnings(msg, cmd_name),
+        'cmd_unwarn': lambda: cmd_unwarn(msg, cmd_name),
+        'cmd_del': lambda: cmd_del(msg, cmd_name),
+        'cmd_pin': lambda: cmd_pin(msg, cmd_name),
+        'cmd_purge': lambda: cmd_purge(msg, cmd_name),
+        'cmd_promote': lambda: cmd_promote(msg, cmd_name),
+        'cmd_demote': lambda: cmd_demote(msg, cmd_name),
+        'cmd_close_topic': lambda: cmd_close_topic(msg, cmd_name),
+        'cmd_open_topic': lambda: cmd_open_topic(msg, cmd_name),
+        'cmd_list_topics': lambda: cmd_list_topics(msg, cmd_name),
+        'cmd_add_iso': lambda: cmd_add_iso(msg, cmd_name),
+        'cmd_rem_iso': lambda: cmd_rem_iso(msg, cmd_name),
         'cmd_show_iso': lambda: cmd_show_iso(msg),
-        'cmd_give_award': lambda: cmd_give_award(msg),
-        'cmd_rem_award': lambda: cmd_rem_award(msg),
-        'cmd_my_awards': lambda: cmd_my_awards(msg),
-        'cmd_top_awards': lambda: cmd_top_awards(msg),
-        'cmd_marry': lambda: cmd_marry(msg),
-        'cmd_accept_marry': lambda: cmd_accept_marry(msg),
-        'cmd_reject_marry': lambda: cmd_reject_marry(msg),
-        'cmd_divorce': lambda: cmd_divorce(msg),
+        'cmd_give_award': lambda: cmd_give_award(msg, cmd_name),
+        'cmd_rem_award': lambda: cmd_rem_award(msg, cmd_name),
+        'cmd_my_awards': lambda: cmd_my_awards(msg, cmd_name),
+        'cmd_top_awards': lambda: cmd_top_awards(msg, cmd_name),
+        'cmd_marry': lambda: cmd_marry(msg, cmd_name),
+        'cmd_accept_marry': lambda: cmd_accept_marry(msg, cmd_name),
+        'cmd_reject_marry': lambda: cmd_reject_marry(msg, cmd_name),
+        'cmd_divorce': lambda: cmd_divorce(msg, cmd_name),
         'cmd_marriages_list': lambda: cmd_marriages_list(msg),
-        'cmd_add_phrase': lambda: cmd_add_phrase(msg),
-        'cmd_del_phrase': lambda: cmd_del_phrase(msg),
-        'cmd_list_phrases': lambda: cmd_list_phrases(msg),
+        'cmd_add_phrase': lambda: cmd_add_phrase(msg, cmd_name),
+        'cmd_del_phrase': lambda: cmd_del_phrase(msg, cmd_name),
+        'cmd_list_phrases': lambda: cmd_list_phrases(msg, cmd_name),
         'cmd_phrase_stats': lambda: cmd_phrase_stats(msg),
-        'cmd_phrase_show': lambda: cmd_phrase_show(msg),
-        'cmd_welcome': lambda: cmd_welcome(msg),
-        'cmd_farewell': lambda: cmd_farewell(msg),
+        'cmd_phrase_show': lambda: cmd_phrase_show(msg, cmd_name),
+        'cmd_welcome': lambda: cmd_welcome(msg, cmd_name),
+        'cmd_farewell': lambda: cmd_farewell(msg, cmd_name),
         'cmd_rules': lambda: cmd_rules(msg),
-        'cmd_add_rule': lambda: cmd_add_rule(msg),
-        'cmd_clear_rules': lambda: cmd_clear_rules(msg),
-        'cmd_games_menu': lambda: cmd_games_menu(msg),
-        'cmd_rps_menu': lambda: cmd_rps(msg),
-        'cmd_rps_with_bot': lambda: cmd_rps(msg),
-        'cmd_rps_choice': lambda: cmd_rps(msg),
-        'cmd_ttt_menu': lambda: cmd_games_menu(msg),
-        'cmd_weather': lambda: cmd_weather(msg),
-        'cmd_random_joke': lambda: cmd_random_joke(msg),
-        'cmd_poll': lambda: cmd_poll(msg),
-        'cmd_iris': lambda: cmd_iris(msg),
-        'cmd_report': lambda: cmd_report(msg),
-        'cmd_nick': lambda: cmd_nick(msg),
-        'cmd_anti_moderation': lambda: cmd_anti_moderation(msg),
-        'cmd_anti_spam': lambda: cmd_anti_spam(msg),
-        'cmd_ping': lambda: cmd_ping(msg),
-        'cmd_backup': lambda: cmd_backup(msg),
-        'cmd_restore': lambda: cmd_restore(msg),
-        'cmd_dk_set': lambda: cmd_dk_set(msg),
-        'cmd_dk_enable': lambda: cmd_dk_enable(msg),
-        'cmd_dk_disable': lambda: cmd_dk_disable(msg),
-        'cmd_ldk_add': lambda: cmd_ldk_add(msg),
-        'cmd_ldk_rem': lambda: cmd_ldk_rem(msg),
-        'cmd_forward': lambda: cmd_forward(msg),
+        'cmd_add_rule': lambda: cmd_add_rule(msg, cmd_name),
+        'cmd_clear_rules': lambda: cmd_clear_rules(msg, cmd_name),
+        'cmd_games_menu': lambda: cmd_games_menu(msg, cmd_name),
+        'cmd_rps_menu': lambda: cmd_rps(msg, cmd_name),
+        'cmd_rps_with_bot': lambda: cmd_rps(msg, cmd_name),
+        'cmd_rps_choice': lambda: cmd_rps(msg, cmd_name),
+        'cmd_ttt_menu': lambda: cmd_games_menu(msg, cmd_name),
+        'cmd_weather': lambda: cmd_weather(msg, cmd_name),
+        'cmd_random_joke': lambda: cmd_random_joke(msg, cmd_name),
+        'cmd_poll': lambda: cmd_poll(msg, cmd_name),
+        'cmd_iris': lambda: cmd_iris(msg, cmd_name),
+        'cmd_pogonialo': lambda: cmd_pogonialo(msg, cmd_name),
+        'cmd_anti_spam': lambda: cmd_anti_spam(msg, cmd_name),
+        'cmd_ping_check': lambda: cmd_ping_check(msg),
+        'cmd_ping': lambda: cmd_ping(msg, cmd_name),
+        'cmd_backup': lambda: cmd_backup(msg, cmd_name),
+        'cmd_restore': lambda: cmd_restore(msg, cmd_name),
+        'cmd_dk_set': lambda: cmd_dk_set(msg, cmd_name),
+        'cmd_dk_enable': lambda: cmd_dk_enable(msg, cmd_name),
+        'cmd_dk_disable': lambda: cmd_dk_disable(msg, cmd_name),
+        'cmd_ldk_add': lambda: cmd_ldk_add(msg, cmd_name),
+        'cmd_ldk_rem': lambda: cmd_ldk_rem(msg, cmd_name),
+        'cmd_dk_menu': lambda: cmd_dk_menu(msg, cmd_name),
+        'cmd_forward': lambda: cmd_forward(msg, cmd_name),
     }
 
     func_name = COMMANDS.get(cmd_name)
@@ -1177,112 +1670,115 @@ async def execute_command(cmd_name: str, args: str, msg: Message, main_chat: boo
 
 # ==================== Профиль и информация ====================
 
-async def who_am_i(msg: Message):
-    save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    u = storage.get_user(msg.chat.id, msg.from_user.id)
-    uid = msg.from_user.id
+def build_profile_text(chat_id: int, uid: int, u: dict, show_last_active: bool = False) -> str:
+    """Собирает красиво оформленный текст профиля пользователя."""
     username = u.get('username', '')
     custom_name = u.get('custom_name', '')
-
-    if custom_name:
-        display_name = custom_name
-    else:
-        display_name = u.get('first_name') or username or f"ID:{uid}"
-
-    rank = u.get('rank', 0)
-    reputation = u.get('reputation', 0)
-
-    activity = u.get('activity', {})
-    today = datetime.now().strftime('%Y-%m-%d')
-    today_msgs = activity.get(today, {}).get('messages', 0)
-
-    week_msgs = sum(
-        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in
-        range(7))
-    month_msgs = sum(
-        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in
-        range(30))
-    total_msgs = u.get('messages_count', 0)
-
-    first_seen = u.get('first_seen', time.time())
-    first_seen_date = datetime.fromtimestamp(first_seen)
-    days_since = (datetime.now() - first_seen_date).days
-
-    last_seen = u.get('last_seen', time.time())
-    last_seen_diff = int(time.time() - last_seen)
-    last_active = "только что" if last_seen_diff < 60 else f"{last_seen_diff // 60} мин назад" if last_seen_diff < 3600 else f"{last_seen_diff // 3600} ч назад" if last_seen_diff < 86400 else f"{last_seen_diff // 86400} дн назад"
+    original_name = u.get('first_name') or (f"@{username}" if username else f"ID:{uid}")
+    display_name = custom_name or original_name
 
     if username:
         profile_link = f'<a href="https://t.me/{username}">{display_name}</a>'
     else:
         profile_link = f'<a href="tg://user?id={uid}">{display_name}</a>'
 
-    rank_emoji = RANK_EMOJI.get(rank, "👤")
-    rank_name = RANK_NAMES.get(rank, "Обычный")
+    rank = u.get('rank', 0)
+    reputation = u.get('reputation', 0)
+    rank_emoji = get_rank_emoji(chat_id, rank)
+    rank_name = get_rank_name(chat_id, rank)
 
-    awards = u.get('awards', [])
-    recent_awards = sorted(awards, key=lambda x: x.get('given_at', 0), reverse=True)[:5]
+    activity = u.get('activity', {})
+    today = datetime.now().strftime('%Y-%m-%d')
+    today_msgs = activity.get(today, {}).get('messages', 0)
+    week_msgs = sum(
+        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0)
+        for i in range(7))
+    month_msgs = sum(
+        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0)
+        for i in range(30))
+    total_msgs = u.get('messages_count', 0)
 
-    text = f"👤 <b>Профиль пользователя</b> {profile_link}\n"
+    first_seen = u.get('first_seen', time.time())
+    first_seen_date = datetime.fromtimestamp(first_seen)
+    days_since = (datetime.now() - first_seen_date).days
 
+    # ── Заголовок ──
+    lines = [f"👤 <b>{profile_link}</b>"]
     if custom_name:
-        text += f"📝 <b>Кастомное имя:</b> {custom_name}\n"
+        lines.append(f"📝 <i>оригинальное имя: {original_name}</i>")
+    lines.append("━━━━━━━━━━━━━━━")
 
-    if rank >= 8:
-        text += f"👑 <b>Отец Нации 👑</b>\n"
-    elif rank >= 7:
-        text += f"💫 <b>Заместитель Отца</b>\n"
-    elif rank >= 6:
-        text += f"⭐ <b>Главный Отец</b>\n"
-    elif rank >= 5:
-        text += f"👑 <b>Батя</b>\n"
-    elif rank >= 4:
-        text += f"👨‍👧‍👦 <b>Батька</b>\n"
-    elif rank >= 3:
-        text += f"👨‍👧 <b>Отчим</b>\n"
-    elif rank >= 2:
-        text += f"👨‍👦 <b>Папаша</b>\n"
-    elif rank >= 1:
-        text += f"🪪 <b>Стажёр</b>\n"
-
-    text += f"\n{rank_emoji} <b>{rank} Степень власти: {rank_name}</b>\n"
-    text += f"⭐ Репутация: ➕ {reputation}\n"
-
-    text += f"\n📊 <b>Статистика активности:</b>\n"
-    text += f"• Сегодня: {today_msgs} сообщ.\n"
-    text += f"• За неделю: {week_msgs} сообщ.\n"
-    text += f"• За месяц: {month_msgs} сообщ.\n"
-    text += f"• Всего: {total_msgs} сообщ.\n"
-
-    text += f"\n📅 <b>Первое появление:</b> {first_seen_date.strftime('%d.%m.%Y')} ({days_since} дн)\n"
-    text += f"🕐 <b>Последний актив:</b> {last_active}\n"
+    # ── Ранг и репутация ──
+    lines.append(f"{rank_emoji} <b>{rank_name}</b> <i>(степень {rank})</i>")
+    lines.append(f"⭐ Репутация: <b>{reputation}</b>")
 
     wrn = [w for w in u.get('warnings', []) if w.get('expire_date', 0) > time.time()]
     if wrn:
-        text += f"\n⚠️ <b>Предупреждения:</b> {len(wrn)}/{MAX_WARNINGS}\n"
+        lines.append(f"⚠️ Предупреждения: <b>{len(wrn)}/{MAX_WARNINGS}</b>")
 
     if u.get('marriage_partner'):
         partner = u['marriage_partner']
         marriage_date = u.get('marriage_date')
         if marriage_date:
             days_married = int((time.time() - marriage_date) / 86400)
-            text += f"\n💍 <b>В браке с:</b> {mention(msg.chat.id, partner)} ({days_married} дн)\n"
+            lines.append(f"💍 В браке с {mention(chat_id, partner)} <i>({days_married} дн)</i>")
         else:
-            text += f"\n💍 <b>В браке с:</b> {mention(msg.chat.id, partner)}\n"
+            lines.append(f"💍 В браке с {mention(chat_id, partner)}")
 
+    # ── Активность ──
+    lines.append("")
+    lines.append("📊 <b>Активность</b>")
+    lines.append(f"  Сегодня: {today_msgs} · Неделя: {week_msgs} · Месяц: {month_msgs}")
+    lines.append(f"  Всего сообщений: <b>{total_msgs}</b>")
+
+    # ── Прочее ──
+    lines.append("")
+    lines.append(f"📅 В чате с {first_seen_date.strftime('%d.%m.%Y')} <i>({days_since} дн)</i>")
+
+    if show_last_active:
+        last_seen = u.get('last_seen', time.time())
+        diff = int(time.time() - last_seen)
+        if diff < 60:
+            last_active = "только что"
+        elif diff < 3600:
+            last_active = f"{diff // 60} мин назад"
+        elif diff < 86400:
+            last_active = f"{diff // 3600} ч назад"
+        else:
+            last_active = f"{diff // 86400} дн назад"
+        lines.append(f"🕐 Последний актив: {last_active}")
+
+    # ── Награды ──
+    awards = u.get('awards', [])
+    recent_awards = sorted(awards, key=lambda x: x.get('given_at', 0), reverse=True)[:5]
     if recent_awards:
-        text += f"\n🏆 <b>Последние награды:</b>\n"
+        lines.append("")
+        lines.append("🏆 <b>Последние награды</b>")
         for award in recent_awards:
-            text += f"• {award['name']} (ст. {award.get('degree', 1)})\n"
+            lines.append(f"  • {award['name']} <i>(ст. {award.get('degree', 1)})</i>")
 
-    graph = create_graph(msg.chat.id, msg.from_user.id, 30)
+    return "\n".join(lines)
+
+
+async def who_am_i(msg: Message, cmd_name: str = 'кто я'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    uid = msg.from_user.id
+    u = storage.get_user(msg.chat.id, uid)
+
+    text = build_profile_text(msg.chat.id, uid, u, show_last_active=True)
+
+    graph = create_graph(msg.chat.id, uid, 30)
     if graph:
         await msg.answer_photo(BufferedInputFile(graph.read(), 'profile_graph.png'), caption=text)
     else:
         await msg.answer(text, disable_web_page_preview=True)
 
 
-async def who_are_you(msg: Message, args: str = None):
+async def who_are_you(msg: Message, args: str = None, cmd_name: str = 'кто ты'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     tid = None
@@ -1296,70 +1792,7 @@ async def who_are_you(msg: Message, args: str = None):
         return await msg.answer("❌ Укажите пользователя:\n<code>кто ты @user</code> или ответьте на сообщение")
 
     u = storage.get_user(msg.chat.id, tid)
-    username = u.get('username', '')
-    custom_name = u.get('custom_name', '')
-
-    if custom_name:
-        display_name = custom_name
-    else:
-        display_name = u.get('first_name') or username or f"ID:{tid}"
-
-    rank = u.get('rank', 0)
-    reputation = u.get('reputation', 0)
-
-    activity = u.get('activity', {})
-    today = datetime.now().strftime('%Y-%m-%d')
-    today_msgs = activity.get(today, {}).get('messages', 0)
-
-    week_msgs = sum(
-        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in
-        range(7))
-    month_msgs = sum(
-        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in
-        range(30))
-    total_msgs = u.get('messages_count', 0)
-
-    first_seen = u.get('first_seen', time.time())
-    first_seen_date = datetime.fromtimestamp(first_seen)
-    days_since = (datetime.now() - first_seen_date).days
-
-    if username:
-        profile_link = f'<a href="https://t.me/{username}">{display_name}</a>'
-    else:
-        profile_link = f'<a href="tg://user?id={tid}">{display_name}</a>'
-
-    text = f"👤 <b>Профиль пользователя</b> {profile_link}\n"
-
-    if custom_name:
-        text += f"📝 <b>Кастомное имя:</b> {custom_name}\n"
-
-    if rank >= 8:
-        text += f"👑 <b>Отец Нации 👑</b>\n"
-    elif rank >= 7:
-        text += f"💫 <b>Заместитель Отца</b>\n"
-    elif rank >= 6:
-        text += f"⭐ <b>Главный Отец</b>\n"
-    elif rank >= 5:
-        text += f"👑 <b>Батя</b>\n"
-    elif rank >= 4:
-        text += f"👨‍👧‍👦 <b>Батька</b>\n"
-    elif rank >= 3:
-        text += f"👨‍👧 <b>Отчим</b>\n"
-    elif rank >= 2:
-        text += f"👨‍👦 <b>Папаша</b>\n"
-    elif rank >= 1:
-        text += f"🪪 <b>Стажёр</b>\n"
-
-    text += f"\n{RANK_EMOJI.get(rank, '👤')} <b>{rank} Степень власти: {RANK_NAMES.get(rank, 'Обычный')}</b>\n"
-    text += f"⭐ Репутация: ➕ {reputation}\n"
-
-    text += f"\n📊 <b>Статистика активности:</b>\n"
-    text += f"• Сегодня: {today_msgs} сообщ.\n"
-    text += f"• За неделю: {week_msgs} сообщ.\n"
-    text += f"• За месяц: {month_msgs} сообщ.\n"
-    text += f"• Всего: {total_msgs} сообщ.\n"
-
-    text += f"\n📅 <b>Первое появление:</b> {first_seen_date.strftime('%d.%m.%Y')} ({days_since} дн)\n"
+    text = build_profile_text(msg.chat.id, tid, u, show_last_active=False)
 
     graph = create_graph(msg.chat.id, tid, 30)
     if graph:
@@ -1369,6 +1802,8 @@ async def who_are_you(msg: Message, args: str = None):
 
 
 async def who_admin(msg: Message):
+    if not check_access(msg.from_user.id, msg.chat.id, 'кто админ', 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     admins = []
@@ -1386,22 +1821,12 @@ async def who_admin(msg: Message):
     for uid, user_data, rank in admins:
         ranks_grouped[rank].append((uid, user_data))
 
-    rank_roles = {
-        8: 'Отец Нации',
-        7: 'Заместитель',
-        6: 'Главный Отец',
-        5: 'Батя',
-        4: 'Батька',
-        3: 'Отчим',
-        2: 'Папаша',
-        1: 'Стажёр'
-    }
     txt = "👑 <b>Администрация чата:</b>\n\n"
 
     for rank in sorted(ranks_grouped.keys(), reverse=True):
         group = ranks_grouped[rank]
-        role_name = rank_roles.get(rank, 'Модер')
-        mango_count = max(1, min(rank, 8))
+        role_name = get_rank_name(msg.chat.id, rank)
+        mango_count = max(1, min(rank, MAX_RANK))
         mango_line = '🥭' * mango_count
         txt += f"{mango_line} <b>{role_name}</b>\n"
 
@@ -1429,17 +1854,48 @@ async def who_admin(msg: Message):
 
 async def cmd_rank(msg: Message):
     r = storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0)
-    await msg.answer(f"{RANK_EMOJI.get(r)} {RANK_NAMES.get(r)} ({r}/8)")
+    await msg.answer(f"{get_rank_emoji(msg.chat.id, r)} {get_rank_name(msg.chat.id, r)} ({r}/{MAX_RANK})")
 
 
-async def cmd_id(msg: Message):
+async def cmd_ranks_list(msg: Message):
+    """Показывает названия всех уровней иерархии в этом чате"""
+    lines = ["🏆 <b>Иерархия рангов</b>\n"]
+    for level in range(MAX_RANK + 1):
+        lines.append(f"{get_rank_emoji(msg.chat.id, level)} <b>{level}</b> — {get_rank_name(msg.chat.id, level)}")
+    lines.append("\n<code>!переранг 0-5 Новое название</code> — переименовать")
+    await msg.answer("\n".join(lines))
+
+
+async def cmd_rank_rename(msg: Message, cmd_name: str = 'название ранга', args: str = ""):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
+        return await msg.answer("❌ Недостаточно прав!")
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return await msg.answer(f"❌ <code>!переранг 0-{MAX_RANK} Новое название</code>")
+    level = int(parts[0])
+    if not (0 <= level <= MAX_RANK):
+        return await msg.answer(f"❌ Уровень должен быть 0-{MAX_RANK}")
+    new_name = parts[1].strip()
+    if not new_name:
+        return await msg.answer("❌ Укажите название")
+    storage.data['rank_names'].setdefault(str(msg.chat.id), {})[str(level)] = new_name
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(f"✅ Ранг {level}: теперь называется «{new_name}»")
+
+
+async def cmd_id(msg: Message, cmd_name: str = '.ид'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     await msg.answer(
         f"🆔 <code>{msg.reply_to_message.from_user.id}</code>" if msg.reply_to_message else f"🆔 Ваш: <code>{msg.from_user.id}</code>\n💬 Чат: <code>{msg.chat.id}</code>")
 
 
 # ==================== Топы ====================
 
-async def cmd_top(msg: Message, args: str = ""):
+async def cmd_top(msg: Message, args: str = "", cmd_name: str = 'топ'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     if not args:
@@ -1505,7 +1961,9 @@ async def show_msg_top(msg: Message, period: str = 'all'):
     await msg.answer(txt, disable_web_page_preview=True)
 
 
-async def cmd_chat_stats(msg: Message):
+async def cmd_chat_stats(msg: Message, cmd_name: str = 'статистика чата'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     total_msgs = sum(d.get('messages_count', 0) for d in storage.data['users'].get(str(msg.chat.id), {}).values())
     total_rep = sum(d.get('reputation', 0) for d in storage.data['users'].get(str(msg.chat.id), {}).values())
@@ -1515,7 +1973,9 @@ async def cmd_chat_stats(msg: Message):
         f"📊 <b>Статистика чата</b>\n\n👥 Пользователей: {len(storage.data['users'].get(str(msg.chat.id), {}))}\n👑 Модераторов: {moders}\n💬 Сообщений: {total_msgs}\n⭐ Репутации: {total_rep}\n💍 Браков: {marriages}")
 
 
-async def cmd_stats(msg: Message, args: str = ""):
+async def cmd_stats(msg: Message, args: str = "", cmd_name: str = 'статистика'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     parts = args.split()
 
@@ -1553,9 +2013,9 @@ async def cmd_stats(msg: Message, args: str = ""):
 
 # ==================== Модерация ====================
 
-async def cmd_mute(msg: Message):
+async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 1):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
         return await msg.answer("❌ Недостаточно прав!")
 
     text = msg.text.strip()
@@ -1569,12 +2029,16 @@ async def cmd_mute(msg: Message):
     if msg.reply_to_message and msg.reply_to_message.from_user:
         tid = msg.reply_to_message.from_user.id
         if len(parts) > 1:
-            # Парсим время и причину
-            rest = parts[1] if len(parts) > 1 else ""
-            time_match = re.match(r'^(\d+[дчм]?)\s*(.*)$', rest, re.IGNORECASE)
+            # Парсим время и причину - берём весь остаток после команды
+            rest = text[len(parts[0]):].strip()  # Берём весь остаток после "!мут"
+            # Ищем число + слово времени (с полной поддержкой падежей и сокращений)
+            time_match = re.match(r'^(\d+)\s*(тысячелети(?:й|и|е)?|век(?:а|ов)?|год(?:а|ов)?|месяц(?:а|ев)?|дн?(?:и|ей)?|ча?(?:с(?:а|ов)?)?|минут(?:ы|а)?|[дчм])?(?:\s+(.*))?$', rest, re.IGNORECASE)
             if time_match:
-                dur_text = time_match.group(1)
-                reason = time_match.group(2).strip() or "Без причины"
+                num = time_match.group(1)
+                unit = time_match.group(2) or ""
+                reason_part = time_match.group(3) or ""
+                dur_text = f"{num} {unit}".strip()
+                reason = reason_part.strip() or "Без причины"
             else:
                 reason = rest or "Без причины"
 
@@ -1591,10 +2055,14 @@ async def cmd_mute(msg: Message):
 
         if len(parts) >= 3:
             rest = parts[2]
-            time_match = re.match(r'^(\d+[дчм]?)\s*(.*)$', rest, re.IGNORECASE)
+            # Ищем число + слово времени (с полной поддержкой падежей и сокращений)
+            time_match = re.match(r'^(\d+)\s*(тысячелети(?:й|и|е)?|век(?:а|ов)?|год(?:а|ов)?|месяц(?:а|ев)?|дн?(?:и|ей)?|ча?(?:с(?:а|ов)?)?|минут(?:ы|а)?|[дчм])?(?:\s+(.*))?$', rest, re.IGNORECASE)
             if time_match:
-                dur_text = time_match.group(1)
-                reason = time_match.group(2).strip() or "Без причины"
+                num = time_match.group(1)
+                unit = time_match.group(2) or ""
+                reason_part = time_match.group(3) or ""
+                dur_text = f"{num} {unit}".strip()
+                reason = reason_part.strip() or "Без причины"
             else:
                 reason = rest or "Без причины"
 
@@ -1620,10 +2088,37 @@ async def cmd_mute(msg: Message):
 
     try:
         until = datetime.now() + timedelta(minutes=dur)
-        await bot.restrict_chat_member(msg.chat.id, tid, ChatPermissions(can_send_messages=False), until_date=until)
+        await bot.restrict_chat_member(msg.chat.id, tid, ChatPermissions(can_send_messages=False), until_date=int(until.timestamp()))
 
         # Форматируем время
-        if dur >= 1440:
+        if dur >= 525600000:  # тысячелетие (1000 * 365 * 1440)
+            count = dur // 525600000
+            time_str = f"{count} тысячелетие" if count == 1 else f"{count} тысячелетий"
+        elif dur >= 52560000:  # век (100 * 365 * 1440)
+            count = dur // 52560000
+            if count % 10 == 1 and count != 11:
+                time_str = f"{count} век"
+            elif count % 10 in [2, 3, 4] and count not in [12, 13, 14]:
+                time_str = f"{count} века"
+            else:
+                time_str = f"{count} веков"
+        elif dur >= 525600:  # год (365 * 1440)
+            count = dur // 525600
+            if count % 10 == 1 and count != 11:
+                time_str = f"{count} год"
+            elif count % 10 in [2, 3, 4] and count not in [12, 13, 14]:
+                time_str = f"{count} года"
+            else:
+                time_str = f"{count} лет"
+        elif dur >= 43800:  # месяц (30 * 1440)
+            count = dur // 43800
+            if count % 10 == 1 and count != 11:
+                time_str = f"{count} месяц"
+            elif count % 10 in [2, 3, 4] and count not in [12, 13, 14]:
+                time_str = f"{count} месяца"
+            else:
+                time_str = f"{count} месяцев"
+        elif dur >= 1440:  # дни
             days = dur // 1440
             hours = (dur % 1440) // 60
             minutes = dur % 60
@@ -1635,14 +2130,14 @@ async def cmd_mute(msg: Message):
                 time_str = f"{days}д {minutes}м"
             else:
                 time_str = f"{days}д"
-        elif dur >= 60:
+        elif dur >= 60:  # часы
             hours = dur // 60
             minutes = dur % 60
             if minutes > 0:
                 time_str = f"{hours}ч {minutes}м"
             else:
                 time_str = f"{hours}ч"
-        else:
+        else:  # минуты
             time_str = f"{dur}м"
 
         # Сохраняем мут
@@ -1678,25 +2173,19 @@ async def cmd_mute(msg: Message):
         except:
             pass
 
-        # Сообщение в чат (удалится через 5 сек)
-        chat_msg = await msg.answer(
+        # Сообщение в чат
+        await msg.answer(
             f"🔇 {mention(msg.chat.id, tid)} заглушен на {time_str}\n📝 {reason}",
             disable_web_page_preview=True
         )
-
-        await asyncio.sleep(5)
-        try:
-            await chat_msg.delete()
-        except:
-            pass
 
 
     except Exception as e:
         await msg.answer(f"❌ Ошибка: {e}")
 
 
-async def cmd_unmute(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 1):
+async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
         return
 
     text = msg.text.strip()
@@ -1753,15 +2242,9 @@ async def cmd_unmute(msg: Message):
 
         reason_text = f"\n📝 Причина мута была: {mute_info['reason']}" if mute_info and mute_info.get('reason') else ""
 
-        # Сообщение в чат (удалится через 3 сек)
-        chat_msg = await msg.answer(f"🔊 {mention(msg.chat.id, tid)} размучен{reason_text}",
-                                    disable_web_page_preview=True)
-
-        await asyncio.sleep(3)
-        try:
-            await chat_msg.delete()
-        except:
-            pass
+        # Сообщение в чат
+        await msg.answer(f"🔊 {mention(msg.chat.id, tid)} размучен{reason_text}",
+                        disable_web_page_preview=True)
 
         # Уведомление в личку
         try:
@@ -1775,17 +2258,12 @@ async def cmd_unmute(msg: Message):
 
 
     except Exception as e:
-        error_msg = await msg.answer(f"❌ Ошибка: {e}")
-        await asyncio.sleep(3)
-        try:
-            await error_msg.delete()
-        except:
-            pass
+        await msg.answer(f"❌ Ошибка: {e}")
 
 
-async def cmd_ban(msg: Message):
+async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 3):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
         return await msg.answer("❌ Недостаточно прав! Требуется ранг 3+")
 
     text = msg.text.strip()
@@ -1847,17 +2325,11 @@ async def cmd_ban(msg: Message):
         storage.mark_dirty()
         await storage.save()
 
-        # Сообщение в чат (удалится через 5 сек)
-        chat_msg = await msg.answer(
+        # Сообщение в чат
+        await msg.answer(
             f"🚫 {mention(msg.chat.id, tid)} забанен\n📝 Причина: {reason}",
             disable_web_page_preview=True
         )
-
-        await asyncio.sleep(5)
-        try:
-            await chat_msg.delete()
-        except:
-            pass
 
         # Уведомление в личку
         try:
@@ -1873,8 +2345,8 @@ async def cmd_ban(msg: Message):
         await msg.answer(f"❌ Ошибка: {e}")
 
 
-async def cmd_unban(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 3):
+async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
         return
 
     text = msg.text.strip()
@@ -1927,15 +2399,9 @@ async def cmd_unban(msg: Message):
 
         reason_text = f"\n📝 Причина бана: {ban_info['reason']}" if ban_info and ban_info.get('reason') else ""
 
-        # Сообщение в чат (удалится через 3 сек)
-        chat_msg = await msg.answer(f"✅ {mention(msg.chat.id, tid)} разбанен{reason_text}",
-                                    disable_web_page_preview=True)
-
-        await asyncio.sleep(3)
-        try:
-            await chat_msg.delete()
-        except:
-            pass
+        # Сообщение в чат
+        await msg.answer(f"✅ {mention(msg.chat.id, tid)} разбанен{reason_text}",
+                        disable_web_page_preview=True)
 
         # Уведомление в личку
         try:
@@ -1949,17 +2415,12 @@ async def cmd_unban(msg: Message):
 
 
     except Exception as e:
-        error_msg = await msg.answer(f"❌ Ошибка: {e}")
-        await asyncio.sleep(3)
-        try:
-            await error_msg.delete()
-        except:
-            pass
+        await msg.answer(f"❌ Ошибка: {e}")
 
 
-async def cmd_warn(msg: Message):
+async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'предупреждения', 1):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
         return
 
     # Определяем какая команда была использована
@@ -2000,40 +2461,90 @@ async def cmd_warn(msg: Message):
             except:
                 reason = ' '.join(parts[2:]) or 'Без причины'
 
+    if not tid:
+        return await msg.answer("❌ Пользователь не найден")
+
     if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
         return await msg.answer("❌ Анти-модерация!")
 
     u = storage.get_user(msg.chat.id, tid)
-    u.setdefault('warnings', []).append({
+    
+    # Добавляем предупреждение
+    new_warning = {
         'reason': reason,
         'date': time.time(),
         'expire_date': (datetime.now() + timedelta(days=days)).timestamp(),
         'warned_by': msg.from_user.id
-    })
+    }
+    
+    if 'warnings' not in u:
+        u['warnings'] = []
+    
+    u['warnings'].append(new_warning)
+    
+    # Получаем активные предупреждения
     active = [w for w in u['warnings'] if w.get('expire_date', 0) > time.time()]
+    
     storage.mark_dirty()
     await storage.save()
+    
+    logger.info(f"Предупреждение: {msg.from_user.id} дал {tid}, активных: {len(active)}/{MAX_WARNINGS}")
 
     # Формируем информативное сообщение
     time_str = f"{days} дн" if days > 0 else "навсегда"
 
+    if len(active) >= MAX_WARNINGS:
+        try:
+            await bot.ban_chat_member(msg.chat.id, tid)
+
+            chat_id_str = str(msg.chat.id)
+            if 'banned_users' not in storage.data:
+                storage.data['banned_users'] = {}
+            if chat_id_str not in storage.data['banned_users']:
+                storage.data['banned_users'][chat_id_str] = []
+
+            storage.data['banned_users'][chat_id_str].append({
+                'user_id': tid,
+                'banned_by': msg.from_user.id,
+                'reason': f"Достигнут лимит предупреждений ({MAX_WARNINGS})",
+                'date': time.time()
+            })
+
+            storage.mark_dirty()
+            await storage.save()
+
+            await msg.answer(
+                f"🚫 {mention(msg.chat.id, tid)} забанен по лимиту предупреждений\n"
+                f"📊 {len(active)}/{MAX_WARNINGS}\n"
+                f"📝 Причина: {reason}",
+                disable_web_page_preview=True
+            )
+
+            try:
+                await bot.send_message(
+                    tid,
+                    f"🚫 <b>Вы были забанены!</b>\n\n"
+                    f"📊 Достигнут лимит предупреждений: {len(active)}/{MAX_WARNINGS}\n"
+                    f"📝 Последняя причина: {reason}",
+                    disable_web_page_preview=True
+                )
+            except:
+                pass
+            return
+
+        except Exception as e:
+            logger.warning(f"Не удалось забанить пользователя {tid} после предупреждений: {e}")
+
     # Уведомление в чат
-    chat_msg = await msg.answer(
-        f"⚠️ <b>Предупреждение!</b>\n\n"
+    await msg.answer(
+        f"⚠️ <b>Предупреждение выдано!</b>\n\n"
         f"👤 {mention(msg.chat.id, tid)}\n"
         f"📝 Причина: {reason}\n"
         f"⏱️ Срок: {time_str}\n"
-        f"📊 {len(active)}/{MAX_WARNINGS}\n"
+        f"📊 Активных: {len(active)}/{MAX_WARNINGS}\n"
         f"👮 Выдал: {mention(msg.chat.id, msg.from_user.id)}",
         disable_web_page_preview=True
     )
-
-    # Удаляем сообщение через 5 секунд
-    await asyncio.sleep(5)
-    try:
-        await chat_msg.delete()
-    except:
-        pass
 
     # Уведомление в личку пользователю
     try:
@@ -2041,15 +2552,17 @@ async def cmd_warn(msg: Message):
             f"⚠️ <b>Вы получили предупреждение!</b>\n\n"
             f"📝 Причина: {reason}\n"
             f"⏱️ Срок: {time_str}\n"
-            f"📊 Всего: {len(active)}/{MAX_WARNINGS}\n\n"
-            f"📌 При повторных нарушениях вы можете получить мут или бан."
+            f"📊 Всего активных: {len(active)}/{MAX_WARNINGS}\n\n"
+            f"📌 При {MAX_WARNINGS} предупреждениях вы получите бан."
         )
         await bot.send_message(tid, user_msg, disable_web_page_preview=True)
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Не удалось отправить ДМ о варне: {e}")
 
 
-async def show_warnings(msg: Message):
+async def show_warnings(msg: Message, cmd_name: str = 'преды'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     parts = msg.text.split()
@@ -2082,8 +2595,8 @@ async def show_warnings(msg: Message):
     await msg.answer(txt, disable_web_page_preview=True)
 
 
-async def cmd_unwarn(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'предупреждения', 2):
+async def cmd_unwarn(msg: Message, cmd_name: str = 'снятьпред'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
         return
 
     parts = msg.text.split()
@@ -2097,7 +2610,8 @@ async def cmd_unwarn(msg: Message):
     if not tid:
         return await msg.answer(
             "❌ <b>Использование:</b>\n\n"
-            "• <code>снятьпред @user [номер]</code>\n"
+            "• <code>снятьпред @user [номер]</code> — снять конкретное\n"
+            "• <code>снятьпред @user</code> — снять все активные\n"
             "• <code>снятьварн @user [номер]</code>\n"
             "• <code>unwarn @user [номер]</code>\n"
             "• Или ответьте на сообщение пользователя"
@@ -2106,13 +2620,31 @@ async def cmd_unwarn(msg: Message):
     u = storage.get_user(msg.chat.id, tid)
     active = [(i, w) for i, w in enumerate(u.get('warnings', [])) if w.get('expire_date', 0) > time.time()]
 
+    if not active:
+        chat_msg = await msg.answer(
+            f"✅ У {mention(msg.chat.id, tid)} нет активных предупреждений",
+            disable_web_page_preview=True
+        )
+        await asyncio.sleep(3)
+        try:
+            await chat_msg.delete()
+        except:
+            pass
+        return
+
+    # Проверяем если указан номер
     num_idx = 2 if not msg.reply_to_message else 1
     if len(parts) > num_idx and parts[num_idx].isdigit():
         idx = int(parts[num_idx]) - 1
         if 0 <= idx < len(active):
-            removed_warning = u['warnings'].pop(active[idx][0])
+            # Снимаем конкретное предупреждение по его индексу в исходном массиве
+            removed_warning = u['warnings'][active[idx][0]]
+            del u['warnings'][active[idx][0]]
+            
             storage.mark_dirty()
             await storage.save()
+            
+            logger.info(f"Снято предупреждение #{idx + 1} у {tid}")
 
             chat_msg = await msg.answer(
                 f"✅ Снято предупреждение #{idx + 1} у {mention(msg.chat.id, tid)}\n"
@@ -2125,26 +2657,28 @@ async def cmd_unwarn(msg: Message):
             except:
                 pass
             return
+        else:
+            return await msg.answer(f"❌ Предупреждение #{idx + 1} не найдено")
 
-    # Если не указан номер, снимаем все
+    # Если не указан номер, снимаем ВСЕ АКТИВНЫЕ
     before_count = len(active)
-    u['warnings'] = [w for w in u.get('warnings', []) if w.get('expire_date', 0) <= time.time()]
+    # Удаляем активные предупреждения в обратном порядке (чтобы не сбить индексы)
+    for idx, _ in sorted(active, key=lambda x: x[0], reverse=True):
+        del u['warnings'][idx]
+    
     storage.mark_dirty()
     await storage.save()
+    
+    logger.info(f"Снято {before_count} предупреждений у {tid}")
 
-    chat_msg = await msg.answer(
-        f"✅ Снято {before_count} предупреждений у {mention(msg.chat.id, tid)}",
+    await msg.answer(
+        f"✅ Снято <b>{before_count}</b> предупреждений у {mention(msg.chat.id, tid)}",
         disable_web_page_preview=True
     )
-    await asyncio.sleep(3)
-    try:
-        await chat_msg.delete()
-    except:
-        pass
 
 
-async def cmd_del(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 1):
+async def cmd_del(msg: Message, cmd_name: str = '-смс'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
         return
     if msg.reply_to_message:
         try:
@@ -2154,8 +2688,8 @@ async def cmd_del(msg: Message):
             pass
 
 
-async def cmd_pin(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 2):
+async def cmd_pin(msg: Message, cmd_name: str = '.пин'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
         return
     if msg.reply_to_message:
         try:
@@ -2164,8 +2698,8 @@ async def cmd_pin(msg: Message):
             pass
 
 
-async def cmd_purge(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'модерация', 2):
+async def cmd_purge(msg: Message, cmd_name: str = 'очистить'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
         return
 
     # Обязательно нужно ответить на сообщение
@@ -2213,9 +2747,9 @@ async def cmd_purge(msg: Message):
 
 # ==================== Топики ====================
 
-async def cmd_close_topic(msg: Message):
+async def cmd_close_topic(msg: Message, cmd_name: str = 'закрыть топик'):
     """Закрыть топик - теперь поддерживает @упоминания для исключений"""
-    if not check_access(msg.from_user.id, msg.chat.id, 'топики', 2):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
         return
 
     # Парсим аргументы: может быть ранг ИЛИ @упоминания
@@ -2229,10 +2763,9 @@ async def cmd_close_topic(msg: Message):
             rank = int(part)
         elif part.startswith('@'):
             username = part[1:].lower()
-            for uid, data in storage.data['users'].get(str(msg.chat.id), {}).items():
-                if data.get('username', '').lower() == username:
-                    allowed_users.append(uid)
-                    break
+            uid = storage.get_user_by_username(msg.chat.id, username)
+            if uid is not None:
+                allowed_users.append(str(uid))
 
     # Определяем топик
     topic_id = msg.message_thread_id
@@ -2276,9 +2809,9 @@ async def cmd_close_topic(msg: Message):
     await msg.answer(response, disable_web_page_preview=True)
 
 
-async def cmd_open_topic(msg: Message):
+async def cmd_open_topic(msg: Message, cmd_name: str = 'открыть топик'):
     """Открыть топик (без изменений)"""
-    if not check_access(msg.from_user.id, msg.chat.id, 'топики', 2):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
         return
 
     topic_id = msg.message_thread_id
@@ -2298,8 +2831,10 @@ async def cmd_open_topic(msg: Message):
         await msg.answer("❌ Этот топик не был закрыт")
 
 
-async def cmd_list_topics(msg: Message):
+async def cmd_list_topics(msg: Message, cmd_name: str = 'топики'):
     """Показать список закрытых топиков (обновлено с показом исключений)"""
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     chat_topics = storage.data.get('closed_topics', {}).get(str(msg.chat.id), {})
 
     if not chat_topics:
@@ -2336,9 +2871,9 @@ async def cmd_list_topics(msg: Message):
 
 # ==================== Изоляция ====================
 
-async def cmd_add_iso(msg: Message):
+async def cmd_add_iso(msg: Message, cmd_name: str = '+изоляция'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'изоляция', 3):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
         return
 
     parts = msg.text.split(maxsplit=5)
@@ -2383,8 +2918,8 @@ async def cmd_add_iso(msg: Message):
                      disable_web_page_preview=True)
 
 
-async def cmd_rem_iso(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'изоляция', 3):
+async def cmd_rem_iso(msg: Message, cmd_name: str = '-изоляция'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
         return
 
     parts = msg.text.split()
@@ -2415,14 +2950,14 @@ async def cmd_show_iso(msg: Message):
 
 # ==================== Награды ====================
 
-async def cmd_give_award(msg: Message):
+async def cmd_give_award(msg: Message, cmd_name: str = 'наградить'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'награды', 4):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 4):
         return await msg.answer("❌ Недостаточно прав! Требуется ранг 4+")
 
     text = msg.text.strip()
 
-    for prefix in ['!', '?', '/']:
+    for prefix in ['!']:
         if text.startswith(prefix):
             text = text[1:].strip()
             break
@@ -2516,13 +3051,13 @@ async def cmd_give_award(msg: Message):
     )
 
 
-async def cmd_rem_award(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'награды', 4):
+async def cmd_rem_award(msg: Message, cmd_name: str = 'снять награду'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 4):
         return await msg.answer("❌ Недостаточно прав! Требуется ранг 4+")
 
     text = msg.text.strip()
 
-    for prefix in ['!', '?', '/']:
+    for prefix in ['!']:
         if text.startswith(prefix):
             text = text[1:].strip()
             break
@@ -2600,7 +3135,9 @@ async def cmd_rem_award(msg: Message):
                      disable_web_page_preview=True)
 
 
-async def cmd_my_awards(msg: Message):
+async def cmd_my_awards(msg: Message, cmd_name: str = 'мои награды'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     tid = msg.from_user.id
@@ -2609,7 +3146,7 @@ async def cmd_my_awards(msg: Message):
         tid = msg.reply_to_message.from_user.id
     else:
         text = msg.text.strip()
-        for prefix in ['!', '?', '/']:
+        for prefix in ['!']:
             if text.startswith(prefix):
                 text = text[1:].strip()
                 break
@@ -2652,7 +3189,9 @@ async def cmd_my_awards(msg: Message):
     await msg.answer(txt, disable_web_page_preview=True)
 
 
-async def cmd_top_awards(msg: Message):
+async def cmd_top_awards(msg: Message, cmd_name: str = 'топ наград'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     awards_stats = []
@@ -2682,7 +3221,9 @@ async def cmd_top_awards(msg: Message):
 
 # ==================== Браки ====================
 
-async def cmd_marry(msg: Message):
+async def cmd_marry(msg: Message, cmd_name: str = 'брак'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     parts = msg.text.split()
@@ -2806,7 +3347,9 @@ async def marry_callback(call: CallbackQuery):
     await call.answer()
 
 
-async def cmd_accept_marry(msg: Message):
+async def cmd_accept_marry(msg: Message, cmd_name: str = 'принять брак'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     u = storage.get_user(msg.chat.id, msg.from_user.id)
     proposer_id = u.get('pending_marriage')
 
@@ -2850,7 +3393,9 @@ async def cmd_accept_marry(msg: Message):
     )
 
 
-async def cmd_reject_marry(msg: Message):
+async def cmd_reject_marry(msg: Message, cmd_name: str = 'отклонить брак'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     u = storage.get_user(msg.chat.id, msg.from_user.id)
     proposer_id = u.get('pending_marriage')
 
@@ -2867,7 +3412,9 @@ async def cmd_reject_marry(msg: Message):
     await msg.answer(f"💔 Предложение от {mention(msg.chat.id, proposer_id)} отклонено.", disable_web_page_preview=True)
 
 
-async def cmd_divorce(msg: Message):
+async def cmd_divorce(msg: Message, cmd_name: str = 'развод'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     u = storage.get_user(msg.chat.id, msg.from_user.id)
     partner_id = u.get('marriage_partner')
 
@@ -2958,8 +3505,8 @@ async def cmd_marriages_list(msg: Message):
 
 # ==================== Фразы ====================
 
-async def cmd_add_phrase(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'фразы', 1):
+async def cmd_add_phrase(msg: Message, cmd_name: str = 'добавить фразу'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
         return
 
     parts = msg.text.split(maxsplit=4)
@@ -3000,7 +3547,9 @@ async def cmd_add_phrase(msg: Message):
     await msg.answer(f"✅ Фраза добавлена: {trigger} → {response}\n📊 Теперь у этого слова {count} вариант(ов) ответа")
 
 
-async def cmd_list_phrases(msg: Message):
+async def cmd_list_phrases(msg: Message, cmd_name: str = 'фразы'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     phrases = storage.get_chat(msg.chat.id, 'phrases')
     if not isinstance(phrases, list) or not phrases:
         return await msg.answer("📝 Нет фраз")
@@ -3041,8 +3590,8 @@ async def cmd_phrase_stats(msg: Message):
     await msg.answer(txt)
 
 
-async def cmd_del_phrase(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'фразы', 1):
+async def cmd_del_phrase(msg: Message, cmd_name: str = 'удалить фразу'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
         return
 
     parts = msg.text.split(maxsplit=2)
@@ -3076,8 +3625,10 @@ async def cmd_del_phrase(msg: Message):
     await storage.save()
 
 
-async def cmd_phrase_show(msg: Message):
+async def cmd_phrase_show(msg: Message, cmd_name: str = 'показать фразу'):
     """Показать все ответы на определённую фразу"""
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("❌ <code>показать фразу слово</code>")
@@ -3104,33 +3655,84 @@ async def cmd_phrase_show(msg: Message):
 
 # ==================== Приветствия ====================
 
-async def cmd_welcome(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'приветствия', 2):
+async def cmd_welcome(msg: Message, cmd_name: str = 'приветствие'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
         return
     txt = msg.text.lower()
     cid = str(msg.chat.id)
+    settings = storage.data['welcome_settings'].setdefault(cid, {})
+
     if 'вкл' in txt or 'выкл' in txt:
-        storage.data['welcome_settings'].setdefault(cid, {})['enabled'] = 'вкл' in txt
+        settings['enabled'] = 'вкл' in txt
         storage.mark_dirty();
         await storage.save()
-        await msg.answer(f"✅ Приветствия {'включены' if 'вкл' in txt else 'выключены'}")
-    elif 'текст' in txt:
+        await msg.answer(f"✅ Приветствия {'включены' if settings['enabled'] else 'выключены'}")
+        return
+
+    parts = msg.text.split()
+    if len(parts) >= 3 and parts[1].lower() == 'картинка':
+        url = ' '.join(parts[2:]).strip()
+        if not url:
+            return await msg.answer("❌ Укажите ссылку после <code>!приветствие картинка</code>")
+        settings['image_url'] = url
+        storage.mark_dirty();
+        await storage.save()
+        await msg.answer("✅ Картинка приветствия установлена")
+        return
+
+    if 'текст' in txt:
         text = ' '.join(msg.text.split()[2:])
-        storage.data['welcome_settings'].setdefault(cid, {})['text'] = text
+        settings['text'] = text
         storage.mark_dirty();
         await storage.save()
         await msg.answer("✅ Текст приветствия установлен")
-
-
-async def cmd_farewell(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'приветствия', 2):
         return
-    text = ' '.join(msg.text.split()[2:])
+
+    await msg.answer("❌ Использование: <code>!приветствие вкл/выкл</code> | <code>!приветствие текст ...</code> | <code>!приветствие картинка URL</code>")
+
+
+async def cmd_farewell(msg: Message, cmd_name: str = 'прощание'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
+        return
+
+    txt = msg.text.lower()
     cid = str(msg.chat.id)
-    storage.data['welcome_settings'].setdefault(cid, {})['farewell_text'] = text
-    storage.mark_dirty();
-    await storage.save()
-    await msg.answer("✅ Текст прощания установлен")
+    settings = storage.data['welcome_settings'].setdefault(cid, {})
+
+    if 'вкл' in txt or 'выкл' in txt:
+        settings['farewell_enabled'] = 'вкл' in txt
+        storage.mark_dirty()
+        await storage.save()
+        await msg.answer(f"✅ Прощание {'включено' if settings['farewell_enabled'] else 'выключено'}")
+        return
+
+    parts = msg.text.split()
+    if len(parts) >= 3 and parts[1].lower() == 'картинка':
+        url = ' '.join(parts[2:]).strip()
+        if not url:
+            return await msg.answer("❌ Укажите ссылку после <code>!прощание картинка</code>")
+        settings['farewell_image_url'] = url
+        storage.mark_dirty();
+        await storage.save()
+        await msg.answer("✅ Картинка прощания установлена")
+        return
+
+    if 'текст' in txt:
+        text = ' '.join(msg.text.split()[2:])
+        settings['farewell_text'] = text
+        storage.mark_dirty()
+        await storage.save()
+        await msg.answer("✅ Текст прощания установлен")
+        return
+
+    text = ' '.join(msg.text.split()[1:])
+    if text:
+        settings['farewell_text'] = text
+        storage.mark_dirty()
+        await storage.save()
+        await msg.answer("✅ Текст прощания установлен")
+    else:
+        await msg.answer("❌ Использование: <code>!прощание вкл/выкл</code> | <code>!прощание текст ...</code> | <code>!прощание картинка URL</code>")
 
 
 # ==================== Правила ====================
@@ -3145,8 +3747,8 @@ async def cmd_rules(msg: Message):
     await msg.answer(txt)
 
 
-async def cmd_add_rule(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 4):
+async def cmd_add_rule(msg: Message, cmd_name: str = 'добавитьправило'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 4):
         return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -3158,8 +3760,8 @@ async def cmd_add_rule(msg: Message):
     await msg.answer(f"✅ Правило #{len(rules)} добавлено")
 
 
-async def cmd_clear_rules(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 4):
+async def cmd_clear_rules(msg: Message, cmd_name: str = 'очиститьправила'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 4):
         return
     storage.data.setdefault('rules', {})[str(msg.chat.id)] = []
     storage.mark_dirty();
@@ -3175,8 +3777,10 @@ pending_challenges = {}  # challenge_id -> challenge_data
 
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 
-async def cmd_games_menu(msg: Message):
+async def cmd_games_menu(msg: Message, cmd_name: str = 'игры'):
     """Главное меню игр"""
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3505,7 +4109,11 @@ async def resolve_rps_duel(game_id: str, chat_id: int):
     storage.mark_dirty()
     await storage.save()
 
+    u1 = storage.get_user(chat_id, p1)
+    u2 = storage.get_user(chat_id, p2)
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Реванш", callback_data=f"rpsrematch_{p1}_{p2}")],
         [InlineKeyboardButton(text="🎮 В меню", callback_data="game_back_to_menu")]
     ])
 
@@ -3513,7 +4121,9 @@ async def resolve_rps_duel(game_id: str, chat_id: int):
         chat_id,
         f"⚔️ <b>Результат дуэли!</b>\n\n"
         f"{mention(chat_id, p1)}: {emoji[c1]} {name[c1]}\n"
-        f"{mention(chat_id, p2)}: {emoji[c2]} {name[c2]}\n\n{result}",
+        f"{mention(chat_id, p2)}: {emoji[c2]} {name[c2]}\n\n{result}\n\n"
+        f"📊 {mention(chat_id, p1)}: {u1.get('rps_wins', 0)} побед | "
+        f"{mention(chat_id, p2)}: {u2.get('rps_wins', 0)} побед",
         reply_markup=kb
     )
 
@@ -3648,6 +4258,46 @@ async def ttt_move_handler(call: CallbackQuery):
                              f"Ход: {mention(call.message.chat.id, game['current'])}")
 
 
+def _ttt_minimax(board: list, depth: int, is_bot: bool) -> int:
+    """Оценка позиции для минимакс-ИИ бота (O — бот, X — игрок)"""
+    winner = check_ttt_winner(board)
+    if winner == 'O':
+        return 10 - depth
+    if winner == 'X':
+        return depth - 10
+    if all(cell != ' ' for row in board for cell in row):
+        return 0
+
+    scores = []
+    for i in range(3):
+        for j in range(3):
+            if board[i][j] == ' ':
+                board[i][j] = 'O' if is_bot else 'X'
+                scores.append(_ttt_minimax(board, depth + 1, not is_bot))
+                board[i][j] = ' '
+
+    return max(scores) if is_bot else min(scores)
+
+
+def best_ttt_move(board: list) -> tuple:
+    """Лучший ход бота: минимакс (побеждает/блокирует всегда, где возможно)"""
+    empty = [(i, j) for i in range(3) for j in range(3) if board[i][j] == ' ']
+
+    # Первый ход бота — сразу в центр, чтобы не гонять полное дерево впустую
+    if len(empty) == 9:
+        return (1, 1)
+
+    best_score, best_move = -999, empty[0]
+    for i, j in empty:
+        board[i][j] = 'O'
+        score = _ttt_minimax(board, 0, False)
+        board[i][j] = ' '
+        if score > best_score:
+            best_score, best_move = score, (i, j)
+
+    return best_move
+
+
 async def bot_ttt_move(game_id: str, message):
     """Ход бота в TTT"""
     game = active_games.get(game_id)
@@ -3658,7 +4308,7 @@ async def bot_ttt_move(game_id: str, message):
     if not empty:
         return
 
-    row, col = random.choice(empty)
+    row, col = best_ttt_move(game['board'])
     game['board'][row][col] = 'O'
 
     winner = check_ttt_winner(game['board'])
@@ -3674,17 +4324,21 @@ async def end_ttt_game(game: dict, game_id: str, winner: str, message):
     """Завершение игры TTT"""
     game['status'] = 'finished'
 
+    win_taunts = ["Ну вы даёте! 🔥", "Красиво сыграно!", "Чистая победа!", "Вот это комбо!"]
+    bot_taunts = ["Бот в ударе сегодня 🤖", "Не повезло — реванш?", "Бот считает на 9 ходов вперёд 😏"]
+
     if game['type'] == 'ttt_bot':
         player = game['player']
         u = storage.get_user(message.chat.id, player)
         u['ttt_games'] = u.get('ttt_games', 0) + 1
         if winner == 'X':
             u['ttt_wins'] = u.get('ttt_wins', 0) + 1
-            title = f"🎮 Крестики-Нолики\n✅ Вы победили!"
+            title = f"🎮 Крестики-Нолики\n✅ Вы победили! {random.choice(win_taunts)}"
         elif winner == 'O':
-            title = f"🎮 Крестики-Нолики\n❌ Победил бот!"
+            title = f"🎮 Крестики-Нолики\n❌ Победил бот! {random.choice(bot_taunts)}"
         else:
-            title = f"🎮 Крестики-Нолики\n🤝 Ничья!"
+            title = f"🎮 Крестики-Нолики\n🤝 Ничья! Бот с этим ИИ проигрывает крайне редко 👀"
+        title += f"\n\n📊 Побед: {u.get('ttt_wins', 0)} | Игр: {u.get('ttt_games', 0)}"
     else:
         p1, p2 = game['players']
         for pid in [p1, p2]:
@@ -3693,27 +4347,41 @@ async def end_ttt_game(game: dict, game_id: str, winner: str, message):
             if winner and pid == (p1 if winner == 'X' else p2):
                 u['ttt_wins'] = u.get('ttt_wins', 0) + 1
 
+        u1 = storage.get_user(message.chat.id, p1)
+        u2 = storage.get_user(message.chat.id, p2)
+
         if winner == 'X':
             title = f"🎮 Крестики-Нолики\n✅ Победил {mention(message.chat.id, p1)}!"
         elif winner == 'O':
             title = f"🎮 Крестики-Нолики\n✅ Победил {mention(message.chat.id, p2)}!"
         else:
             title = f"🎮 Крестики-Нолики\n🤝 Ничья!"
+        title += (f"\n\n📊 {mention(message.chat.id, p1)}: {u1.get('ttt_wins', 0)} побед | "
+                  f"{mention(message.chat.id, p2)}: {u2.get('ttt_wins', 0)} побед")
 
     storage.mark_dirty()
     await storage.save()
 
-    # Финальная отрисовка
+    # Финальная отрисовка с подсветкой выигрышной линии
     board = game['board']
+    win_line = ttt_winning_line(board) if winner else None
     keyboard = []
     for i in range(3):
         row = []
         for j in range(3):
             cell = board[i][j]
-            text = '❌' if cell == 'X' else '⭕' if cell == 'O' else '⬜'
+            base = '❌' if cell == 'X' else '⭕' if cell == 'O' else '⬜'
+            text = f"🔥{base}" if win_line and (i, j) in win_line else base
             row.append(InlineKeyboardButton(text=text, callback_data="ttt_noop"))
         keyboard.append(row)
 
+    if game['type'] == 'ttt_bot':
+        keyboard.append([InlineKeyboardButton(text="🔄 Реванш", callback_data="ttt_mode_bot")])
+    else:
+        keyboard.append([InlineKeyboardButton(
+            text="🔄 Реванш",
+            callback_data=f"tttrematch_{game['players'][0]}_{game['players'][1]}"
+        )])
     keyboard.append([InlineKeyboardButton(text="🎮 В меню", callback_data="game_back_to_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -3795,6 +4463,34 @@ async def ttt_noop_handler(call: CallbackQuery):
     await call.answer("❌ Клетка занята!", show_alert=True)
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith('tttrematch_'))
+async def ttt_rematch_handler(call: CallbackQuery):
+    """Реванш в TTT-дуэли — перезапуск без повторного вызова/принятия"""
+    parts = call.data.split('_')
+    p1, p2 = int(parts[1]), int(parts[2])
+
+    if call.from_user.id not in (p1, p2):
+        await call.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    await start_ttt_duel(call, {'challenger': p1, 'opponent': p2})
+    await call.answer("🔄 Реванш!")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith('rpsrematch_'))
+async def rps_rematch_handler(call: CallbackQuery):
+    """Реванш в RPS-дуэли — перезапуск без повторного вызова/принятия"""
+    parts = call.data.split('_')
+    p1, p2 = int(parts[1]), int(parts[2])
+
+    if call.from_user.id not in (p1, p2):
+        await call.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    await start_rps_duel(call, {'challenger': p1, 'opponent': p2})
+    await call.answer("🔄 Реванш!")
+
+
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
 def check_ttt_winner(board: list) -> str:
@@ -3809,6 +4505,20 @@ def check_ttt_winner(board: list) -> str:
         return board[0][0]
     if board[0][2] == board[1][1] == board[2][0] != ' ':
         return board[0][2]
+
+    return None
+
+
+def ttt_winning_line(board: list) -> list:
+    """Возвращает список координат выигрышной линии, либо None"""
+    lines = [[(i, 0), (i, 1), (i, 2)] for i in range(3)] + \
+            [[(0, j), (1, j), (2, j)] for j in range(3)] + \
+            [[(0, 0), (1, 1), (2, 2)], [(0, 2), (1, 1), (2, 0)]]
+
+    for line in lines:
+        a, b, c = (board[i][j] for i, j in line)
+        if a == b == c != ' ':
+            return line
 
     return None
 
@@ -3837,12 +4547,14 @@ async def cmd_game(msg: Message):
     await cmd_games_menu(msg)
 
 
-async def cmd_rps(msg: Message):
+async def cmd_rps(msg: Message, cmd_name: str = 'кнб'):
     """Текстовая команда для КНБ"""
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'games')
 
     text = msg.text.strip()
-    for prefix in ['!', '?', '/']:
+    for prefix in ['!']:
         if text.startswith(prefix):
             text = text[1:].strip()
             break
@@ -3903,36 +4615,69 @@ async def cmd_rps(msg: Message):
 
 # ==================== Опросы ====================
 
-async def cmd_poll(msg: Message):
+async def cmd_poll(msg: Message, cmd_name: str = 'опрос'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    
+    # Парсим текст: получаем всё после команды !опрос
     text = msg.text.strip()
-    if text.lower().startswith('опрос'):
-        text = text[5:].strip()
+    
+    # Удаляем префикс команды если есть
+    for prefix in ['!опрос', '!poll']:
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    
     if not text:
-        return await msg.answer("❌ <code>опрос Вопрос? | Да | Нет</code>")
+        return await msg.answer("❌ <code>!опрос Вопрос? | Да | Нет</code>")
+    
+    # Парсим по разделителю |
     parts = [p.strip() for p in text.split('|') if p.strip()]
     if len(parts) < 3:
-        return await msg.answer("❌ Нужен вопрос и минимум 2 варианта")
+        return await msg.answer("❌ Нужен вопрос и минимум 2 варианта ответа. Пример: <code>!опрос Это опрос? | Да | Нет</code>")
+    
     question, options = parts[0], parts[1:11]
     if len(options) < 2:
-        return await msg.answer("❌ Минимум 2 варианта")
-    kb = InlineKeyboardBuilder()
-    for i, option in enumerate(options):
-        kb.button(text=option[:50], callback_data=f"poll_vote_{i}")
-    kb.adjust(1)
-    poll_msg = await msg.answer(
-        f"📊 <b>Опрос от {mention(msg.chat.id, msg.from_user.id)}</b>\n\n❓ {question}\n\n" + "\n".join(
-            f"{i + 1}. {opt} (0)" for i, opt in enumerate(options)), reply_markup=kb.as_markup(),
-        disable_web_page_preview=True)
+        return await msg.answer("❌ Минимум 2 варианта ответа")
+    
+    # Проверяем что вопрос не пустой
+    if not question or question == text:
+        return await msg.answer("❌ Введите вопрос перед первым |")
+
+    try:
+        poll_msg = await msg.answer_poll(
+            question=question,
+            options=options,
+            is_anonymous=False,
+            type='regular',
+            allows_multiple_answers=False,
+        )
+    except Exception as e:
+        logger.exception("Ошибка создания реального опроса")
+        return await msg.answer(f"❌ Не удалось создать опрос: {e}")
+
     polls = storage.get_chat(msg.chat.id, 'polls')
     if not isinstance(polls, list):
-        polls = [];
+        polls = []
         storage.data['polls'][str(msg.chat.id)] = polls
-    polls.append(
-        {'message_id': poll_msg.message_id, 'chat_id': msg.chat.id, 'creator': msg.from_user.id, 'question': question,
-         'options': options, 'votes': {i: [] for i in range(len(options))}, 'voters': {}, 'created_at': time.time()})
-    storage.mark_dirty();
+    polls.append({
+        'message_id': poll_msg.message_id,
+        'chat_id': msg.chat.id,
+        'creator': msg.from_user.id,
+        'question': question,
+        'options': options,
+        'poll_id': poll_msg.poll.id,
+        'created_at': time.time(),
+    })
+    storage.mark_dirty()
     await storage.save()
+    
+    # Удаляем исходное сообщение с командой
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сообщение с опросом: {e}")
 
 
 @router.callback_query(F.data.startswith('poll_vote_'))
@@ -3969,8 +4714,10 @@ async def poll_vote_handler(call: CallbackQuery):
 
 # ==================== Интеграции ====================
 
-async def cmd_weather(msg: Message):
+async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
     """Погода через Open-Meteo (с редактированием сообщения)"""
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     parts = msg.text.split(maxsplit=1)
@@ -4093,7 +4840,9 @@ async def cmd_weather(msg: Message):
         await status_msg.edit_text(f"❌ Не удалось получить погоду для '{city}'")
 
 
-async def cmd_random_joke(msg: Message):
+async def cmd_random_joke(msg: Message, cmd_name: str = 'шутка'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     try:
         import aiohttp
@@ -4120,17 +4869,21 @@ async def cmd_random_joke(msg: Message):
         await msg.answer("❌ Ошибка")
 
 
-async def cmd_iris(msg: Message):
-    query = msg.text[5:].strip().lower()
-    responses = {'характер': '🌸 Я дружелюбный бот-помощник!', 'версия': '🌸 Iris Bot v3.0',
-                 'помощь': 'Используйте /помощь'}
+async def cmd_iris(msg: Message, cmd_name: str = 'валера'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    query = re.sub(r'^\S+\s*', '', msg.text, count=1).strip().lower()
+    responses = {'характер': '🐻 Я обкуренный желейный медведь-помощник!', 'версия': '🐻 Обкуренный Валера v3.0',
+                 'помощь': 'Используйте !помощь'}
     for key, resp in responses.items():
         if key in query:
             return await msg.answer(resp)
-    await msg.answer("🌸 Спросите: характер, версия, помощь")
+    await msg.answer("🐻 Спросите: характер, версия, помощь")
 
 
-async def cmd_report(msg: Message):
+async def cmd_report(msg: Message, cmd_name: str = 'репорт'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     parts = msg.text.split(maxsplit=1)
     reason = parts[1] if len(parts) > 1 else 'Не указана'
     text = f"🚨 <b>Репорт</b>\n👤 {mention(msg.chat.id, msg.from_user.id)}\n💬 {msg.chat.title}\n📝 {reason}"
@@ -4166,9 +4919,9 @@ async def cmd_report(msg: Message):
 
 # ==================== Ранги ====================
 
-async def cmd_promote(msg: Message):
+async def cmd_promote(msg: Message, cmd_name: str = 'повысить'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 5):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return await msg.answer("❌ Недостаточно прав!")
 
     parts = msg.text.split()
@@ -4198,56 +4951,185 @@ async def cmd_promote(msg: Message):
             new_rank = current + int(rank_arg[1:])
         elif rank_arg and rank_arg.startswith('-'):
             new_rank = max(0, current - int(rank_arg[1:]))
+        elif rank_arg:
+            new_rank = int(rank_arg)
         else:
-            new_rank = int(rank_arg) if rank_arg else current
+            new_rank = current + 1
     except:
         return await msg.answer("❌ Неверный ранг. Используйте число, +N или -N")
 
-    if new_rank < 0 or new_rank > 8:
-        return await msg.answer("❌ Ранг 0-8")
+    if new_rank < 0 or new_rank > MAX_RANK:
+        return await msg.answer(f"❌ Ранг 0-{MAX_RANK}")
 
     storage.get_user(msg.chat.id, tid)['rank'] = new_rank
     storage.mark_dirty()
     await storage.save()
-    await msg.answer(f"🎉 {mention(msg.chat.id, tid)}: {RANK_NAMES.get(current)} → {RANK_NAMES.get(new_rank)}",
+    await msg.answer(f"🎉 {mention(msg.chat.id, tid)}: {get_rank_name(msg.chat.id, current)} → {get_rank_name(msg.chat.id, new_rank)}",
                      disable_web_page_preview=True)
 
 
-async def cmd_demote(msg: Message):
+async def cmd_demote(msg: Message, cmd_name: str = 'понизить'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 5):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return await msg.answer("❌ Недостаточно прав!")
 
     parts = msg.text.split()
 
     tid = None
+    rank_arg = None
+
     if msg.reply_to_message and msg.reply_to_message.from_user:
         tid = msg.reply_to_message.from_user.id
-    elif len(parts) > 1:
+        if len(parts) > 1:
+            rank_arg = parts[1]
+    else:
+        if len(parts) < 2:
+            return await msg.answer("❌ <code>понизить @user</code> или ответом")
         tid = await get_target(msg, parts[1])
+        if len(parts) > 2:
+            rank_arg = parts[2]
 
     if not tid:
         return await msg.answer("❌ <code>понизить @user</code> или ответом")
 
     current = storage.get_user(msg.chat.id, tid).get('rank', 0)
-    new_rank = max(0, current - 1)
+    try:
+        if rank_arg and rank_arg.startswith('+'):
+            new_rank = current + int(rank_arg[1:])
+        elif rank_arg and rank_arg.startswith('-'):
+            new_rank = max(0, current - int(rank_arg[1:]))
+        elif rank_arg:
+            new_rank = int(rank_arg)
+        else:
+            new_rank = max(0, current - 1)
+    except:
+        return await msg.answer("❌ Неверный ранг. Используйте число, +N или -N")
+
+    if new_rank < 0 or new_rank > MAX_RANK:
+        return await msg.answer(f"❌ Ранг 0-{MAX_RANK}")
 
     storage.get_user(msg.chat.id, tid)['rank'] = new_rank
     storage.mark_dirty()
     await storage.save()
-    await msg.answer(f"📉 {mention(msg.chat.id, tid)}: {RANK_NAMES.get(current)} → {RANK_NAMES.get(new_rank)}",
+    await msg.answer(f"📉 {mention(msg.chat.id, tid)}: {get_rank_name(msg.chat.id, current)} → {get_rank_name(msg.chat.id, new_rank)}",
                      disable_web_page_preview=True)
 
 
-# ==================== Ник и настройки ====================
+# ==================== Погоняло и ник ====================
 
-async def cmd_nick(msg: Message):
+async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
+    """Устанавливает/сбрасывает тег пользователя.
+    Примеры:
+      !погоняло Крутой чел
+      !погоняло @user Крутой
+      !погоняло сбросить
+    """
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    raw = msg.text.strip()
+    if raw.startswith('!'):
+        raw = raw[1:].strip()
+
+    args = raw[len(cmd_name):].strip() if raw.lower().startswith(cmd_name.lower()) else raw
+    if not args:
+        user_tag = (storage.get_user(msg.chat.id, msg.from_user.id).get('custom_tag') or '').strip()
+        return await msg.answer(
+            "🏷️ <b>Погоняло</b>\n\n"
+            f"Текущий тег: <b>{user_tag or 'не установлен'}</b>\n\n"
+            f"<code>!погоняло Крутой чел</code> — установить себе\n"
+            f"<code>!погоняло @user Крутой</code> — для админа\n"
+            f"<code>!погоняло сбросить</code> — убрать\n"
+            f"<i>Лимит: до {MAX_TAG_LENGTH} символов</i>"
+        )
+
+    parts = args.split(maxsplit=2)
+    target_id = None
+    target_name = None
+
+    if parts and parts[0].startswith('@'):
+        if msg.from_user.id != MAIN_ADMIN_ID and storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) < 1:
+            return await msg.answer("❌ Сменить тег другому человеку могут только администраторы.")
+        target_id = await get_target(msg, parts[0])
+        if not target_id:
+            return await msg.answer("❌ Не удалось найти пользователя.")
+        if len(parts) < 2:
+            return await msg.answer("❌ Укажите тег после @user. Пример: <code>!погоняло @user Крутой</code>")
+        target_name = parts[1].strip()
+        if len(parts) > 2:
+            target_name = ' '.join(parts[1:]).strip()
+    else:
+        target_id = msg.from_user.id
+        target_name = args.strip()
+
+    if target_name.lower() in ('сбросить', 'очистить', 'reset'):
+        storage.get_user(msg.chat.id, target_id)['custom_tag'] = ''
+        storage.invalidate_user_cache(msg.chat.id, target_id)
+        mention_cache.invalidate(f"mention_{msg.chat.id}_{target_id}")
+        storage.mark_dirty()
+        await storage.save()
+
+        try:
+            await bot.set_chat_administrator_custom_title(msg.chat.id, target_id, "")
+        except Exception:
+            pass
+
+        tag_error = None
+        try:
+            await bot.set_chat_member_tag(msg.chat.id, target_id, "")
+        except Exception as e:
+            tag_error = str(e)
+            logger.warning(f"set_chat_member_tag (сброс) не сработал для {target_id} в {msg.chat.id}: {e}")
+
+        if tag_error:
+            return await msg.answer(f"✅ Тег сброшен.\n⚠️ Видимый тег в Telegram не убран: <code>{html.escape(tag_error)}</code>")
+        return await msg.answer("✅ Тег сброшен.")
+
+    text = target_name.strip()
+    if not text:
+        return await msg.answer("❌ Тег не может быть пустым.")
+    if len(text) > MAX_TAG_LENGTH:
+        return await msg.answer(f"❌ Слишком длинный тег. Максимум {MAX_TAG_LENGTH} символов.")
+
+    storage.get_user(msg.chat.id, target_id)['custom_tag'] = text
+    storage.invalidate_user_cache(msg.chat.id, target_id)
+    mention_cache.invalidate(f"mention_{msg.chat.id}_{target_id}")
+    storage.mark_dirty()
+    await storage.save()
+
+    try:
+        await bot.set_chat_administrator_custom_title(msg.chat.id, target_id, text)
+    except Exception:
+        pass
+
+    tag_error = None
+    try:
+        await bot.set_chat_member_tag(msg.chat.id, target_id, text[:16])
+    except Exception as e:
+        tag_error = str(e)
+        logger.warning(f"set_chat_member_tag не сработал для {target_id} в {msg.chat.id}: {e}")
+
+    if target_id == msg.from_user.id:
+        result_msg = f"✅ Погоняло изменено!\n🏷️ <b>{text}</b>"
+    else:
+        result_msg = f"✅ Погоняло для {mention(msg.chat.id, target_id)} изменено на <b>{text}</b>"
+
+    if tag_error:
+        result_msg += f"\n⚠️ Видимый тег в Telegram не установлен: <code>{html.escape(tag_error)}</code>"
+
+    return await msg.answer(result_msg)
+
+
+async def cmd_nick(msg: Message, cmd_name: str = 'ник'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     text = msg.text.strip()
 
     # Очищаем от префиксов
-    for prefix in ['!', '?', '/']:
+    for prefix in ['!']:
         if text.startswith(prefix):
             text = text[1:].strip()
             break
@@ -4304,8 +5186,8 @@ async def cmd_nick(msg: Message):
     return await msg.answer(f"✅ Ник изменён!\n📝 {old} → <b>{new_name}</b>")
 
 
-async def cmd_anti_moderation(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 7):
+async def cmd_anti_moderation(msg: Message, cmd_name: str = 'антимодерация'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     settings = storage.get_chat_settings(msg.chat.id)
     settings['anti_moderation'] = not settings.get('anti_moderation', True)
@@ -4315,8 +5197,8 @@ async def cmd_anti_moderation(msg: Message):
     await msg.answer(f"Анти-модерация: {'🛡️ включена' if settings['anti_moderation'] else '⚠️ выключена'}")
 
 
-async def cmd_anti_spam(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 5):
+async def cmd_anti_spam(msg: Message, cmd_name: str = 'антиспам'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return await msg.answer("❌ Недостаточно прав! Требуется ранг 5+")
 
     settings = storage.get_chat_settings(msg.chat.id)
@@ -4335,78 +5217,411 @@ async def cmd_anti_spam(msg: Message):
 
 # ==================== ДК-система ====================
 
-async def cmd_dk_set(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'дк', 7):
+def get_all_commands() -> List[str]:
+    """Возвращает отсортированный список уникальных команд"""
+    return sorted(list(set(COMMANDS.keys())))
+
+
+# Встроенный минимальный ранг для функций-обработчиков команд. Должен
+# соответствовать значениям min_rank, передаваемым в check_access()
+# внутри каждой функции.
+FUNCTION_MIN_RANK = {
+    'cmd_rank_rename': 5,
+    'cmd_mute': 1, 'cmd_unmute': 1,
+    'cmd_ban': 3, 'cmd_unban': 3,
+    'cmd_warn': 1,
+    'cmd_unwarn': 2,
+    'cmd_del': 1,
+    'cmd_pin': 2,
+    'cmd_purge': 2,
+    'cmd_close_topic': 2, 'cmd_open_topic': 2,
+    'cmd_add_iso': 3, 'cmd_rem_iso': 3,
+    'cmd_give_award': 4, 'cmd_rem_award': 4,
+    'cmd_add_phrase': 1, 'cmd_del_phrase': 1,
+    'cmd_welcome': 2, 'cmd_farewell': 2,
+    'cmd_add_rule': 4, 'cmd_clear_rules': 4,
+    'cmd_promote': 5, 'cmd_demote': 5,
+    'cmd_anti_moderation': 5, 'cmd_anti_spam': 5,
+    'cmd_dk_set': 5, 'cmd_dk_enable': 5, 'cmd_dk_disable': 5,
+    'cmd_ldk_add': 5, 'cmd_ldk_rem': 5, 'cmd_dk_menu': 5,
+    'cmd_ping': 5, 'cmd_backup': 5, 'cmd_restore': 5,
+    'cmd_forward': 3,
+}
+
+# Встроенный минимальный ранг по КАЖДОЙ команде/алиасу (не только
+# "основному" названию) — строится автоматически из COMMANDS, чтобы
+# алиасы одной функции (напр. "-мут"/"размут", "warn"/"пред") всегда
+# показывали тот же реальный ранг, что и check_access(). Если команды
+# нет здесь, по умолчанию она реально доступна всем (min_rank = 0).
+DEFAULT_COMMAND_MIN_RANK = {
+    cmd: FUNCTION_MIN_RANK[func]
+    for cmd, func in COMMANDS.items()
+    if func in FUNCTION_MIN_RANK
+}
+
+
+DK_CATEGORIES = {
+    'info': ("📊 Инфо и статистика", [
+        (['кто я', 'профиль'], None),
+        (['кто ты'], None),
+        (['кто админ'], None),
+        (['ранг', 'ранги'], None),
+        (['.ид'], None),
+        (['топ'], None),
+        (['статистика чата', 'статистика'], None),
+        (['опрос'], None),
+        (['погода', 'п'], None),
+        (['шутка'], None),
+        (['валера'], None),
+    ]),
+    'moderation': ("🛡️ Модерация", [
+        (['мут', 'размут', '-мут'], None),
+        (['бан', 'разбан', '-бан'], None),
+        (['пред', 'варн', 'warn'], None),
+        (['преды', 'варны', 'warns'], None),
+        (['снятьпред', 'снятьварн', '-пред', '-варн', 'unwarn'], None),
+        (['-смс'], None),
+        (['.пин'], None),
+        (['очистить'], None),
+        (['повысить'], None),
+        (['понизить'], None),
+        (['репорт'], None),
+        (['ник'], None),
+    ]),
+    'topics': ("📂 Топики и изоляция", [
+        (['закрыть топик', 'открыть топик'], None),
+        (['топики'], None),
+        (['+изоляция', '-изоляция'], None),
+        (['изоляция'], None),
+    ]),
+    'awards': ("🏆 Награды и браки", [
+        (['наградить', 'снять награду'], None),
+        (['мои награды'], None),
+        (['топ наград'], None),
+        (['брак', 'принять брак', 'отклонить брак'], None),
+        (['развод'], None),
+        (['браки'], None),
+    ]),
+    'phrases': ("💬 Фразы, приветствия, правила", [
+        (['добавить фразу', 'удалить фразу'], None),
+        (['фразы'], None),
+        (['статистика фраз'], None),
+        (['показать фразу'], None),
+        (['приветствие'], None),
+        (['прощание текст'], None),
+        (['правила'], None),
+        (['добавитьправило'], None),
+        (['очиститьправила'], None),
+    ]),
+    'games': ("🎮 Игры", [
+        (['игры', 'игра', 'game', 'играть'], None),
+        (['кнб', 'кнб бот'], None),
+        (['камень', 'ножницы', 'бумага'], None),
+        (['крестики нолики', 'ttt'], None),
+    ]),
+    'settings': ("⚙️ Настройки и ДК", [
+        (['антимодерация'], None),
+        (['антиспам'], None),
+        (['дк'], None),
+        (['+дк', '-дк'], None),
+        (['+лдк', '-лдк'], None),
+        (['дкм'], None),
+    ]),
+    'admin': ("🛠️ Админ", [
+        (['общий сбор'], None),
+        (['бэкап'], None),
+        (['восстановить'], None),
+        (['перед'], None),
+        (['название ранга', 'переранг'], None),
+    ]),
+}
+
+
+def match_dk_command(tokens: List[str]) -> tuple:
+    """Ищет команду ДК в начале списка токенов: команды могут состоять
+    из 1 или 2 слов ('дк', 'закрыть топик' и т.д.). Возвращает
+    (найденная_команда, оставшиеся_токены) либо (None, tokens), если
+    совпадение не найдено. Пробуем сначала 2 слова, чтобы не потерять
+    составные команды."""
+    if len(tokens) >= 2:
+        two_word = f"{tokens[0]} {tokens[1]}".lower().strip()
+        if two_word in COMMANDS:
+            return two_word, tokens[2:]
+    if tokens:
+        one_word = tokens[0].lower().strip()
+        if one_word in COMMANDS:
+            return one_word, tokens[1:]
+    return None, tokens
+
+
+def dk_info_main_kb() -> InlineKeyboardMarkup:
+    keys = list(DK_CATEGORIES.keys())
+    rows = []
+    for i in range(0, len(keys), 2):
+        row = [InlineKeyboardButton(text=DK_CATEGORIES[k][0], callback_data=f"dkinfo_{k}")
+               for k in keys[i:i + 2]]
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="dkinfo_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def dk_info_section_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="dkinfo_back")]
+    ])
+
+
+def dk_info_section_text(chat_id: int, section: str) -> str:
+    try:
+        label, cmd_groups = DK_CATEGORIES[section]
+        chat_id_str = str(chat_id)
+        acc = storage.data['command_access'].get(chat_id_str, {})
+        personal = storage.data['personal_access'].get(chat_id_str, {})
+
+        lines = [f"🔐 <b>{label}</b>\n"]
+        
+        if not cmd_groups:
+            return "\n".join(lines) + "\n(нет команд)"
+        
+        for cmd_entry in cmd_groups:
+            # Каждый элемент cmd_groups — кортеж (variants_list, extra_info)
+            if not isinstance(cmd_entry, (list, tuple)) or not cmd_entry:
+                logger.warning(f"Пустой или невалидный cmd_entry в {section}")
+                continue
+
+            cmd_variants = cmd_entry[0]
+            if not isinstance(cmd_variants, (list, tuple)) or not cmd_variants:
+                logger.warning(f"Пустой или невалидный cmd_variants в {section}")
+                continue
+
+            primary_cmd = cmd_variants[0]
+            if not primary_cmd:
+                logger.warning(f"Пустая первая команда в {section}")
+                continue
+            
+            try:
+                level = acc.get(primary_cmd)
+                if level is None:
+                    default_rank = DEFAULT_COMMAND_MIN_RANK.get(primary_cmd, 0)
+                    if default_rank:
+                        status = f"🔒 уровень {default_rank}+ <i>(по умолчанию)</i>"
+                    else:
+                        status = "✅ доступна всем <i>(по умолчанию)</i>"
+                elif level == 9:
+                    status = "❌ отключена"
+                elif level == 0:
+                    status = "✅ доступна всем"
+                else:
+                    status = f"🔒 уровень {level}+"
+                
+                p_users = personal.get(primary_cmd, [])
+                extra = f" · 👤 личный доступ: {len(p_users)}" if p_users else ""
+                
+                # Выводим все вариации команды с защитой от пустых строк
+                cmd_list = [str(cmd).strip() for cmd in cmd_variants if cmd]
+                if not cmd_list:
+                    continue
+                    
+                cmd_str = " / ".join(f"<code>{cmd}</code>" for cmd in cmd_list)
+                lines.append(f"• {cmd_str} — {status}{extra}")
+            except Exception as e:
+                logger.error(f"Ошибка обработки команды {primary_cmd}: {e}")
+                lines.append(f"• <i>ошибка: {primary_cmd}</i>")
+        
+        text = "\n".join(lines)
+        if not text or len(text) == 0:
+            return "❌ Нет данных"
+        return text
+        
+    except Exception as e:
+        logger.error(f"dk_info_section_text ошибка в {section}: {e}", exc_info=True)
+        return f"❌ Ошибка загрузки раздела: {str(e)[:100]}"
+
+
+async def cmd_dk_set(msg: Message, cmd_name: str = 'дк'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
+        return
+    parts = msg.text.split()
+    if len(parts) >= 2 and parts[1].lower().strip() == 'инфо':
+        return await cmd_dk_info(msg)
+    if len(parts) < 3:
+        all_cmds = get_all_commands()
+        return await msg.answer("❌ <code>!дк команда 0-5/откл</code> или <code>!дк инфо</code>\n\n" + 
+                               f"Доступно {len(all_cmds)} команд (первые 10): " + ', '.join(all_cmds[:10]))
+    command, rest = match_dk_command(parts[1:])
+    if command is None:
+        return await msg.answer(f"❌ Неизвестная команда '{parts[1]}'\n\nУкажите команду из доступных")
+    if not rest:
+        return await msg.answer("❌ Уровень 0-5 или откл")
+    level_token = rest[0]
+    level = 9 if level_token == 'откл' else (int(level_token) if level_token.isdigit() else None)
+    if level is None or not (0 <= level <= 5):
+        return await msg.answer("❌ Уровень 0-5 или откл")
+    storage.data['command_access'].setdefault(str(msg.chat.id), {})[command] = level
+    storage.mark_dirty();
+    await storage.save()
+    await msg.answer(f"✅ Доступ к команде '{command}' установлен на уровень {level}")
+
+
+async def cmd_dk_menu(msg: Message, cmd_name: str = 'дкм'):
+    """Быстрый доступ к меню ДК (алиас '!дк инфо'), с той же проверкой доступа."""
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
+        return
+    await cmd_dk_info(msg)
+
+
+async def cmd_dk_info(msg: Message):
+    acc = storage.data['command_access'].get(str(msg.chat.id), {})
+    total = sum(len(cmd_groups) for _, cmd_groups in DK_CATEGORIES.values())
+    text = (f"🔐 <b>Настройки ДК</b>\n\nВыберите раздел ниже 👇\n\n"
+            f"📊 Настроено вручную: {len(acc)} из {total}")
+    await msg.answer(text, reply_markup=dk_info_main_kb())
+
+
+@router.callback_query(F.data.startswith('dkinfo_'))
+async def dk_info_callback(call: CallbackQuery):
+    try:
+        action = call.data.replace('dkinfo_', '', 1)
+        logger.info(f"dkinfo callback: action={action}, user={call.from_user.id}, chat={call.message.chat.id}")
+        
+        # Закрыть - всем доступно
+        if action == 'close':
+            try:
+                await call.message.delete()
+            except Exception as e:
+                logger.debug(f"Не удалось удалить сообщение: {e}")
+            await call.answer()
+            return
+        
+        # Назад - всем доступно
+        if action == 'back':
+            try:
+                acc = storage.data['command_access'].get(str(call.message.chat.id), {})
+                total = sum(len(cmd_groups) for _, cmd_groups in DK_CATEGORIES.values())
+                text = (f"🔐 <b>Настройки ДК</b>\n\nВыберите раздел ниже 👇\n\n"
+                        f"📊 Настроено вручную: {len(acc)} из {total}")
+                await call.message.edit_text(text, reply_markup=dk_info_main_kb())
+                await call.answer()
+            except Exception as e:
+                logger.error(f"Ошибка в back: {type(e).__name__}: {e}")
+                await call.answer(f"❌ Ошибка back: {str(e)[:100]}", show_alert=True)
+            return
+        
+        # Открыть раздел - требует доступ
+        if not check_access(call.from_user.id, call.message.chat.id, 'дк', 5):
+            await call.answer("❌ Нет доступа к ДК", show_alert=True)
+            return
+        
+        if action not in DK_CATEGORIES:
+            logger.warning(f"Unknown dkinfo section: {action}")
+            await call.answer(f"❌ Неизвестный раздел: {action}", show_alert=True)
+            return
+            
+        try:
+            logger.debug(f"Генерирую текст для {action}...")
+            text = dk_info_section_text(call.message.chat.id, action)
+            logger.debug(f"Текст сгенерирован ({len(text)} символов), редактирую сообщение...")
+            await call.message.edit_text(text, reply_markup=dk_info_section_kb())
+            logger.info(f"Успешно открыт раздел {action}")
+            await call.answer()
+        except Exception as e:
+            logger.error(f"Ошибка в dkinfo_{action}: {type(e).__name__}: {e}", exc_info=True)
+            await call.answer(f"❌ {type(e).__name__}: {str(e)[:80]}", show_alert=True)
+        
+    except Exception as e:
+        logger.error(f"dk_info_callback критическая ошибка: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            await call.answer(f"❌ Критическая ошибка: {str(e)[:80]}", show_alert=True)
+        except:
+            logger.error("Не удалось отправить алерт об ошибке")
+
+
+async def cmd_dk_enable(msg: Message, cmd_name: str = '+дк'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
+        return
+    command = ' '.join(msg.text.split()[1:]).lower().strip()
+    if command not in COMMANDS:
+        return await msg.answer(f"❌ Неизвестная команда '{command}'")
+    storage.data['command_access'].setdefault(str(msg.chat.id), {})[command] = 0
+    storage.mark_dirty();
+    await storage.save()
+    await msg.answer(f"✅ Команда '{command}' включена (доступна всем)")
+
+
+async def cmd_dk_disable(msg: Message, cmd_name: str = '-дк'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
+        return
+    command = ' '.join(msg.text.split()[1:]).lower().strip()
+    if command not in COMMANDS:
+        return await msg.answer(f"❌ Неизвестная команда '{command}'")
+    storage.data['command_access'].setdefault(str(msg.chat.id), {})[command] = 9
+    storage.mark_dirty();
+    await storage.save()
+    await msg.answer(f"❌ Команда '{command}' отключена")
+
+
+async def cmd_ldk_add(msg: Message, cmd_name: str = '+лдк'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     parts = msg.text.split()
     if len(parts) < 3:
-        return await msg.answer("❌ <code>!дк команда 0-9/откл</code>")
-    level = 9 if parts[2] == 'откл' else (int(parts[2]) if parts[2].isdigit() else None)
-    if level is None:
-        return await msg.answer("❌ Уровень 0-9 или откл")
-    storage.data['command_access'].setdefault(str(msg.chat.id), {})[parts[1]] = level
-    storage.mark_dirty();
-    await storage.save()
-    await msg.answer(f"✅ Доступ к '{parts[1]}' установлен на уровень {level}")
-
-
-async def cmd_dk_enable(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'дк', 7):
-        return
-    section = ' '.join(msg.text.split()[1:])
-    storage.data['command_access'].setdefault(str(msg.chat.id), {})[section] = 0
-    storage.mark_dirty();
-    await storage.save()
-    await msg.answer(f"✅ Раздел '{section}' включен")
-
-
-async def cmd_dk_disable(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'дк', 7):
-        return
-    section = ' '.join(msg.text.split()[1:])
-    storage.data['command_access'].setdefault(str(msg.chat.id), {})[section] = 9
-    storage.mark_dirty();
-    await storage.save()
-    await msg.answer(f"❌ Раздел '{section}' отключен")
-
-
-async def cmd_ldk_add(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'дк', 7):
-        return
-    parts = msg.text.split()
-    if len(parts) < 3:
-        return await msg.answer("❌ <code>+лдк команда @user</code>")
-    tid = await get_target(msg, parts[2])
+        return await msg.answer("❌ <code>!+лдк команда @user</code>")
+    command, rest = match_dk_command(parts[1:])
+    if command is None:
+        return await msg.answer(f"❌ Неизвестная команда '{parts[1]}'")
+    if not rest:
+        return await msg.answer("❌ <code>!+лдк команда @user</code>")
+    tid = await get_target(msg, rest[0])
     if not tid:
         return await msg.answer("❌ Пользователь не найден")
-    storage.data['personal_access'].setdefault(str(msg.chat.id), {}).setdefault(parts[1], []).append(tid)
+    access_list = storage.data['personal_access'].setdefault(str(msg.chat.id), {}).setdefault(command, [])
+    if tid in access_list:
+        return await msg.answer(f"⚠️ У {mention(msg.chat.id, tid)} уже есть личный доступ к команде '{command}'",
+                                 disable_web_page_preview=True)
+    access_list.append(tid)
     storage.mark_dirty();
     await storage.save()
-    await msg.answer(f"✅ Личный доступ к '{parts[1]}' выдан {mention(msg.chat.id, tid)}", disable_web_page_preview=True)
+    await msg.answer(f"✅ Личный доступ к команде '{command}' выдан {mention(msg.chat.id, tid)}", disable_web_page_preview=True)
 
 
-async def cmd_ldk_rem(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'дк', 7):
+async def cmd_ldk_rem(msg: Message, cmd_name: str = '-лдк'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     parts = msg.text.split()
     if len(parts) < 3:
-        return await msg.answer("❌ <code>-лдк команда @user</code>")
-    tid = await get_target(msg, parts[2])
+        return await msg.answer("❌ <code>!-лдк команда @user</code>")
+    command, rest = match_dk_command(parts[1:])
+    if command is None:
+        return await msg.answer(f"❌ Неизвестная команда '{parts[1]}'")
+    if not rest:
+        return await msg.answer("❌ <code>!-лдк команда @user</code>")
+    tid = await get_target(msg, rest[0])
     if not tid:
         return await msg.answer("❌ Пользователь не найден")
-    acc = storage.data['personal_access'].get(str(msg.chat.id), {}).get(parts[1], [])
+    acc = storage.data['personal_access'].get(str(msg.chat.id), {}).get(command, [])
     if tid in acc:
         acc.remove(tid)
         storage.mark_dirty();
         await storage.save()
-        await msg.answer(f"✅ Доступ к '{parts[1]}' отозван у {mention(msg.chat.id, tid)}",
+        await msg.answer(f"✅ Доступ к команде '{command}' отозван у {mention(msg.chat.id, tid)}",
+                         disable_web_page_preview=True)
+    else:
+        await msg.answer(f"❌ У {mention(msg.chat.id, tid)} нет личного доступа к команде '{command}'",
                          disable_web_page_preview=True)
 
 
 # ==================== Админ-команды ====================
 
-async def cmd_ping(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 5):
+async def cmd_ping_check(msg: Message):
+    """Простой пинг бота без обращения к базе и админским правам."""
+    start = time.perf_counter()
+    await msg.answer(f"🏓 Пинг: {0} мс", disable_web_page_preview=True)
+    latency = round((time.perf_counter() - start) * 1000, 1)
+    await msg.edit_text(f"🏓 Пинг: {latency} мс", disable_web_page_preview=True)
+
+
+async def cmd_ping(msg: Message, cmd_name: str = 'общий сбор'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     try:
         admins = await bot.get_chat_administrators(msg.chat.id)
@@ -4417,8 +5632,8 @@ async def cmd_ping(msg: Message):
         pass
 
 
-async def cmd_backup(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 8):
+async def cmd_backup(msg: Message, cmd_name: str = 'бэкап'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     await storage.save()
     backup = {'ts': time.time(), 'data': json.loads(json.dumps(storage.data))}
@@ -4431,8 +5646,8 @@ async def cmd_backup(msg: Message):
     await msg.answer(f"✅ Бэкап: {filename}")
 
 
-async def cmd_restore(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 8):
+async def cmd_restore(msg: Message, cmd_name: str = 'восстановить'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     if not storage.data.get('backups'):
         return await msg.answer("❌ Нет бэкапов")
@@ -4441,8 +5656,8 @@ async def cmd_restore(msg: Message):
     await msg.answer("✅ Восстановлено")
 
 
-async def cmd_forward(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'админ', 3):
+async def cmd_forward(msg: Message, cmd_name: str = 'перед'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
         return
     parts = msg.text.split()
 
@@ -4466,7 +5681,7 @@ async def cmd_forward(msg: Message):
 
 @router.message(F.reply_to_message)
 async def reputation_handler(msg: Message):
-    """Выдача репутации за ответ с +"""
+    """Выдача репутации за ответ с + (работает БЕЗ !)"""
 
     # Игнорируем ботов
     if msg.from_user.is_bot:
@@ -4489,7 +5704,7 @@ async def reputation_handler(msg: Message):
     # Проверяем текст сообщения
     text = msg.text.strip()
 
-    # Список слов для выдачи репутации
+    # Список слов для выдачи репутации (БЕЗ обязательного !)
     rep_words = [
         '+', 'плюс', 'спасибо', 'жиза', 'красава', 'респект',
         'уважение', 'лайк', 'like', 'топ', 'красавчик',
@@ -4499,6 +5714,7 @@ async def reputation_handler(msg: Message):
 
     # Проверяем точное совпадение ИЛИ начинается с +
     if text.lower() in rep_words or (text.startswith('+') and len(text) <= 3):
+        logger.debug(f"Репутация: {msg.from_user.id} -> {msg.reply_to_message.from_user.id}, текст='{text}'")
         await give_reputation(msg)
         return
 
@@ -4508,6 +5724,8 @@ async def give_reputation(msg: Message):
     try:
         giver_id = msg.from_user.id
         receiver_id = msg.reply_to_message.from_user.id
+        
+        logger.info(f"Выдача репутации: {giver_id} -> {receiver_id}")
 
         giver = storage.get_user(msg.chat.id, giver_id, use_cache=False)
         receiver = storage.get_user(msg.chat.id, receiver_id, use_cache=False)
@@ -4521,27 +5739,29 @@ async def give_reputation(msg: Message):
             remaining = int(REPUTATION_COOLDOWN - (now - last_rep))
             minutes = remaining // 60
             seconds = remaining % 60
-            if minutes > 0:
-                await msg.reply(f"⏳ Кулдаун! Подождите {minutes}м {seconds}с")
-            else:
-                await msg.reply(f"⏳ Кулдаун! Подождите {seconds}с")
+            msg_text = f"⏳ Кулдаун! Подождите {minutes}м {seconds}с" if minutes > 0 else f"⏳ Кулдаун! Подождите {seconds}с"
+            logger.debug(f"Репутация: кулдаун для {giver_id}")
+            await msg.reply(msg_text)
             return
 
         # Проверка дневного лимита
         rep_today = giver.get('rep_given_today', {})
         today_count = rep_today.get(today, 0)
         if today_count >= REPUTATION_DAILY_LIMIT:
-            await msg.reply(f"❌ Дневной лимит исчерпан ({REPUTATION_DAILY_LIMIT}/день)")
+            logger.debug(f"Репутация: дневной лимит для {giver_id}")
+            await msg.reply(f"❌ Дневной лимит исчерпан ({today_count}/{REPUTATION_DAILY_LIMIT})")
             return
 
         # Проверка что сегодня ещё не давали этому пользователю
         targets_today = rep_today.get('targets', {})
         if str(receiver_id) in targets_today:
+            logger.debug(f"Репутация: {giver_id} уже давал сегодня {receiver_id}")
             # Уже давали сегодня - молча игнорируем
             return
 
         # ВЫДАЁМ РЕПУТАЦИЮ
         receiver['reputation'] = receiver.get('reputation', 0) + 1
+        logger.info(f"✅ Репутация выдана: {giver_id} -> {receiver_id}, всего: {receiver['reputation']}")
 
         # Обновляем данные дающего
         giver['last_rep_time'] = now
@@ -4574,10 +5794,12 @@ async def give_reputation(msg: Message):
             disable_web_page_preview=True
         )
 
-        # Проверяем достижения
-
     except Exception as e:
-        logger.error(f"Ошибка выдачи репутации: {e}")
+        logger.error(f"Ошибка выдачи репутации: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            await msg.reply(f"❌ Ошибка репутации: {str(e)[:80]}")
+        except:
+            pass
 
 
 # ==================== Автомодерация ====================
@@ -4635,7 +5857,7 @@ async def auto_mod(msg: Message):
                 if u['violations_count'] >= 3:
                     until = datetime.now() + timedelta(minutes=10)
                     await bot.restrict_chat_member(chat_id, uid,
-                                                   ChatPermissions(can_send_messages=False), until_date=until)
+                                                   ChatPermissions(can_send_messages=False), until_date=int(until.timestamp()))
 
                     mutes = storage.get_chat(chat_id, 'mutes')
                     if not isinstance(mutes, list):
@@ -4708,7 +5930,7 @@ async def auto_mod(msg: Message):
             await bot.restrict_chat_member(
                 chat_id, uid,
                 ChatPermissions(can_send_messages=False),
-                until_date=until
+                until_date=int(until.timestamp())
             )
 
             mutes.append({
@@ -4725,22 +5947,9 @@ async def auto_mod(msg: Message):
             logger.error(f"Ошибка авто-модерации изоляции: {e}")
         return
 
-    # === ФРАЗЫ (оставляем как есть) ===
-    phrases = storage.data.get('phrases', {}).get(str(chat_id), [])
-    if isinstance(phrases, list) and phrases and msg.text:
-        msg_lower = msg.text.lower()
-
-        matching_phrases = []
-        for p in phrases:
-            if (p.get('anywhere') and p['trigger'] in msg_lower) or msg_lower == p['trigger']:
-                matching_phrases.append(p)
-
-        if matching_phrases:
-            selected = random.choice(matching_phrases)
-            selected['uses'] = selected.get('uses', 0) + 1
-            storage.mark_dirty()
-            await storage.save()
-            await msg.answer(selected['response'])
+    # === ФРАЗЫ ОТКЛЮЧЕНЫ ===
+    # Автоответы по триггерам больше не обрабатываются.
+    # Команды управления фразами остаются, но бот не реагирует на них автоматически.
 
 
 # ==================== Проверка мутов ====================
@@ -4788,56 +5997,7 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-# ==================== Команды с префиксом / ====================
-
-@router.message(Command('start'))
-async def cmd_start(msg: Message):
-    storage.update_user_from_message(msg)
-    save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    await msg.answer(
-        "🌸 <b>Iris Bot v3.0</b>\n\n📊 <code>кто я</code> — профиль\n📊 <code>опрос</code>\n🌤️ <code>погода</code> / <code>шутка</code>\n\n<code>/помощь</code> — все команды")
-
-
-@router.message(Command('помощь'))
-@router.message(Command('help'))
-async def cmd_help(msg: Message):
-    save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    await msg.answer(f"🌸 <b>Iris Bot v3.0</b>\n\n"
-                     f"📊 <b>Инфо:</b> кто я, кто ты @user, кто админ, топ, топ день, топ неделя, топ месяц, топ год, статистика\n"
-                     f"📊 <b>Опросы:</b> опрос Вопрос? | Да | Нет\n"
-                     f"🌤️ <b>Интеграции:</b> погода, шутка\n"
-                     f"🛡️ <b>Модерация:</b> мут, бан, пред, размут\n"
-                     f"👑 <b>Ранги:</b> повысить, понизить\n"
-                     f"⚠️ <b>Предупреждения:</b> преды, снятьпред\n"
-                     f"📂 <b>Топики:</b> закрыть топик, открыть топик, топики\n"
-                     f"🔒 <b>Изоляция:</b> +изоляция, -изоляция, изоляция\n"
-                     f"🏆 <b>Награды:</b> наградить, снять награду, мои награды, топ наград\n"
-                     f"💍 <b>Браки:</b> брак, развод, браки (8 достижений)\n"
-                     f"💬 <b>Фразы:</b> добавить фразу, удалить фразу, фразы\n"
-                     f"👋 <b>Приветствия:</b> приветствие вкл/выкл/текст\n"
-                     f"📝 <b>Правила:</b> правила, добавитьправило\n"
-                     f"🎮 <b>Игры:</b> игра, кнб\n"
-                     f"🎭 <b>РП:</b> /рп\n"
-                     f"⭐ <b>Репутация:</b> ответьте +\n"
-                     f"🚨 <b>Репорт:</b> репорт\n"
-                     f"👤 <b>Ник:</b> ник\n"
-                     f"⚙️ <b>Настройки:</b> антимодерация, !антиспам\n"
-                     f"🔐 <b>ДК:</b> !дк, +дк, -дк, +лдк, -лдк\n"
-                     f"🛠️ <b>Админ:</b> общий сбор, бэкап, восстановить, !перед\n\n"
-                     f"💡 Все команды также работают с префиксами !, ?, /")
-
-
-@router.message(Command('рп'))
-async def cmd_rp_list(msg: Message):
-    save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    rank = storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0)
-    married = bool(storage.get_user(msg.chat.id, msg.from_user.id).get('marriage_partner'))
-    txt = f"🎭 <b>РП-команды ({len(ALL_RP)}):</b>\n\n📌 <b>Обычные ({len(RP)}):</b>\n{', '.join(sorted(RP.keys()))}\n\n"
-    txt += f"{'⭐' if rank >= VIP_RP_RANK else '🔒'} <b>ВИП ({len(VIP_RP)}):</b>\n{', '.join(sorted(VIP_RP.keys()))}\n\n"
-    txt += f"{'💝' if married else '🔒'} <b>Для влюблённых ({len(LOVE_RP)}):</b>\n{', '.join(sorted(LOVE_RP.keys()))}\n\n"
-    txt += "Использование: <code>команда @user</code> или ответом"
-    await msg.answer(txt)
-
+# ==================== Команды с префиксом ! ====================
 
 @router.message(F.new_chat_members)
 async def new_member_handler(msg: Message):
@@ -4861,15 +6021,64 @@ async def new_member_handler(msg: Message):
             text = f"👋 Добро пожаловать, {name}!"
 
         try:
-            await msg.answer(text)
+            image_url = settings.get('image_url')
+            if image_url:
+                try:
+                    await bot.send_photo(msg.chat.id, photo=image_url, caption=text)
+                except Exception:
+                    await msg.answer(text)
+            else:
+                await msg.answer(text)
         except:
             pass
+
+        try:
+            await msg.delete()
+        except:
+            pass
+
+
+@router.message(F.left_chat_member)
+async def left_member_handler(msg: Message):
+    """Прощание при выходе участника"""
+    cid = str(msg.chat.id)
+    settings = storage.data['welcome_settings'].get(cid, {})
+    if not settings.get('farewell_enabled', True):
+        return
+
+    left_member = msg.left_chat_member
+    if not left_member or left_member.is_bot:
+        return
+
+    name = mention(msg.chat.id, left_member)
+    text = settings.get('farewell_text')
+    if text:
+        text = text.replace('{name}', name).replace('{имя}', name)
+    else:
+        text = f"👋 Пока, {name}! Будем ждать тебя снова."
+
+    try:
+        image_url = settings.get('farewell_image_url')
+        if image_url:
+            try:
+                await bot.send_photo(msg.chat.id, photo=image_url, caption=text)
+            except Exception:
+                await msg.answer(text)
+        else:
+            await msg.answer(text)
+    except:
+        pass
+
+    try:
+        await msg.delete()
+    except:
+        pass
 
 
 # ==================== Запуск ====================
 
 async def main():
-    logger.info("🌸 Iris Bot v3.0 запускается...")
+    logger.info("🐻 Обкуренный Валера v3.0 запускается...")
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     asyncio.create_task(check_mutes())
