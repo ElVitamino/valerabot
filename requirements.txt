@@ -1,5 +1,5 @@
 # Основной фреймворк для Telegram Bot API
-aiogram==3.30.0
+aiogram==3.31.0
 
 # Загрузка переменных окружения из .env файла
 python-dotenv==1.0.1
