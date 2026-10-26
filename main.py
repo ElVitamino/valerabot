@@ -13,12 +13,103 @@ import signal
 import sys
 import textwrap
 import time
+import unicodedata
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union, Set
+from typing import Dict, List, Optional, Any, Union, Set, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+KALININGRAD_TZ = timezone(timedelta(hours=2), name='Europe/Kaliningrad')
+TIMEZONE_REGIONS = {
+    'калининград': (KALININGRAD_TZ, ('калининград', 'калининградская область')),
+    'москва': (timezone(timedelta(hours=3)), ('москва', 'санкт-петербург', 'петербург', 'спб')),
+    'самара': (timezone(timedelta(hours=4)), ('самара',)),
+    'екатеринбург': (timezone(timedelta(hours=5)), ('екатеринбург',)),
+    'омск': (timezone(timedelta(hours=6)), ('омск',)),
+    'новосибирск': (timezone(timedelta(hours=7)), ('новосибирск',)),
+    'красноярск': (timezone(timedelta(hours=7)), ('красноярск',)),
+    'иркутск': (timezone(timedelta(hours=8)), ('иркутск',)),
+    'якутск': (timezone(timedelta(hours=9)), ('якутск',)),
+    'владивосток': (timezone(timedelta(hours=10)), ('владивосток',)),
+    'магадан': (timezone(timedelta(hours=11)), ('магадан',)),
+    'камчатка': (timezone(timedelta(hours=12)), ('камчатка', 'петропавловск-камчатский')),
+}
+TIMEZONE_REGION_ALIASES = {
+    alias: region
+    for region, (_, aliases) in TIMEZONE_REGIONS.items()
+    for alias in aliases
+}
+
+
+def kaliningrad_now() -> datetime:
+    return datetime.now(KALININGRAD_TZ)
+
+
+def resolve_time_region(region: str):
+    requested_region = region.strip()
+    if not requested_region:
+        return 'Калининград', KALININGRAD_TZ
+
+    canonical_region = TIMEZONE_REGION_ALIASES.get(requested_region.casefold())
+    if canonical_region:
+        return canonical_region.title(), TIMEZONE_REGIONS[canonical_region][0]
+
+    return requested_region, ZoneInfo(requested_region)
+
+
+async def lookup_time_region(region: str) -> Optional[Tuple[str, datetime, timedelta]]:
+    import aiohttp
+
+    search_region = region.rsplit('/', 1)[-1].replace('_', ' ') if '/' in region else region
+    timeout = aiohttp.ClientTimeout(total=12)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={
+                    'name': search_region,
+                    'count': 1,
+                    'language': 'ru',
+                    'format': 'json',
+                },
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Геопоиск вернул HTTP {response.status}")
+                geocoding_data = await response.json()
+
+            results = geocoding_data.get('results')
+            if not results:
+                return None
+
+            location = results[0]
+            location_name = str(location['name'])
+            country = location.get('country')
+            region_name = f"{location_name}, {country}" if country else location_name
+            latitude = location['latitude']
+            longitude = location['longitude']
+
+            async with session.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    'latitude': latitude,
+                    'longitude': longitude,
+                    'current': 'temperature_2m',
+                    'timezone': 'auto',
+                },
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Сервис времени вернул HTTP {response.status}")
+                time_data = await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise RuntimeError("Не удалось связаться с сервисом времени") from exc
+
+    current_time = datetime.fromisoformat(time_data['current']['time'])
+    offset = timedelta(seconds=int(time_data['utc_offset_seconds']))
+    return region_name, current_time, offset
+
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -35,7 +126,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, ChatPermissions, InlineKeyboardButton,
-    InlineKeyboardMarkup, BufferedInputFile, User
+    InlineKeyboardMarkup, BufferedInputFile, User, BotCommand
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -82,6 +173,50 @@ class SimpleCache:
 user_cache = SimpleCache(max_size=2000, ttl=300)
 chat_settings_cache = SimpleCache(max_size=200, ttl=600)
 mention_cache = SimpleCache(max_size=5000, ttl=3600)
+anti_spam_admin_cache = SimpleCache(max_size=5000, ttl=10)
+
+EXCHANGE_RATE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
+CURRENCY_DISPLAY = {
+    'RUB': ('🇷🇺', 'российский рубль', '₽'),
+    'EUR': ('🇪🇺', 'евро', '€'),
+    'USD': ('🇺🇸', 'доллар США', '$'),
+    'GBP': ('🇬🇧', 'британский фунт', '£'),
+    'CNY': ('🇨🇳', 'китайский юань', '¥'),
+    'KZT': ('🇰🇿', 'казахстанский тенге', '₸'),
+    'UAH': ('🇺🇦', 'украинская гривна', '₴'),
+    'BYN': ('🇧🇾', 'белорусский рубль', 'Br'),
+    'TRY': ('🇹🇷', 'турецкая лира', '₺'),
+    'JPY': ('🇯🇵', 'японская иена', '¥'),
+    'CHF': ('🇨🇭', 'швейцарский франк', 'Fr'),
+    'CAD': ('🇨🇦', 'канадский доллар', 'C$'),
+    'AUD': ('🇦🇺', 'австралийский доллар', 'A$'),
+    'INR': ('🇮🇳', 'индийская рупия', '₹'),
+}
+CURRENCY_ALIASES = {
+    'USD': (r'USD', r'доллар\w*', r'dollar\w*', r'бакс\w*', r'\$'),
+    'RUB': (r'RUB', r'руб\w*', r'₽'),
+    'EUR': (r'EUR', r'евро', r'euro', r'€'),
+    'GBP': (r'GBP', r'фунт\w*', r'£'),
+    'CNY': (r'CNY', r'юан\w*', r'¥'),
+    'KZT': (r'KZT', r'тенге', r'₸'),
+    'UAH': (r'UAH', r'грив\w*', r'грн', r'₴'),
+    'BYN': (r'BYN', r'белорус\w* руб\w*', r'бел\w* руб\w*'),
+    'TRY': (r'TRY', r'лир\w*'),
+    'JPY': (r'JPY', r'иен\w*', r'йен\w*'),
+    'CHF': (r'CHF', r'франк\w*'),
+    'CAD': (r'CAD', r'канад\w* доллар\w*'),
+    'AUD': (r'AUD', r'австрал\w* доллар\w*'),
+    'INR': (r'INR', r'рупи\w*'),
+}
+CURRENCY_AMOUNT_PATTERN = re.compile(
+    r'(?<!\w)(?P<amount>\d+(?:[.,]\d+)?)\s*'
+    r'(?P<currency>' + '|'.join(
+        rf'(?:{alias})' for aliases in CURRENCY_ALIASES.values() for alias in aliases
+    ) + r')(?!\w)',
+    re.IGNORECASE,
+)
+
+
 
 # ==================== Загрузка .env ====================
 
@@ -102,21 +237,10 @@ except ImportError:
     print("⚠️ python-dotenv не установлен")
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-MAIN_ADMIN_ID = os.getenv('MAIN_ADMIN_ID')
 MAIN_GROUP_ID = os.getenv('MAIN_GROUP_ID')
 
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN не найден!")
-    sys.exit(1)
-
-if not MAIN_ADMIN_ID:
-    print("❌ MAIN_ADMIN_ID не найден!")
-    sys.exit(1)
-
-try:
-    MAIN_ADMIN_ID = int(MAIN_ADMIN_ID)
-except ValueError:
-    print(f"❌ MAIN_ADMIN_ID не является числом: {MAIN_ADMIN_ID}")
     sys.exit(1)
 
 if MAIN_GROUP_ID:
@@ -128,16 +252,27 @@ if MAIN_GROUP_ID:
 DATA_FILE = os.getenv('DATA_FILE', 'valera_data.json')
 LOG_FILE = os.getenv('LOG_FILE', 'valera_bot.log')
 BACKUP_DIR = os.getenv('BACKUP_DIR', 'backups')
+UK_RF_ARTICLES_FILE = Path(__file__).parent / 'uk_rf_articles.json'
 DEFAULT_MUTE_MINUTES = int(os.getenv('DEFAULT_MUTE_MINUTES', '30'))
 DEFAULT_WARN_DAYS = int(os.getenv('DEFAULT_WARN_DAYS', '30'))
 MAX_WARNINGS = int(os.getenv('MAX_WARNINGS', '7'))
 REPUTATION_COOLDOWN = int(os.getenv('REPUTATION_COOLDOWN', '3600'))
 REPUTATION_DAILY_LIMIT = int(os.getenv('REPUTATION_DAILY_LIMIT', '15'))
+REPUTATION_REMOVE_COOLDOWN = int(os.getenv('REPUTATION_REMOVE_COOLDOWN', '3600'))
+REPUTATION_REMOVE_DAILY_LIMIT = int(os.getenv('REPUTATION_REMOVE_DAILY_LIMIT', '15'))
 MUTE_CHECK_INTERVAL = int(os.getenv('MUTE_CHECK_INTERVAL', '60'))
 VIP_RP_RANK = int(os.getenv('VIP_RP_RANK', '2'))
 AUTO_SAVE_INTERVAL = int(os.getenv('AUTO_SAVE_INTERVAL', '300'))
 MAX_TAG_LENGTH = int(os.getenv('MAX_TAG_LENGTH', '32'))
 ANTI_SPAM_ENABLED = os.getenv('ANTI_SPAM_ENABLED', 'true').lower() == 'true'
+DEFAULT_WORDLE_LENGTH = 5
+DEFAULT_WORDLE_ATTEMPTS = 6
+WORDLE_WORDS_FILE = str(Path(__file__).resolve().parent / "russian_words.txt")
+PIC_DISABLED_CHATS = {
+    chat.strip().lstrip('@').casefold()
+    for chat in os.getenv('PIC_DISABLED_CHATS', 'Weltobruhsuperchat').split(',')
+    if chat.strip()
+}
 
 Path(BACKUP_DIR).mkdir(exist_ok=True)
 
@@ -161,16 +296,18 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+# Очень компактный разделитель для мобильного вида.
+UI_LINE = "─" * 12
 
 print("=" * 60)
 print("🐻 Обкуренный Валера v3.0 - Полная версия")
 print("=" * 60)
-print(f"👑 Главный админ ID: {MAIN_ADMIN_ID}")
 print(f"🏠 Основная группа ID: {MAIN_GROUP_ID or 'не указана (статистика везде)'}")
 print(f"📁 Данные: {DATA_FILE}")
 print(f"💾 Бэкапы: {BACKUP_DIR}/")
 print(f"🔄 Автосохранение: каждые {AUTO_SAVE_INTERVAL} сек")
 print(f"🛡️ Анти-спам: {'Включен' if ANTI_SPAM_ENABLED else 'Отключен'}")
+print(f"🚫 /pic отключена по умолчанию в: {', '.join(sorted(PIC_DISABLED_CHATS)) or 'нигде'}")
 print(f"⭐ Лимит репутации: {REPUTATION_DAILY_LIMIT}/день")
 print(f"📊 Графики: {'Да' if MATPLOTLIB_AVAILABLE else 'Нет'}")
 print("=" * 60)
@@ -224,52 +361,390 @@ def max_consecutive_days(activity: dict) -> int:
 
 class AntiSpamSystem:
     def __init__(self):
-        self.message_times: Dict[int, List[float]] = defaultdict(list)
-        self.message_hashes: Dict[int, List[tuple]] = defaultdict(list)
-        self.warnings: Dict[int, int] = defaultdict(int)
+        self.user_messages: Dict[Tuple[int, int], List[Tuple[float, int, str]]] = defaultdict(list)
+        self.user_rate: Dict[Tuple[int, int], List[Tuple[float, int]]] = defaultdict(list)
+        self.user_stickers: Dict[Tuple[int, int], List[Tuple[float, int]]] = defaultdict(list)
+        self.user_animations: Dict[Tuple[int, int], List[Tuple[float, int]]] = defaultdict(list)
+        self.user_caps: Dict[Tuple[int, int], List[Tuple[float, int]]] = defaultdict(list)
+        self.user_fragments: Dict[Tuple[int, int], List[Tuple[float, int, str]]] = defaultdict(list)
+        self.user_mentions: Dict[Tuple[int, int], List[Tuple[float, int, int]]] = defaultdict(list)
+        self.user_links: Dict[Tuple[int, int], List[Tuple[float, int, Tuple[str, ...]]]] = defaultdict(list)
+        self.message_dates: Dict[Tuple[int, int], Dict[int, Tuple[float, Optional[str]]]] = defaultdict(dict)
         self.last_cleanup = time.time()
+
+    def _normalize_text(self, text: str) -> str:
+        text = html.unescape(text or '')
+        text = re.sub(r'https?://\S+|www\.\S+', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'@\w+', ' ', text)
+        text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
+        text = re.sub(r'\s+', ' ', text).strip().lower()
+        return text
+
+    def _words_set(self, text: str) -> Set[str]:
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return set()
+        return {w for w in normalized.split() if len(w) > 2}
+
+    def _similarity(self, a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        left = self._words_set(a)
+        right = self._words_set(b)
+        if not left or not right:
+            return 0.0
+        inter = len(left & right)
+        union = len(left | right)
+        if union == 0:
+            return 0.0
+        return inter / union
+
+    def _is_caps_flood(self, text: str) -> bool:
+        if len(text) < 10:
+            return False
+        letters = [ch for ch in text if ch.isalpha()]
+        if len(letters) < 6:
+            return False
+        upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+        punct_ratio = text.count('!') + text.count('?')
+        return upper_ratio >= 0.7 and punct_ratio <= 1
 
     def cleanup(self):
         now = time.time()
         if now - self.last_cleanup < 300:
             return
         self.last_cleanup = now
-        for uid in list(self.message_times.keys()):
-            self.message_times[uid] = [t for t in self.message_times[uid] if now - t < 10]
-            self.message_hashes[uid] = [(h, t) for h, t in self.message_hashes[uid] if now - t < 60]
-            if not self.message_times[uid] and not self.message_hashes[uid]:
-                del self.message_times[uid]
-                del self.message_hashes[uid]
-        for uid in list(self.warnings.keys()):
-            if now - self.warnings[uid] > 3600:
-                del self.warnings[uid]
 
-    def check_message(self, msg: Message) -> tuple:
-        if msg.from_user.is_bot:
-            return False, None
-        uid = msg.from_user.id
+        for key, messages in list(self.user_rate.items()):
+            recent = [(ts, mid) for ts, mid in messages if now - ts < 60]
+            if recent:
+                self.user_rate[key] = recent
+            else:
+                del self.user_rate[key]
+
+        for key, messages in list(self.user_messages.items()):
+            recent = [(ts, mid, body) for ts, mid, body in messages if now - ts < 60]
+            if recent:
+                self.user_messages[key] = recent
+            else:
+                del self.user_messages[key]
+
+        for key, messages in list(self.user_stickers.items()):
+            recent = [(ts, mid) for ts, mid in messages if now - ts < 10]
+            if recent:
+                self.user_stickers[key] = recent
+            else:
+                del self.user_stickers[key]
+
+        for key, messages in list(self.user_animations.items()):
+            recent = [(ts, mid) for ts, mid in messages if now - ts < 10]
+            if recent:
+                self.user_animations[key] = recent
+            else:
+                del self.user_animations[key]
+
+        for key, messages in list(self.user_caps.items()):
+            recent = [(ts, mid) for ts, mid in messages if now - ts < 10]
+            if recent:
+                self.user_caps[key] = recent
+            else:
+                del self.user_caps[key]
+
+        for key, messages in list(self.user_fragments.items()):
+            recent = [(ts, mid, body) for ts, mid, body in messages if now - ts < 10]
+            if recent:
+                self.user_fragments[key] = recent
+            else:
+                del self.user_fragments[key]
+
+        for key, messages in list(self.user_mentions.items()):
+            recent = [(ts, mid, count) for ts, mid, count in messages if now - ts < 15]
+            if recent:
+                self.user_mentions[key] = recent
+            else:
+                del self.user_mentions[key]
+
+        for key, messages in list(self.user_links.items()):
+            recent = [(ts, mid, urls) for ts, mid, urls in messages if now - ts < 60]
+            if recent:
+                self.user_links[key] = recent
+            else:
+                del self.user_links[key]
+
+        for key, messages in list(self.message_dates.items()):
+            recent = {
+                message_id: (ts, activity_date)
+                for message_id, (ts, activity_date) in messages.items()
+                if now - ts < 60
+            }
+            if recent:
+                self.message_dates[key] = recent
+            else:
+                del self.message_dates[key]
+
+    def _remember_message(self, chat_user: Tuple[int, int], msg: Message, now: float):
+        activity_date = None
+        if is_main_chat(msg.chat.id, msg.message_thread_id):
+            activity_date = datetime.fromtimestamp(now, KALININGRAD_TZ).strftime('%Y-%m-%d')
+        self.message_dates[chat_user][msg.message_id] = (now, activity_date)
+
+    def pop_message_date(self, chat_id: int, user_id: int, message_id: int) -> Optional[str]:
+        message = self.message_dates.get((chat_id, user_id), {}).pop(message_id, None)
+        return message[1] if message else None
+
+    def check_message(self, msg: Message) -> Tuple[bool, Optional[str], List[int]]:
+        if not msg.from_user or msg.from_user.is_bot:
+            return False, None, []
+
+        chat_user = (msg.chat.id, msg.from_user.id)
         now = time.time()
         self.cleanup()
-        self.message_times[uid].append(now)
-        if len(self.message_times[uid]) > 7:
-            self.warnings[uid] = self.warnings.get(uid, 0) + 1
-            return True, "Слишком много сообщений"
-        if msg.text and len(msg.text) > 10:
-            msg_hash = hashlib.md5(msg.text.encode()).hexdigest()
-            self.message_hashes[uid].append((msg_hash, now))
-            if sum(1 for h, _ in self.message_hashes[uid] if h == msg_hash) >= 4:
-                self.warnings[uid] = self.warnings.get(uid, 0) + 1
-                return True, "Повторяющиеся сообщения"
-        return False, None
+        self._remember_message(chat_user, msg, now)
 
-    def get_warnings(self, uid: int) -> int:
-        return self.warnings.get(uid, 0)
+        recent_rate = [
+            (ts, mid) for ts, mid in self.user_rate[chat_user] if now - ts < 60
+        ]
+        recent_rate.append((now, msg.message_id))
+        self.user_rate[chat_user] = recent_rate
+        burst_ids = [mid for ts, mid in recent_rate if now - ts < 10]
+        if len(burst_ids) >= 12 or len(recent_rate) >= 31:
+            self.user_rate[chat_user] = []
+            return True, "Слишком частые сообщения", burst_ids[-12:] if len(burst_ids) >= 12 else [
+                mid for _, mid in recent_rate[-31:]
+            ]
 
-    def reset_warnings(self, uid: int):
-        self.warnings.pop(uid, None)
+        if msg.sticker:
+            recent_stickers = [
+                (ts, mid) for ts, mid in self.user_stickers[chat_user] if now - ts < 10
+            ]
+            recent_stickers.append((now, msg.message_id))
+            if len(recent_stickers) > 5:
+                self.user_stickers[chat_user] = []
+                return True, "Слишком много стикеров", [mid for _, mid in recent_stickers]
+            self.user_stickers[chat_user] = recent_stickers
+            return False, None, []
+
+        is_gif = bool(msg.animation) or bool(
+            msg.document
+            and (
+                msg.document.mime_type == 'image/gif'
+                or (msg.document.file_name and msg.document.file_name.lower().endswith('.gif'))
+            )
+        )
+        if is_gif:
+            recent_animations = [
+                (ts, mid) for ts, mid in self.user_animations[chat_user] if now - ts < 10
+            ]
+            recent_animations.append((now, msg.message_id))
+            if len(recent_animations) > 5:
+                self.user_animations[chat_user] = []
+                return True, "Слишком много GIF-анимаций", [mid for _, mid in recent_animations]
+            self.user_animations[chat_user] = recent_animations
+            return False, None, []
+
+        if not msg.text:
+            return False, None, []
+
+        stripped_text = msg.text.lstrip()
+        prefix = get_command_prefix(msg.chat.id)
+        if (
+            stripped_text.startswith(('!', '/'))
+            or (prefix and stripped_text.startswith(prefix))
+            or (not prefix and match_command(stripped_text)[0] is not None)
+        ):
+            return False, None, []
+
+        links = tuple(
+            match.group(0).rstrip('.,!?;:)')
+            for match in re.finditer(r'https?://\S+|www\.\S+', msg.text, flags=re.IGNORECASE)
+        )
+        if links:
+            normalized_links = tuple(link.lower() for link in links)
+            recent_links = [
+                (ts, mid, urls)
+                for ts, mid, urls in self.user_links[chat_user]
+                if now - ts < 60
+            ]
+            recent_links.append((now, msg.message_id, normalized_links))
+            self.user_links[chat_user] = recent_links
+            recent_link_burst = [entry for entry in recent_links if now - entry[0] < 15]
+            url_message_counts: Dict[str, int] = defaultdict(int)
+            for _, _, previous_urls in recent_links:
+                for url in set(previous_urls):
+                    url_message_counts[url] += 1
+            repeated_urls = {
+                url for url, count in url_message_counts.items() if count >= 3
+            }
+            if len(links) >= 2 or len(recent_link_burst) >= 4 or repeated_urls:
+                if repeated_urls:
+                    spam_ids = [
+                        mid for _, mid, urls in recent_links
+                        if repeated_urls.intersection(urls)
+                    ]
+                else:
+                    spam_ids = [mid for _, mid, _ in recent_link_burst]
+                return True, "Спам-ссылками", spam_ids
+
+        mention_count = len(re.findall(r'@\w+', msg.text))
+        if mention_count:
+            recent_mentions = [
+                (ts, mid, count)
+                for ts, mid, count in self.user_mentions[chat_user]
+                if now - ts < 15
+            ]
+            recent_mentions.append((now, msg.message_id, mention_count))
+            self.user_mentions[chat_user] = recent_mentions
+            if mention_count >= 5 or sum(count for _, _, count in recent_mentions) >= 8:
+                return True, "Массовые упоминания", [mid for _, mid, _ in recent_mentions]
+
+        normalized_text = self._normalize_text(msg.text)
+        if not normalized_text:
+            return False, None, []
+
+        recent_messages = [
+            (ts, mid, body) for ts, mid, body in self.user_messages[chat_user] if now - ts < 60
+        ]
+        recent_messages.append((now, msg.message_id, normalized_text))
+        self.user_messages[chat_user] = recent_messages
+
+        if len(normalized_text) <= 3:
+            fragments = [
+                (ts, mid, body) for ts, mid, body in self.user_fragments[chat_user]
+                if now - ts < 10
+            ]
+            fragments.append((now, msg.message_id, normalized_text))
+            self.user_fragments[chat_user] = fragments
+            distinct_fragments = {body for _, _, body in fragments}
+            if len(fragments) >= 8 and len(distinct_fragments) >= 6:
+                fragment_ids = [mid for _, mid, _ in fragments]
+                self.user_fragments[chat_user] = []
+                return True, "Флуд короткими сообщениями", fragment_ids
+
+        exact_count = sum(1 for _, _, body in recent_messages if body == normalized_text)
+        if exact_count >= 4:
+            self.user_messages[chat_user] = []
+            return True, "Повторяющиеся сообщения", [mid for _, mid, _ in recent_messages]
+
+        if self._is_caps_flood(msg.text):
+            caps_messages = [
+                (ts, mid) for ts, mid in self.user_caps[chat_user] if now - ts < 10
+            ]
+            caps_messages.append((now, msg.message_id))
+            self.user_caps[chat_user] = caps_messages
+            if len(caps_messages) >= 3:
+                return True, "Капс-флуд", [mid for _, mid in caps_messages]
+
+        if len(recent_messages) >= 6:
+            recent_bodies = [body for _, _, body in recent_messages]
+            similarity_hits = 0
+            for i in range(1, len(recent_bodies)):
+                if self._similarity(recent_bodies[i - 1], recent_bodies[i]) >= 0.7:
+                    similarity_hits += 1
+            if similarity_hits >= 3:
+                self.user_messages[chat_user] = []
+                return True, "Повторяющиеся сообщения", [mid for _, mid, _ in recent_messages]
+
+        return False, None, []
 
 
 anti_spam = AntiSpamSystem()
+
+
+async def handle_anti_spam(msg: Message) -> bool:
+    if not msg.from_user or msg.from_user.is_bot:
+        return False
+
+    if msg.chat.type not in ('group', 'supergroup'):
+        return False
+
+    if await is_anti_spam_admin(msg.chat.id, msg.from_user.id):
+        return False
+
+    settings = storage.get_chat_settings(msg.chat.id)
+    if not settings.get('anti_spam', {}).get('enabled', True):
+        return False
+
+    is_spam, reason, message_ids = anti_spam.check_message(msg)
+    if not is_spam:
+        return False
+
+    deleted_ids = set()
+    deduped_ids = list(dict.fromkeys(message_ids))
+    for message_id in deduped_ids:
+        try:
+            await bot.delete_message(msg.chat.id, message_id)
+            deleted_ids.add(message_id)
+        except Exception as e:
+            logger.warning(
+                "Антиспам: не удалось удалить сообщение %s в чате %s: %s",
+                message_id, msg.chat.id, e
+            )
+
+    for message_id in deleted_ids:
+        activity_date = anti_spam.pop_message_date(msg.chat.id, msg.from_user.id, message_id)
+        if activity_date:
+            remove_message_activity(msg.chat.id, msg.from_user.id, activity_date)
+
+    now = time.time()
+    mutes = storage.get_chat(msg.chat.id, 'mutes')
+    if not isinstance(mutes, list):
+        mutes = []
+        storage.data['mutes'][str(msg.chat.id)] = mutes
+
+    active_mutes = [
+        mute for mute in mutes
+        if mute.get('user_id') == msg.from_user.id
+        and (
+            mute.get('permanent') is True
+            or isinstance(mute.get('expire_time'), (int, float)) and mute['expire_time'] > now
+        )
+    ]
+    if any(mute.get('permanent') is True for mute in active_mutes):
+        return True
+    base_wait = 60
+    if reason == 'Капс-флуд':
+        base_wait = 120
+    elif reason in {'Спам-ссылками', 'Массовые упоминания', 'Флуд короткими сообщениями'}:
+        base_wait = 180
+    mute_until = max([now + base_wait] + [mute['expire_time'] for mute in active_mutes])
+    try:
+        await bot.restrict_chat_member(
+            msg.chat.id,
+            msg.from_user.id,
+            ChatPermissions(can_send_messages=False),
+            until_date=int(mute_until)
+        )
+    except Exception as e:
+        logger.warning(
+            "Антиспам: не удалось ограничить пользователя %s в чате %s: %s",
+            msg.from_user.id, msg.chat.id, e
+        )
+        return True
+
+    if active_mutes:
+        active_mutes[0]['expire_time'] = mute_until
+        issued_at = active_mutes[0].get('issued_at')
+        if not isinstance(issued_at, (int, float)):
+            issued_at = now
+            active_mutes[0]['issued_at'] = issued_at
+        active_mutes[0]['duration_minutes'] = max(1, round((mute_until - issued_at) / 60))
+        active_mutes[0]['auto_mute'] = True
+        for duplicate_mute in active_mutes[1:]:
+            mutes.remove(duplicate_mute)
+    else:
+        mutes.append({
+            'user_id': msg.from_user.id,
+            'expire_time': mute_until,
+            'issued_at': now,
+            'duration_minutes': max(1, round((mute_until - now) / 60)),
+            'muted_by': 'auto',
+            'auto_mute': True,
+            'reason': f'Антиспам: {reason}'
+        })
+
+    storage.mark_dirty()
+    await storage.save()
+    return True
 
 
 # ==================== Хранилище данных ====================
@@ -291,9 +766,9 @@ class DataStorage:
     @staticmethod
     def _get_default_data() -> dict:
         return {
-            'users': {}, 'command_access': {}, 'personal_access': {},
-            'mutes': {}, 'closed_topics': {}, 'phrases': {},
-            'welcome_settings': {}, 'marriages': {}, 'isolation': {},
+            'users': {}, 'command_access': {}, 'personal_access': {}, 'chat_owners': {},
+            'mutes': {}, 'phrases': {},
+            'welcome_settings': {}, 'marriages': {},
             'games': {}, 'backups': [], 'chat_settings': {}, 'rules': {}, 'polls': {},
             'rank_names': {}, 'rank_emoji': {}
         }
@@ -303,10 +778,10 @@ class DataStorage:
         """Создаёт пользователя с правильными полями."""
         return {
             'id': uid, 'username': '', 'first_name': '', 'rank': 0,
-            'reputation': 0, 'last_rep_time': 0, 'rep_given_today': {},
+            'reputation': 0, 'last_rep_time_by_target': {}, 'last_rep_removed_time_by_target': {},
+            'rep_given_today': {},
             'rep_given_total': 0, 'warnings': [], 'awards': [], 'marriage_partner': None,
             'marriage_date': None, 'pending_marriage': None, 'messages_count': 0,
-            'violations_count': 0, 'last_violation_time': 0, 'isolation': None,
             'activity': {}, 'ttt_games': 0, 'ttt_wins': 0, 'rps_games': 0,
             'rps_wins': 0, 'rps_current_streak': 0, 'rps_best_streak': 0,
             'custom_name': '', 'custom_tag': '', 'total_mutes_survived': 0, 'first_seen': time.time(),
@@ -380,8 +855,12 @@ class DataStorage:
                         for old_backup in backups[:-5]:
                             old_backup.unlink()
 
-                with open(DATA_FILE, 'w', encoding='utf-8') as f:
+                temp_file = f'{DATA_FILE}.tmp'
+                with open(temp_file, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_file, DATA_FILE)
 
                 self._last_save_time = time.monotonic()
                 self._dirty = False
@@ -395,8 +874,12 @@ class DataStorage:
     def save_sync(self):
         try:
             save_data = json.loads(json.dumps(self.data, default=str))
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            temp_file = f'{DATA_FILE}.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(save_data, f, ensure_ascii=False, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, DATA_FILE)
             self._dirty = False
             logger.debug("Данные синхронно сохранены")
         except Exception as e:
@@ -491,10 +974,11 @@ class DataStorage:
             'username': '',
             'rank': 0,
             'reputation': 0,
+            'last_rep_time_by_target': {},
+            'last_rep_removed_time_by_target': {},
             'warnings': [],
             'awards': [],
             'activity': {},
-            'isolation': None,
             'marriage_partner': None
         }
         for field, default_value in default_fields.items():
@@ -558,9 +1042,9 @@ class DataStorage:
             self.data['chat_settings'] = {}
         if chat_id not in self.data['chat_settings']:
             self.data['chat_settings'][chat_id] = {
+                'command_prefix': '!',
                 'anti_moderation': True,
-                'anti_spam': {'enabled': ANTI_SPAM_ENABLED, 'max_messages': 5, 'interval': 5, 'action': 'mute',
-                              'duration': 5},
+                'anti_spam': {'enabled': ANTI_SPAM_ENABLED},
                 'warn_actions': [{'count': 3, 'action': 'mute', 'duration': 60},
                                  {'count': 5, 'action': 'mute', 'duration': 1440},
                                  {'count': MAX_WARNINGS, 'action': 'ban', 'duration': 0}]
@@ -576,6 +1060,266 @@ class DataStorage:
 
 storage = DataStorage()
 
+
+# ==================== Wordle (русский) ====================
+
+class WordleGame:
+    """
+    Класс для управления игрой Wordle (русская версия).
+    Использует файл russian_words.txt (если есть) или встроенный словарь.
+    """
+    def __init__(self, words_file: str = WORDLE_WORDS_FILE):
+        self.words_file = words_file
+        self._words_cache = None
+        self.games = {}  # активные игры: key = f"wordle_{user_id}"
+
+    DIFFICULTY_NAMES = {
+        'easy': 'лёгкий',
+        'medium': 'средний',
+        'hard': 'сложный',
+        'expert': 'экспертный',
+    }
+    DIFFICULTY_ALIASES = {
+        'лёгкий': 'easy', 'легкий': 'easy', 'легкая': 'easy', 'лёгкая': 'easy', 'easy': 'easy', 'легко': 'easy',
+        'средний': 'medium', 'средняя': 'medium', 'medium': 'medium', 'среднее': 'medium',
+        'сложный': 'hard', 'сложная': 'hard', 'hard': 'hard',
+        'эксперт': 'expert', 'экспертный': 'expert', 'экспертная': 'expert', 'expert': 'expert', 'экстрим': 'expert',
+    }
+    COMMON_WORDS = {
+        'вода', 'ветер', 'город', 'дверь', 'земля', 'игрок', 'книга', 'кошка', 'луна',
+        'море', 'ночь', 'огонь', 'песня', 'птица', 'река', 'собака', 'слово', 'солнце',
+        'стена', 'стол', 'текст', 'цветок', 'школа', 'шутка', 'яблоко', 'молоко',
+    }
+
+    def _load_words(self):
+        if self._words_cache is not None:
+            return self._words_cache
+
+        words = []
+        try:
+            with open(self.words_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if 4 <= len(w) <= 6 and w.isalpha():
+                        words.append(w)
+            if words:
+                self._words_cache = words
+                return words
+        except FileNotFoundError:
+            pass
+
+        # Fallback-словарь (500+ слов)
+        fallback = [
+            "дом", "год", "день", "ночь", "мир", "вода", "огонь", "земля", "ветер", "лес",
+            "река", "гора", "море", "солнце", "луна", "звезда", "небо", "облако", "дождь", "снег",
+            "город", "дело", "слово", "друг", "враг", "мать", "отец", "брат", "сестра", "сын",
+            "дочь", "муж", "жена", "человек", "народ", "власть", "сила", "мысль", "душа", "сердце",
+            "кровь", "кость", "рука", "нога", "глаз", "ухо", "нос", "рот", "зуб", "язык",
+            "лицо", "лоб", "бровь", "ресница", "щека", "губа", "шея", "плечо", "грудь", "спина",
+            "живот", "пояс", "бедро", "колено", "голень", "стопа", "палец", "ноготь", "волос", "борода",
+            "усы", "бакен", "шевелюра", "челка", "затылок", "висок", "скула", "челюсть", "подбородок", "горло",
+            "трава", "цветок", "дерево", "куст", "лист", "корень", "ствол", "ветка", "плод", "семя",
+            "животное", "птица", "рыба", "зверь", "волк", "лиса", "медведь", "заяц", "лось", "олень",
+            "кошка", "собака", "корова", "лошадь", "свинья", "коза", "овца", "курица", "утка", "гусь",
+            "лебедь", "ворона", "сорока", "воробей", "голубь", "орёл", "сокол", "ястреб", "филин", "сова",
+            "мышь", "крыса", "хомяк", "морж", "тюлень", "дельфин", "кит", "акула", "осьминог", "медуза",
+            "растение", "гриб", "ягода", "яблоко", "груша", "слива", "вишня", "черешня", "абрикос", "персик",
+            "виноград", "арбуз", "дыня", "тыква", "огурец", "помидор", "картофель", "морковь", "свекла", "лук",
+            "чеснок", "капуста", "салат", "укроп", "петрушка", "перец", "баклажан", "кабачок", "горох", "фасоль",
+            "хлеб", "молоко", "масло", "сыр", "творог", "сметана", "яйцо", "мясо", "рыба", "соль",
+            "сахар", "мед", "варенье", "компот", "кисель", "суп", "борщ", "щи", "каша", "макароны",
+            "печенье", "пирог", "блин", "оладья", "вафля", "конфета", "шоколад", "вареник", "пельмень", "чебурек",
+            "квартира", "комната", "кухня", "ванна", "туалет", "коридор", "лестница", "лифт", "балкон", "крыша",
+            "стена", "пол", "потолок", "окно", "дверь", "замок", "ключ", "стол", "стул", "кровать",
+            "диван", "кресло", "шкаф", "полка", "зеркало", "ковер", "лампа", "свет", "тень", "цвет",
+            "рисунок", "картина", "фотография", "книга", "журнал", "газета", "письмо", "конверт", "марка", "почта",
+            "школа", "учитель", "ученик", "парта", "доска", "мел", "ручка", "карандаш", "ластик", "тетрадь",
+            "дневник", "урок", "звонок", "перемена", "экзамен", "оценка", "знание", "ум", "талант", "гений",
+            "врач", "больница", "аптека", "лекарство", "таблетка", "укол", "перевязка", "здоровье", "болезнь", "грипп",
+            "магазин", "продавец", "покупатель", "товар", "цена", "деньги", "монета", "кусок", "мелочь", "сдача",
+            "дорога", "путь", "тропа", "шоссе", "перекресток", "светофор", "машина", "автобус", "троллейбус", "трамвай",
+            "метро", "поезд", "самолет", "вертолет", "корабль", "лодка", "пароход", "яхта", "весло", "парус",
+            "спорт", "футбол", "хоккей", "теннис", "волейбол", "баскетбол", "лыжи", "коньки", "санки", "шахматы",
+            "музыка", "песня", "танец", "театр", "кино", "актер", "роль", "сцена", "зритель", "аплодисменты"
+        ]
+        fallback = sorted(set(fallback))
+        self._words_cache = fallback
+        return fallback
+
+    @classmethod
+    def normalize_difficulty(cls, difficulty: str = 'medium') -> str:
+        return cls.DIFFICULTY_ALIASES.get((difficulty or '').lower().strip(), 'medium')
+
+    @staticmethod
+    def _word_difficulty_score(word: str) -> int:
+        rare_letters = set('жцчщъэюяфх')
+        score = sum(letter in rare_letters for letter in word)
+        score += max(0, len(set(word)) - 3) // 2
+        score += sum(word[index] == word[index - 1] for index in range(1, len(word)))
+        return score
+
+    def get_random_word(self, length: int, difficulty: str = 'medium') -> str:
+        words = self._load_words()
+        filtered = [w for w in words if len(w) == length]
+        if not filtered:
+            fallback = {4: "река", 5: "слово", 6: "сестра"}
+            return fallback.get(length, "слово")
+
+        difficulty = self.normalize_difficulty(difficulty)
+        if difficulty == 'easy':
+            common = [word for word in filtered if word in self.COMMON_WORDS]
+            candidates = common or sorted(filtered, key=self._word_difficulty_score)[:max(1, len(filtered) // 4)]
+        else:
+            scores = {word: self._word_difficulty_score(word) for word in filtered}
+            ordered = sorted(filtered, key=lambda word: scores[word])
+            start = {'medium': 0, 'hard': 1, 'expert': 2}[difficulty] * len(ordered) // 4
+            end = (('medium', 'hard', 'expert').index(difficulty) + 2) * len(ordered) // 4
+            candidates = ordered[start:max(start + 1, end)]
+        return random.choice(candidates)
+
+    @staticmethod
+    def check_guess(word: str, guess: str) -> str:
+        result = [''] * len(word)
+        word_list = list(word)
+        guess_list = list(guess)
+
+        for i in range(len(word_list)):
+            if guess_list[i] == word_list[i]:
+                result[i] = '🟩'
+                word_list[i] = None
+                guess_list[i] = None
+
+        for i in range(len(guess_list)):
+            if guess_list[i] is None:
+                continue
+            if guess_list[i] in word_list:
+                result[i] = '🟨'
+                word_list[word_list.index(guess_list[i])] = None
+            else:
+                result[i] = '⬛'
+
+        return ''.join(result)
+
+    def start_game(self, user_id: int, length: int = DEFAULT_WORDLE_LENGTH,
+                   attempts: int = DEFAULT_WORDLE_ATTEMPTS, difficulty: str = 'medium'):
+        key = f"wordle_{user_id}"
+        if key in self.games:
+            return False, "❌ Вы уже играете. Завершите: !wordle exit"
+
+        difficulty = self.normalize_difficulty(difficulty)
+        word = self.get_random_word(length, difficulty)
+        if not word:
+            return False, "❌ Не удалось получить слово."
+
+        self.games[key] = {
+            'word': word,
+            'length': length,
+            'attempts': attempts,
+            'attempts_left': attempts,
+            'guesses': [],
+            'status': 'active',
+            'user_id': user_id,
+            'chat_id': None,
+            'message_id': None,
+            'difficulty': difficulty
+        }
+        return True, (f"🎮 <b>Wordle (русский)</b>\n\n"
+                      f"Загадано слово из <b>{length}</b> букв.\n"
+                      f"У вас <b>{attempts}</b> попыток.\n\n"
+                      f"Введите слово в следующем сообщении.\n"
+                      f"🟩 — на месте\n🟨 — есть, но не на месте\n⬛ — нет\n\n"
+                      f"Для выхода: <code>!wordle exit</code>")
+
+    def start_chat_game(self, chat_id: int, user_id: int, length: int = DEFAULT_WORDLE_LENGTH,
+                        attempts: int = DEFAULT_WORDLE_ATTEMPTS, difficulty: str = 'medium'):
+        key = f"wordle_chat_{chat_id}"
+        if key in self.games and self.games[key]['status'] == 'active':
+            return False, "❌ В этом чате уже идёт игра Wordle."
+
+        difficulty = self.normalize_difficulty(difficulty)
+        word = self.get_random_word(length, difficulty)
+        if not word:
+            return False, "❌ Не удалось получить слово."
+
+        self.games[key] = {
+            'word': word,
+            'length': length,
+            'attempts': attempts,
+            'attempts_left': attempts,
+            'guesses': [],
+            'status': 'active',
+            'user_id': user_id,
+            'chat_id': chat_id,
+            'message_id': None
+            , 'difficulty': difficulty
+        }
+        return True, (f"🎮 <b>Wordle на русском</b>\n\n"
+                  f"🔤 Загадано слово из <b>{length}</b> букв.\n"
+                f"🎚️ Сложность: <b>{self.DIFFICULTY_NAMES[difficulty]}</b>\n"
+                  f"🎯 Всего на всех игроков — до <b>{attempts}</b> попыток.\n\n"
+                  f"<b>Как играть:</b>\n"
+                  f"1️⃣ Ответьте на это сообщение словом из {length} букв.\n"
+                  f"2️⃣ Бот покажет результат после каждой попытки.\n"
+                  f"🟩 буква угадана и стоит на месте\n"
+                  f"🟨 буква есть, но место другое\n"
+                  f"⬛ такой буквы нет в слове\n\n"
+                  f"💡 Это одна общая игра для всего чата: отвечайте на это сообщение.\n"
+                  f"⏹️ Отменить игру: <code>!wordle exit</code>\n"
+                  f"🛑 Админу остановить игру: <code>!wordle stop</code>")
+
+    def make_guess(self, chat_id: int, user_id: int, guess: str, player_name: str):
+        game = self.get_chat_game(chat_id)
+        if not game or game['status'] != 'active':
+            return False, "❌ В этом чате нет активной игры.", None
+
+        if len(guess) != game['length']:
+            return False, f"❌ Слово должно быть из {game['length']} букв.", None
+        if not re.fullmatch(r'[а-яё]+', guess):
+            return False, "❌ Только русские буквы.", None
+
+        used_words = {entry[1] for entry in game['guesses']}
+        if guess in used_words:
+            return False, "❌ Это слово уже вводили. Попробуйте другое.", None
+
+        result_emoji = self.check_guess(game['word'], guess)
+        game['guesses'].append((player_name, guess, result_emoji))
+        game['attempts_left'] -= 1
+
+        display = '\n'.join([f"👤 <b>{name}</b>: <code>{g}</code> — {r}"
+                     for name, g, r in game['guesses']])
+
+        if guess == game['word']:
+            game['status'] = 'finished'
+            return True, (f"🎉 <b>Поздравляем!</b>\n\n{display}\n\n"
+                          f"Попыток: {game['attempts'] - game['attempts_left']}"), game
+
+        if game['attempts_left'] == 0:
+            game['status'] = 'finished'
+            return True, (f"😞 <b>Игра окончена!</b>\n\n{display}\n\n"
+                          f"Загаданное слово: <b>{game['word']}</b>"), game
+
+        return True, (f"📝 <b>Попытка {game['attempts'] - game['attempts_left']}</b>\n\n{display}\n\n"
+                      f"Осталось: {game['attempts_left']}"), None
+
+    def exit_chat_game(self, chat_id: int) -> bool:
+        key = f"wordle_chat_{chat_id}"
+        if key in self.games:
+            del self.games[key]
+            return True
+        return False
+
+    def set_game_message(self, user_id: int, chat_id: int, message_id: int):
+        game = self.get_chat_game(chat_id)
+        if game is not None:
+            game['message_id'] = message_id
+
+    def get_game_state(self, user_id: int):
+        return self.games.get(f"wordle_{user_id}")
+
+    def get_chat_game(self, chat_id: int):
+        return self.games.get(f"wordle_chat_{chat_id}")
+
+wordle = WordleGame()
 # ==================== Бот ====================
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -618,40 +1362,198 @@ def get_rank_emoji(chat_id: int, level: int) -> str:
 
 # ==================== Вспомогательные функции ====================
 
+MUTE_TIME_UNIT_PATTERN = (
+    r'(?:тысячелети(?:е|я|й|и)?|тыс\.?|век(?:а|у|и|ов)?|'
+    r'год(?:а|у|ы|ов)?|лет|г(?![а-яёa-z])|'
+    r'месяц(?:а|у|е|ы|ев)?|мес\.?|'
+    r'недел(?:я|и|ю|ей|е)|нед\.?|'
+    r'день|дня|дней|дни|дн\.?|д(?![а-яёa-z])|'
+    r'час(?:а|у|ы|ов)?|ч\.?|'
+    r'мин(?:ут(?:а|ы|у|е|ой|ами|ах)?|\.?)|м(?![а-яёa-z])|'
+    r'years?|yrs?|months?|mos?|weeks?|wks?|days?|hrs?|hours?|mins?|minutes?|'
+    r'y|d|h)'
+)
+MUTE_TIME_UNIT_REGEX = re.compile(
+    rf'(?P<value>\d+)\s*(?P<unit>{MUTE_TIME_UNIT_PATTERN})(?=$|\s|[.,])',
+    re.IGNORECASE,
+)
+MUTE_TIME_MULTIPLIERS = {
+    'тысячелетие': 525600000, 'тысячелетия': 525600000, 'тысячелетий': 525600000,
+    'тысячилетие': 525600000, 'тыс': 525600000,
+    'век': 52560000, 'века': 52560000, 'веку': 52560000, 'веки': 52560000, 'веков': 52560000,
+    'год': 525600, 'года': 525600, 'году': 525600, 'годы': 525600, 'годов': 525600, 'лет': 525600, 'г': 525600,
+    'месяц': 43800, 'месяца': 43800, 'месяцу': 43800, 'месяце': 43800, 'месяцы': 43800, 'месяцев': 43800, 'мес': 43800,
+    'неделя': 10080, 'недели': 10080, 'неделю': 10080, 'недель': 10080, 'неделе': 10080, 'нед': 10080,
+    'день': 1440, 'дня': 1440, 'дней': 1440, 'дни': 1440, 'дн': 1440, 'д': 1440,
+    'час': 60, 'часа': 60, 'часу': 60, 'часы': 60, 'часов': 60, 'ч': 60,
+    'минута': 1, 'минуты': 1, 'минуту': 1, 'минуте': 1, 'минутой': 1,
+    'минутами': 1, 'минутах': 1, 'мин': 1, 'м': 1,
+    'year': 525600, 'years': 525600, 'yr': 525600, 'yrs': 525600, 'y': 525600,
+    'month': 43800, 'months': 43800, 'mo': 43800, 'mos': 43800,
+    'week': 10080, 'weeks': 10080, 'wk': 10080, 'wks': 10080, 'w': 10080,
+    'day': 1440, 'days': 1440, 'd': 1440,
+    'hour': 60, 'hours': 60, 'hr': 60, 'hrs': 60, 'h': 60,
+    'minute': 1, 'minutes': 1, 'min': 1, 'mins': 1,
+}
+
+
+def _normalize_mute_time_unit(unit: str) -> Optional[int]:
+    normalized = unit.lower().rstrip('.')
+    multiplier = MUTE_TIME_MULTIPLIERS.get(normalized)
+    if multiplier is not None:
+        return multiplier
+    if normalized.startswith('тысячелети'):
+        return 525600000
+    return None
+
+
+def _parse_mute_duration_prefix(text: str) -> Tuple[str, str]:
+    """Splits a leading sequence of duration units from the remaining reason."""
+    position = 0
+    total_components = 0
+    length = len(text)
+
+    while position < length:
+        whitespace_start = position
+        while position < length and text[position].isspace():
+            position += 1
+        match = MUTE_TIME_UNIT_REGEX.match(text, position)
+        if match:
+            multiplier = _normalize_mute_time_unit(match.group('unit'))
+            if multiplier is None:
+                position = whitespace_start
+                break
+            try:
+                int(match.group('value'))
+            except ValueError:
+                position = whitespace_start
+                break
+            position = match.end()
+            total_components += 1
+            continue
+
+        number_match = re.match(r'\d+', text[position:])
+        if number_match and total_components == 0:
+            number_end = position + number_match.end()
+            if number_end == length or text[number_end].isspace():
+                position = number_end
+                total_components = 1
+        break
+
+    if not total_components:
+        return '', text.strip()
+    duration = text[:position].strip()
+    reason = text[position:].strip()
+    return duration, reason or 'Без причины'
+
+
+def format_mute_duration(duration_minutes: int) -> str:
+    if duration_minutes >= 525600:
+        years, remainder = divmod(duration_minutes, 525600)
+        months = remainder // 43800
+        parts = [f"{years} г."]
+        if months:
+            parts.append(f"{months} мес.")
+        return ' '.join(parts)
+    if duration_minutes >= 43800:
+        months, remainder = divmod(duration_minutes, 43800)
+        days = remainder // 1440
+        parts = [f"{months} мес."]
+        if days:
+            parts.append(f"{days} д.")
+        return ' '.join(parts)
+    if duration_minutes >= 1440:
+        days, remainder = divmod(duration_minutes, 1440)
+        hours, minutes = divmod(remainder, 60)
+        parts = [f"{days} д."]
+        if hours:
+            parts.append(f"{hours} ч.")
+        if minutes:
+            parts.append(f"{minutes} мин.")
+        return ' '.join(parts)
+    if duration_minutes >= 60:
+        hours, minutes = divmod(duration_minutes, 60)
+        return f"{hours} ч." + (f" {minutes} мин." if minutes else '')
+    return f"{duration_minutes} мин."
+
+
 def parse_time(s: str) -> int:
     if not s:
         return DEFAULT_MUTE_MINUTES
-    s = s.lower().strip()
+    s = s.strip()
+    if re.fullmatch(r'\d+', s):
+        try:
+            return int(s)
+        except ValueError:
+            return 0
+
     total_minutes = 0
-    # Тысячелетия, века, годы, месяцы, дни, часы, минуты со всеми падежами
-    for pattern, multiplier in [
-        (r'(\d+)\s*(?:тысячелети(?:й|и|е)?|тыс\.?(?!\w))', 525600000),  # тысячелетия
-        (r'(\d+)\s*(?:век(?:а|ов)?|в\.?(?!\w))', 52560000),  # века
-        (r'(\d+)\s*(?:год(?:а|ов)?|л(?:ет)?|г(?!\w))', 525600),  # годы, лет, г
-        (r'(\d+)\s*(?:месяц(?:а|ев)?|мес\.?(?!\w))', 43800),  # месяцы
-        (r'(\d+)\s*(?:дн?(?:и|ей)?|д(?!\w))', 1440),  # дни, день, дня, дней, д
-        (r'(\d+)\s*(?:ча?(?:с(?:а|ов)?)?|ч(?!\w))', 60),  # часы, час, часа, часов, ч
-        (r'(\d+)\s*(?:минут(?:ы|)?|минута|м(?!\w))', 1)   # минуты, минута, минут, м
-    ]:
-        matches = re.finditer(pattern, s)
-        for match in matches:
-            total_minutes += int(match.group(1)) * multiplier
-    if total_minutes > 0:
-        return total_minutes
-    try:
-        return int(s)
-    except:
-        return DEFAULT_MUTE_MINUTES
+    position = 0
+    components = 0
+    while position < len(s):
+        while position < len(s) and s[position].isspace():
+            position += 1
+        if position == len(s):
+            break
+        match = MUTE_TIME_UNIT_REGEX.match(s, position)
+        if not match:
+            return 0
+        multiplier = _normalize_mute_time_unit(match.group('unit'))
+        if multiplier is None:
+            return 0
+        try:
+            total_minutes += int(match.group('value')) * multiplier
+        except ValueError:
+            return 0
+        position = match.end()
+        components += 1
+    return total_minutes if components else 0
+
+
+PERMANENT_MUTE_ALIASES = {
+    'навсегда', 'навечно', 'бессрочно', 'бессрочный', 'бессрочная',
+    'перманент', 'перманентно', 'forever', 'permanent', 'perm',
+}
+MAX_MUTE_MINUTES = 365 * 24 * 60
+
+
+def parse_mute_duration_and_reason(text: str) -> Tuple[bool, str, str]:
+    text = text.strip()
+    permanent_aliases = '|'.join(
+        re.escape(alias) for alias in sorted(PERMANENT_MUTE_ALIASES, key=len, reverse=True)
+    )
+    permanent_match = re.match(
+        rf'^({permanent_aliases})\b(?:\s+(.*))?$',
+        text,
+        re.IGNORECASE,
+    )
+    if permanent_match:
+        return True, '', (permanent_match.group(2) or 'Без причины').strip()
+
+    duration, reason = _parse_mute_duration_prefix(text)
+    if not duration and re.match(r'^\d', text):
+        return False, text, 'Без причины'
+    return False, duration, reason
+
+
+def warning_is_active(warning: dict, now: Optional[float] = None) -> bool:
+    if warning.get('permanent') is True:
+        return True
+    expire_date = warning.get('expire_date')
+    current_time = time.time() if now is None else now
+    return isinstance(expire_date, (int, float)) and expire_date > current_time
 
 
 def mention(chat_id: int, user: Union[User, int, str]) -> str:
     """Возвращает кликабельную ссылку на пользователя"""
     try:
         if isinstance(user, User):
+            safe_name = html.escape(str(user.first_name or user.username or "Пользователь"), quote=False)
             if user.username:
-                return f'<a href="https://t.me/{user.username}">{user.first_name or user.username}</a>'
+                safe_username = html.escape(str(user.username), quote=True)
+                return f'<a href="https://t.me/{safe_username}">{safe_name}</a>'
             else:
-                return f'<a href="tg://user?id={user.id}">{user.first_name or "Пользователь"}</a>'
+                return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
         if isinstance(user, int):
             cache_key = f"mention_{chat_id}_{user}"
             cached = mention_cache.get(cache_key)
@@ -660,31 +1562,75 @@ def mention(chat_id: int, user: Union[User, int, str]) -> str:
             u = storage.get_user(chat_id, user)
             username = u.get('username', '')
             base_display = u.get('custom_name') or u.get('first_name') or username or f"ID:{user}"
-            tag = (u.get('custom_tag') or '').strip()
-            display = f"{base_display} • {tag}" if tag else base_display
+            display = html.escape(str(base_display), quote=False)
+            safe_username = html.escape(str(username), quote=True)
             if username:
-                result = f'<a href="https://t.me/{username}">{display}</a>'
+                result = f'<a href="https://t.me/{safe_username}">{display}</a>'
             else:
                 result = f'<a href="tg://user?id={user}">{display}</a>'
             mention_cache.set(cache_key, result)
             return result
-        return str(user)
+        return html.escape(str(user), quote=False)
     except:
         return str(user)
 
 
 def get_display_name(chat_id: int, uid: int) -> str:
-    """Возвращает отображаемое имя пользователя (тег + кастомное или реальное имя)"""
+    """Возвращает кастомное или реальное имя пользователя."""
     u = storage.get_user(chat_id, uid)
     base = u.get('custom_name') or u.get('first_name') or u.get('username') or f"ID:{uid}"
-    tag = (u.get('custom_tag') or '').strip()
-    return f"{base} • {tag}" if tag else base
+    return html.escape(str(base), quote=False)
+
+
+def get_target_mention_span(msg: Message, arg: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    """Возвращает ID и границы кликабельного упоминания без username в тексте команды."""
+    if not arg or not msg.text:
+        return None
+
+    argument = arg.strip().lstrip('@').casefold()
+    if not argument:
+        return None
+
+    encoded_text = msg.text.encode('utf-16-le')
+    for entity in msg.entities or []:
+        entity_type = getattr(entity.type, 'value', entity.type)
+        target_id = None
+        if entity_type == 'text_mention' and entity.user:
+            target_id = entity.user.id
+        elif entity_type == 'text_link':
+            match = re.fullmatch(r'tg://user\?id=(\d+)', entity.url or '')
+            if match:
+                target_id = int(match.group(1))
+        if target_id is None:
+            continue
+
+        byte_start = entity.offset * 2
+        byte_end = (entity.offset + entity.length) * 2
+        if byte_end > len(encoded_text):
+            continue
+        try:
+            start = len(encoded_text[:byte_start].decode('utf-16-le'))
+            end = len(encoded_text[:byte_end].decode('utf-16-le'))
+            entity_text = encoded_text[byte_start:byte_end].decode('utf-16-le')
+        except UnicodeDecodeError:
+            logger.warning("Некорректные границы Telegram entity в сообщении %s", msg.message_id)
+            continue
+
+        normalized_entity = entity_text.strip().casefold()
+        if (
+            normalized_entity == argument
+            or normalized_entity.startswith(argument)
+            and len(normalized_entity) > len(argument)
+            and normalized_entity[len(argument)].isspace()
+        ):
+            return target_id, start, end
+    return None
 
 
 async def get_target(msg: Message, arg: str = None) -> Optional[int]:
     """
     Получить ID цели. Приоритет: ответ на сообщение > аргумент (username, ID, имя).
-    Теперь поддерживает @username даже для новых пользователей!
+    Поддерживает @username, Telegram ID и кликабельные упоминания без username.
     """
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user.id
@@ -693,6 +1639,10 @@ async def get_target(msg: Message, arg: str = None) -> Optional[int]:
         return None
 
     arg = arg.strip()
+
+    mention_span = get_target_mention_span(msg, arg)
+    if mention_span:
+        return mention_span[0]
 
     # Если это @username
     if arg.startswith('@'):
@@ -727,24 +1677,142 @@ async def get_target(msg: Message, arg: str = None) -> Optional[int]:
     return None
 
 
+CHAT_OWNER_CACHE_TTL = 60
+chat_owner_sync_cache: Dict[int, Tuple[float, Optional[int]]] = {}
+chat_owner_sync_locks: Dict[int, asyncio.Lock] = {}
+
+
+async def sync_chat_owner(chat_id: int):
+    """Keeps rank 5 assigned to the current Telegram chat owner."""
+    now = time.monotonic()
+    cached = chat_owner_sync_cache.get(chat_id)
+    if cached and cached[0] > now:
+        return
+
+    lock = chat_owner_sync_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        cached = chat_owner_sync_cache.get(chat_id)
+        if cached and cached[0] > now:
+            return
+
+        try:
+            administrators = await bot.get_chat_administrators(chat_id)
+        except Exception as e:
+            logger.warning("Не удалось определить владельца чата %s: %s", chat_id, e)
+            return
+
+        owner = next((member.user for member in administrators if member.status == 'creator'), None)
+        if owner is None:
+            logger.warning("Telegram не вернул владельца чата %s среди администраторов", chat_id)
+            chat_owner_sync_cache[chat_id] = (now + CHAT_OWNER_CACHE_TTL, None)
+            return
+
+        owners = storage.data.setdefault('chat_owners', {})
+        chat_key = str(chat_id)
+        previous = owners.get(chat_key)
+        if previous is not None and not isinstance(previous, dict):
+            logger.warning("Некорректная запись владельца чата %s в хранилище", chat_id)
+            previous = None
+
+        if previous and previous.get('user_id') != owner.id:
+            previous_user_id = previous.get('user_id')
+            previous_rank = previous.get('rank_before', 0)
+            if isinstance(previous_user_id, int):
+                if isinstance(previous_rank, int) and 0 <= previous_rank <= MAX_RANK:
+                    storage.get_user(chat_id, previous_user_id, use_cache=False)['rank'] = previous_rank
+                    storage.invalidate_user_cache(chat_id, previous_user_id)
+                else:
+                    logger.warning("Некорректный прежний ранг владельца чата %s", chat_id)
+
+        if not previous or previous.get('user_id') != owner.id:
+            owner_user = storage.get_user(chat_id, owner.id, use_cache=False)
+            owners[chat_key] = {'user_id': owner.id, 'rank_before': owner_user.get('rank', 0)}
+            owner_user['rank'] = MAX_RANK
+            storage.invalidate_user_cache(chat_id, owner.id)
+            storage.mark_dirty()
+        else:
+            owner_user = storage.get_user(chat_id, owner.id, use_cache=False)
+            if owner_user.get('rank') != MAX_RANK:
+                owner_user['rank'] = MAX_RANK
+                storage.invalidate_user_cache(chat_id, owner.id)
+                storage.mark_dirty()
+
+        chat_owner_sync_cache[chat_id] = (now + CHAT_OWNER_CACHE_TTL, owner.id)
+
+
 def check_access(uid: int, chat_id: int, cmd: str, min_rank: int = 0) -> bool:
-    if uid == MAIN_ADMIN_ID:
+    chat_id_str = str(chat_id)
+    command_func = COMMANDS.get(cmd)
+    aliases = (
+        [alias for alias, func in COMMANDS.items() if func == command_func]
+        if command_func else [cmd]
+    )
+    command_access = storage.data['command_access'].get(chat_id_str, {})
+    if any(command_access.get(alias) == 9 for alias in aliases):
+        return False
+
+    personal_access = storage.data['personal_access'].get(chat_id_str, {})
+    if any(uid in personal_access.get(alias, []) for alias in aliases):
         return True
-    uid_str, chat_id_str = str(uid), str(chat_id)
-    if cmd in storage.data['personal_access'].get(chat_id_str, {}) and uid in \
-            storage.data['personal_access'][chat_id_str][cmd]:
+
+    configured_ranks = [
+        command_access[alias]
+        for alias in aliases
+        if alias in command_access and isinstance(command_access[alias], int)
+    ]
+    required_rank = max(configured_ranks) if configured_ranks else min_rank
+    return storage.get_user(chat_id, uid).get('rank', 0) >= required_rank if required_rank else True
+
+
+def get_command_aliases(command: str) -> List[str]:
+    command_func = COMMANDS.get(command)
+    if command_func is None:
+        return [command]
+    return [alias for alias, func in COMMANDS.items() if func == command_func]
+
+
+async def is_telegram_admin(chat_id: int, uid: int) -> bool:
+    """Проверяет реальные права пользователя в Telegram перед модерацией."""
+    try:
+        member = await bot.get_chat_member(chat_id, uid)
+        return member.status in ('administrator', 'creator')
+    except Exception as e:
+        logger.warning("Не удалось проверить права %s в чате %s: %s", uid, chat_id, e)
+        return False
+
+
+async def is_anti_spam_admin(chat_id: int, uid: int) -> bool:
+    cache_key = f"{chat_id}:{uid}"
+    cached_status = anti_spam_admin_cache.get(cache_key)
+    if cached_status is not None:
+        return cached_status
+
+    try:
+        member = await bot.get_chat_member(chat_id, uid)
+    except Exception as e:
+        logger.warning(
+            "Антиспам: не удалось проверить права %s в чате %s: %s",
+            uid, chat_id, e
+        )
+        anti_spam_admin_cache.set(cache_key, False, ttl=3)
+        return False
+
+    is_admin = member.status in ('administrator', 'creator')
+    anti_spam_admin_cache.set(cache_key, is_admin)
+    return is_admin
+
+
+async def require_telegram_admin(msg: Message) -> bool:
+    if await is_telegram_admin(msg.chat.id, msg.from_user.id):
         return True
-    acc = storage.data['command_access'].get(chat_id_str, {})
-    if cmd in acc:
-        return False if acc[cmd] == 9 else storage.get_user(chat_id, uid).get('rank', 0) >= acc[cmd]
-    return storage.get_user(chat_id, uid).get('rank', 0) >= min_rank if min_rank else True
+    await msg.answer("❌ Нужны права администратора Telegram для этой команды.")
+    return False
 
 
 def check_anti_moderation(initiator_id: int, target_id: int, chat_id: int) -> bool:
-    if initiator_id == target_id or target_id == MAIN_ADMIN_ID:
-        return target_id != MAIN_ADMIN_ID
-    if initiator_id == MAIN_ADMIN_ID:
-        return True
+    if initiator_id == target_id:
+        return False
     if not storage.get_chat_settings(chat_id).get('anti_moderation', True):
         return True
     initiator_rank = storage.get_user(chat_id, initiator_id).get('rank', 0)
@@ -758,25 +1826,312 @@ def check_anti_moderation(initiator_id: int, target_id: int, chat_id: int) -> bo
     return False
 
 
-def save_activity(chat_id: int, uid: int, atype: str = 'messages'):
+def save_activity(chat_id: int, uid: int, atype: str = 'messages', amount: int = 1):
     """Сохраняет активность только если пользователь в основной группе"""
     atype_map = {'command': 'commands', 'commands': 'commands', 'rep': 'reputation', 'reputation': 'reputation',
                  'game': 'games', 'games': 'games', 'message': 'messages', 'messages': 'messages'}
     atype = atype_map.get(atype, 'messages')
     u = storage.get_user(chat_id, uid)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = kaliningrad_now().strftime('%Y-%m-%d')
     if 'activity' not in u:
         u['activity'] = {}
     if today not in u['activity']:
         u['activity'][today] = {'messages': 0, 'reputation': 0, 'commands': 0, 'games': 0}
     if atype not in u['activity'][today]:
         u['activity'][today][atype] = 0
-    u['activity'][today][atype] += 1
+    u['activity'][today][atype] += amount
     dates = sorted(u['activity'].keys())
     if len(dates) > 60:
         for old in dates[:-60]:
             del u['activity'][old]
     storage.mark_dirty()
+
+
+def get_activity_message_count(activity: dict, period: str, now: datetime) -> int:
+    """Возвращает число сообщений за календарный период."""
+    today = now.astimezone(KALININGRAD_TZ).date()
+    if period == 'day':
+        start = today
+    elif period == 'week':
+        start = today - timedelta(days=today.weekday())
+    elif period == 'month':
+        start = today.replace(day=1)
+    elif period == 'year':
+        start = today.replace(month=1, day=1)
+    else:
+        return 0
+
+    return sum(
+        activity.get((start + timedelta(days=offset)).strftime('%Y-%m-%d'), {}).get('messages', 0)
+        for offset in range((today - start).days + 1)
+    )
+
+
+@lru_cache(maxsize=1)
+def get_graph_emoji_fonts() -> Tuple[Tuple[str, Any], ...]:
+    if not MATPLOTLIB_AVAILABLE:
+        return ()
+    try:
+        from matplotlib import font_manager
+        from matplotlib.ft2font import FT2Font
+    except ImportError:
+        return ()
+
+    preferred_names = (
+        'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji',
+        'Twitter Color Emoji', 'Noto Emoji', 'Symbola',
+    )
+    fonts = []
+    seen_paths = set()
+    for preferred in preferred_names:
+        for entry in font_manager.fontManager.ttflist:
+            if preferred.casefold() not in entry.name.casefold() or entry.fname in seen_paths:
+                continue
+            try:
+                glyphs = FT2Font(entry.fname).get_charmap()
+            except (OSError, RuntimeError):
+                continue
+            fonts.append((entry.fname, glyphs))
+            seen_paths.add(entry.fname)
+    return tuple(fonts)
+
+
+def split_graph_text(text: str) -> List[Tuple[str, bool]]:
+    """Split text into grapheme-like clusters and mark emoji clusters for font fallback."""
+    clusters = []
+    current = ''
+    join_next = False
+    regional_count = 0
+    for char in text:
+        codepoint = ord(char)
+        is_regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        is_modifier = 0x1F3FB <= codepoint <= 0x1F3FF
+        is_variation = 0xFE00 <= codepoint <= 0xFE0F or 0xE0100 <= codepoint <= 0xE01EF
+        is_combining = unicodedata.category(char).startswith('M')
+        if not current or join_next or is_modifier or is_variation or is_combining:
+            current += char
+        elif char == '\u200d':
+            current += char
+        elif is_regional and regional_count % 2 == 1:
+            current += char
+        else:
+            clusters.append(current)
+            current = char
+        join_next = char == '\u200d'
+        if is_regional:
+            regional_count += 1
+        else:
+            regional_count = 0
+    if current:
+        clusters.append(current)
+
+    result = []
+    for cluster in clusters:
+        is_emoji = any(
+            (ord(char) >= 0x1F000 or ord(char) >= 0x2600 and unicodedata.category(char) == 'So')
+            and char not in {'\ufe0f', '\ufe0e', '\u200d'}
+            for char in cluster
+        )
+        result.append((cluster, is_emoji))
+    return result
+
+
+def strip_graph_emojis(text: str) -> str:
+    """Remove emoji clusters from user-provided graph labels."""
+    return ''.join(
+        cluster for cluster, is_emoji in split_graph_text(text)
+        if not is_emoji and '\u20e3' not in cluster
+    )
+
+
+def add_graph_text(
+    fig,
+    text: str,
+    x: float,
+    y: float,
+    *,
+    fontsize: float,
+    color: str,
+    fontweight: str = 'normal',
+) -> None:
+    """Draw text with installed emoji fonts and readable fallback for unsupported emoji."""
+    try:
+        from matplotlib.font_manager import FontProperties
+    except ImportError:
+        fig.text(x, y, text, color=color, fontsize=fontsize, fontweight=fontweight)
+        return
+
+    default_font = FontProperties(family='DejaVu Sans', weight=fontweight, size=fontsize)
+    emoji_fonts = get_graph_emoji_fonts()
+    runs = []
+    for cluster, is_emoji in split_graph_text(text):
+        properties = default_font
+        font_key = None
+        display = cluster
+        if is_emoji:
+            codepoints = {
+                ord(char) for char in cluster
+                if char not in {'\ufe0f', '\ufe0e', '\u200d'}
+                and not 0x1F3FB <= ord(char) <= 0x1F3FF
+            }
+            selected_font = next(
+                (
+                    path for path, glyphs in emoji_fonts
+                    if codepoints and codepoints.issubset(glyphs)
+                ),
+                None,
+            )
+            if selected_font:
+                properties = FontProperties(fname=selected_font, size=fontsize)
+                font_key = selected_font
+            else:
+                names = [
+                    unicodedata.name(char, '').lower().replace(' ', '_')
+                    for char in cluster
+                    if ord(char) >= 0x1F000 or ord(char) >= 0x2600
+                ]
+                display = f":{names[0]}:" if names and names[0] else ''
+        if not display:
+            continue
+        if runs and runs[-1][0] == font_key:
+            runs[-1] = (font_key, runs[-1][1] + display, properties)
+        else:
+            runs.append((font_key, display, properties))
+
+    for font_key, display, properties in runs:
+        artist = fig.text(
+            x, y, display, color=color, fontproperties=properties,
+            ha='left', va='center',
+        )
+        try:
+            fig.canvas.draw()
+            x += artist.get_window_extent(renderer=fig.canvas.get_renderer()).width / fig.bbox.width
+        except (OSError, RuntimeError, ValueError):
+            artist.remove()
+            if font_key is None:
+                raise
+            name = next(
+                (
+                    unicodedata.name(char, '').lower().replace(' ', '_')
+                    for char in display
+                    if ord(char) >= 0x1F000 or ord(char) >= 0x2600
+                ),
+                'emoji',
+            )
+            display = f":{name}:"
+            artist = fig.text(
+                x, y, display, color=color, fontproperties=default_font,
+                ha='left', va='center',
+            )
+            fig.canvas.draw()
+            x += artist.get_window_extent(renderer=fig.canvas.get_renderer()).width / fig.bbox.width
+
+
+def remove_message_activity(chat_id: int, uid: int, activity_date: str):
+    """Убирает удалённое антиспамом сообщение из статистики пользователя."""
+    user = storage.get_user(chat_id, uid, use_cache=False)
+    day_activity = user.get('activity', {}).get(activity_date)
+    if not isinstance(day_activity, dict):
+        return
+
+    day_messages = day_activity.get('messages', 0)
+    total_messages = user.get('messages_count', 0)
+    if day_messages <= 0 and total_messages <= 0:
+        return
+
+    if day_messages > 0:
+        day_activity['messages'] = day_messages - 1
+    if total_messages > 0:
+        user['messages_count'] = total_messages - 1
+
+    storage.invalidate_user_cache(chat_id, uid)
+    storage.mark_dirty()
+    
+class MessageStatsMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.from_user and not event.from_user.is_bot:
+            if event.chat.type in ('group', 'supergroup'):
+                await sync_chat_owner(event.chat.id)
+            if is_main_chat(event.chat.id, event.message_thread_id):
+                updated = storage.update_user_from_message(event)
+                if updated:
+                    save_activity(event.chat.id, event.from_user.id, 'messages')
+                    user = storage.get_user(event.chat.id, event.from_user.id)
+                    user['messages_count'] = user.get('messages_count', 0) + 1
+                    storage.mark_dirty()
+
+            if await handle_anti_spam(event):
+                return None
+
+        return await handler(event, data)
+
+
+router.message.middleware(MessageStatsMiddleware())
+
+
+class CallbackFloodMiddleware(BaseMiddleware):
+    def __init__(self):
+        self.user_callbacks: Dict[Tuple[int, int], List[float]] = defaultdict(list)
+        self.last_cleanup = time.time()
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, CallbackQuery) or not event.from_user:
+            return await handler(event, data)
+
+        if event.message and event.message.chat.type in ('group', 'supergroup'):
+            chat_id = event.message.chat.id
+            if not storage.get_chat_settings(chat_id).get('anti_spam', {}).get('enabled', True):
+                return await handler(event, data)
+            if await is_anti_spam_admin(chat_id, event.from_user.id):
+                return await handler(event, data)
+
+        now = time.time()
+        if now - self.last_cleanup >= 300:
+            self.user_callbacks = defaultdict(
+                list,
+                {
+                    key: [timestamp for timestamp in timestamps if now - timestamp < 10]
+                    for key, timestamps in self.user_callbacks.items()
+                    if any(now - timestamp < 10 for timestamp in timestamps)
+                }
+            )
+            self.last_cleanup = now
+
+        chat_id = event.message.chat.id if event.message else 0
+        key = (chat_id, event.from_user.id)
+        recent = [timestamp for timestamp in self.user_callbacks[key] if now - timestamp < 5]
+        if len(recent) >= 10:
+            self.user_callbacks[key] = recent
+            await event.answer("Слишком частые нажатия. Подождите немного.")
+            return None
+
+        recent.append(now)
+        self.user_callbacks[key] = recent
+        return await handler(event, data)
+
+
+router.callback_query.middleware(CallbackFloodMiddleware())
+
+
+ACTIVITY_GRAPH_THEMES = {
+    'light_default': ('Стандартная', 'light', '#ffffff', '#f5f6f8', '#5865f2', '#d9defa', '#747f8d', '#23272a'),
+    'light_sand': ('Песочная', 'light', '#fbf7f0', '#f3ecdf', '#b77936', '#ead7bd', '#8c7963', '#392f25'),
+    'light_sky': ('Небесная', 'light', '#f4f9ff', '#e8f2ff', '#3787e5', '#c8e0fb', '#7188a3', '#20344d'),
+    'light_mint': ('Мятная', 'light', '#f2fbf6', '#e5f5ec', '#31a875', '#c4ead6', '#708d7d', '#234536'),
+    'light_lavender': ('Лавандовая', 'light', '#f8f5ff', '#eee8fb', '#8d63d8', '#dacdf5', '#827699', '#382c4e'),
+    'light_rose': ('Розовая', 'light', '#fff5f7', '#fbe9ed', '#db6685', '#f4ccd7', '#98747f', '#4a2934'),
+    'light_red': ('Алый', 'light', '#fff5f5', '#fbe8e8', '#d64545', '#f2c5c5', '#986e6e', '#492525'),
+    'dark_default': ('Стандартная', 'dark', '#1a170d', '#211d13', '#ebaa47', '#604e29', '#c5a66f', '#f8fafc'),
+    'dark_midnight': ('Полночь', 'dark', '#161821', '#202331', '#8b9cff', '#414a75', '#aeb5d0', '#f4f5ff'),
+    'dark_ocean': ('Океан', 'dark', '#101c24', '#172832', '#45c7d5', '#275967', '#91bac2', '#ecfbff'),
+    'dark_forest': ('Лесная', 'dark', '#121d18', '#1b2b22', '#62c98b', '#315d43', '#9bb8a5', '#effcf3'),
+    'dark_amethyst': ('Аметистовая', 'dark', '#1c1623', '#291f33', '#bd83ed', '#594071', '#b9a7ca', '#fbf4ff'),
+    'dark_sunset': ('Закатная', 'dark', '#241817', '#33211f', '#ff9274', '#704039', '#c9a39a', '#fff5f1'),
+    'dark_red': ('Багровый', 'dark', '#160606', '#260909', '#ff1a1a', '#801010', '#e08b8b', '#fff0f0'),
+}
+ACTIVITY_GRAPH_THEME_NAMES = {
+    theme_id: theme[0] for theme_id, theme in ACTIVITY_GRAPH_THEMES.items()
+}
 
 
 def create_graph(chat_id: int, uid: int, days: int = 7) -> Optional[BytesIO]:
@@ -786,39 +2141,87 @@ def create_graph(chat_id: int, uid: int, days: int = 7) -> Optional[BytesIO]:
     act = u.get('activity', {})
     if not act:
         return None
-    today = datetime.now().date()
-    dates, msgs, reps = [], [], []
+    today = kaliningrad_now().date()
+    dates, messages = [], []
     for i in range(days):
         d = today - timedelta(days=days - 1 - i)
         ds = d.strftime('%Y-%m-%d')
         dates.append(d)
-        msgs.append(act.get(ds, {}).get('messages', 0))
-        reps.append(act.get(ds, {}).get('reputation', 0))
+        messages.append(max(0, act.get(ds, {}).get('messages', 0)))
+
     try:
-        plt.style.use('dark_background')
-        fig, ax1 = plt.subplots(figsize=(10, 5), facecolor='#1a170d')
-        ax1.set_facecolor('#1a170d')
-        ax1.plot(dates, msgs, color='#ebaa47', linewidth=2.5, marker='o', markersize=6, label='Сообщения')
-        ax1.fill_between(dates, msgs, color='#604e29', alpha=0.4)
-        ax1.set_ylabel('Сообщения', color='#ebaa47')
-        ax1.tick_params(axis='y', labelcolor='#ebaa47')
-        ax1.tick_params(axis='x', colors='#ebaa47', rotation=45)
-        ax2 = ax1.twinx()
-        ax2.plot(dates, reps, color='#604e29', linewidth=2.5, marker='o', markersize=6, label='Репутация')
-        ax2.set_ylabel('Репутация', color='#604e29')
-        ax2.tick_params(axis='y', labelcolor='#604e29')
-        ax1.set_ylim(bottom=0)
-        ax2.set_ylim(bottom=0)
-        ax1.grid(True, color='#604e29', alpha=0.2)
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m'))
-        plt.title(f'Активность: {get_display_name(chat_id, uid)}', color='#ebaa47', fontsize=14)
-        plt.tight_layout()
+        theme_id = u.get('activity_graph_theme', 'dark_default')
+        if not isinstance(theme_id, str):
+            theme_id = 'dark_default'
+        theme = ACTIVITY_GRAPH_THEMES.get(theme_id, ACTIVITY_GRAPH_THEMES['dark_default'])
+        _, _, background, panel, accent, fill, muted, text_color = theme
+
+        fig, ax = plt.subplots(figsize=(10, 4.8), facecolor=background)
+        fig.subplots_adjust(left=0.09, right=0.97, top=0.77, bottom=0.19)
+        ax.set_facecolor(panel)
+        graph_name = strip_graph_emojis(
+            html.unescape(get_display_name(chat_id, uid))
+        ).strip() or f'ID:{uid}'
+        add_graph_text(
+            fig,
+            f'Активность · {graph_name}',
+            0.09, 0.91, color=text_color, fontsize=17, fontweight='bold',
+        )
+        total_messages = sum(messages)
+        active_days = sum(1 for count in messages if count > 0)
+        average = total_messages / days if days else 0
+        add_graph_text(
+            fig,
+            f'{total_messages:,} сообщений     ·     '
+            f'{active_days}/{days} активных дней     ·     '
+            f'{average:.1f} в день',
+            0.09, 0.83, color=muted, fontsize=10,
+        )
+
+        maximum = max(messages, default=0)
+        positions = list(range(len(dates)))
+        ax.fill_between(positions, messages, color=fill, alpha=0.55, zorder=2)
+        ax.plot(
+            positions, messages, color=accent, linewidth=2.7,
+            marker='o', markersize=5.5, markerfacecolor=accent,
+            markeredgecolor=background, markeredgewidth=1.5, zorder=4,
+        )
+        ax.scatter(
+            [positions[-1]], [messages[-1]], s=58,
+            color=accent, edgecolors=background, linewidths=1.5, zorder=5,
+        )
+        ax.set_xlim(-0.25, max(len(dates) - 0.75, 0.25))
+        ax.set_ylim(0, max(maximum * 1.22, 1))
+        ax.set_ylabel('Сообщения', color=muted, fontsize=9, labelpad=12)
+        ax.yaxis.grid(True, color=fill, alpha=0.65, linewidth=0.8)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis='y', colors=muted, labelsize=8, length=0, pad=8)
+        ax.tick_params(axis='x', colors=muted, labelsize=8, length=0, pad=10)
+        ax.set_yticks(plt.MaxNLocator(nbins=4, integer=True).tick_values(0, max(maximum, 1)))
+        ax.set_xticks(positions)
+        label_step = max(1, (len(dates) + 5) // 6)
+        ax.set_xticklabels([
+            date.strftime('%d.%m') if index % label_step == 0 or index == len(dates) - 1 else ''
+            for index, date in enumerate(dates)
+        ])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        for index, count in enumerate(messages):
+            if count > 0 and (count == maximum or index == len(messages) - 1):
+                ax.annotate(
+                    f'{count:,}',
+                    (positions[index], count),
+                    xytext=(0, 6), textcoords='offset points',
+                    ha='center', va='bottom', color=text_color,
+                    fontsize=8, fontweight='bold',
+                )
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a170d')
+        fig.savefig(buf, format='png', dpi=150, facecolor=background)
         buf.seek(0)
-        plt.close()
+        plt.close(fig)
         return buf
-    except:
+    except Exception:
+        logger.exception("Не удалось создать график активности пользователя %s", uid)
         plt.close('all')
         return None
 
@@ -1007,38 +2410,115 @@ LOVE_RP = {
 }
 
 # Объединяем все команды
+def ensure_rp_phrase_variants(commands: dict, modifiers: tuple) -> dict:
+    expanded = {}
+    for action, (phrases, emoji) in commands.items():
+        variants = list(dict.fromkeys(phrases))
+        for modifier in modifiers:
+            for phrase in phrases:
+                variant = f"{modifier} {phrase}"
+                if variant not in variants:
+                    variants.append(variant)
+                if len(variants) >= 10:
+                    break
+            if len(variants) >= 10:
+                break
+        expanded[action] = (variants, emoji)
+    return expanded
+
+
+RP_FRIENDLY = ensure_rp_phrase_variants(RP_FRIENDLY, (
+    'крепко', 'нежно', 'радостно', 'бережно', 'искренне',
+    'с улыбкой', 'от души', 'неожиданно', 'энергично', 'с азартом',
+    'решительно', 'без лишних слов',
+))
+VIP_RP = ensure_rp_phrase_variants(VIP_RP, (
+    'решительно', 'с размахом', 'без промедления', 'эффектно',
+    'грозно', 'внезапно', 'с важным видом', 'уверенно',
+    'демонстративно', 'стремительно', 'хладнокровно', 'во всю силу',
+))
+LOVE_RP = ensure_rp_phrase_variants(LOVE_RP, (
+    'нежно', 'бережно', 'с любовью', 'с улыбкой', 'трепетно',
+    'романтично', 'от всего сердца', 'с особой заботой',
+    'ласково', 'искренне', 'по-особенному', 'с нежностью',
+))
+
 RP = RP_FRIENDLY
 ALL_RP = {**RP, **VIP_RP, **LOVE_RP}
 
+REPUTATION_WORDS = frozenset({
+    '+', 'плюс', 'спасибо', 'спс', 'пасиб', 'благодарю',
+    'жиза', 'красава', 'красавчик', 'красавица', 'респект', 'респектую',
+    'уважение', 'лайк', 'like', 'топ', 'молодец', 'молодчина',
+    'умница', 'умничка', 'based', 'base', 'огонь', 'круто', 'класс',
+    'зачёт', 'зачет', 'имба', 'легенда', 'лучший', 'лучшая',
+    'так держать', 'поддерживаю', 'nice', 'great', 'awesome',
+    'заебись', 'охуенно', 'пиздато', 'ебать круто',
+    'well done', 'good job', 'respect', 'thanks', 'thank you', 'thx',
+    '👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿', '🔥', '💯', '✅',
+    '🫡', '👏', '🙌', '🤝', '💪', '❤️', '❤', '💙', '💚', '✨', '🌟',
+})
 
-async def rp_handler(msg: Message):
+REPUTATION_REMOVE_WORDS = frozenset({
+    '-', 'минус', 'минусую', 'минус реп', 'минус репутация',
+    'дизлайк', 'диз', 'не лайк', 'не респект', 'не одобряю',
+    'осуждаю', 'не согласен', 'не согласна', 'не понравилось',
+    'не зашло', 'так себе', 'слабовато', 'мимо', 'не круто',
+    'плохо', 'плохой', 'плохая', 'ужас', 'отстой', 'фу', 'кринж',
+    'стыдно', 'позор', 'провал', 'фейл', 'разочаровал', 'разочаровала',
+    'хуйня', 'говно', 'дерьмо', 'говнище', 'пиздец',
+    'dislike', 'downvote', 'down vote', 'bad', 'nope', 'boo',
+    'worst', 'terrible', 'awful', 'hate', 'not cool', 'not good',
+    'not impressed', 'disappointed', 'disappointing', 'cringe',
+    'lame', 'fail', 'failed', 'failure', 'trash', 'garbage', 'sucks',
+    'bad job', 'weak', 'meh', 'yikes', 'shame',
+    '👎', '👎🏻', '👎🏼', '👎🏽', '👎🏾', '👎🏿',
+    '❌', '🚫', '⛔', '💩', '🤮', '😡', '🤬', '🙄', '😒',
+    '😠', '🖕', '🤡', '😐', '😕', '😟', '😞', '😔', '😣',
+    '😖', '😫', '😩', '🤢', '🤨', '😬', '🫤', '🗑️', '🚮', '💔',
+})
+
+
+def is_reputation_message(text: str) -> bool:
+    normalized = ' '.join(text.casefold().replace('\ufe0f', '').split())
+    return normalized in REPUTATION_WORDS or (text.startswith('+') and len(text) <= 3)
+
+
+def is_reputation_removal_message(text: str) -> bool:
+    normalized = ' '.join(text.casefold().replace('\ufe0f', '').split())
+    return normalized in REPUTATION_REMOVE_WORDS
+
+
+async def rp_handler(msg: Message) -> bool:
     if not msg.text:
-        return
-    raw_text = strip_command_prefix(msg.text)
+        return False
+    raw_text = strip_command_prefix(msg.text, msg.chat.id)
     text = raw_text.lower()
 
     for act in sorted(ALL_RP.keys(), key=len, reverse=True):
-        if text.startswith(act):
-            parts = raw_text.split(maxsplit=2)
-
+        if text == act or text.startswith(act + ' '):
+            target_arg = raw_text[len(act):].strip()
             tid = None
 
             # ПРИОРИТЕТ: ответ на сообщение
             if msg.reply_to_message and msg.reply_to_message.from_user:
                 tid = msg.reply_to_message.from_user.id
-            elif len(parts) > 1:
+            elif target_arg:
                 # Если есть аргументы, пробуем найти пользователя
-                tid = await get_target(msg, parts[1])
+                tid = await get_target(msg, target_arg.split(maxsplit=1)[0])
 
             if not tid:
-                return
+                return False
 
             if act in VIP_RP and storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) < VIP_RP_RANK:
-                return await msg.answer(f"❌ Нужен ранг {VIP_RP_RANK}+")
+                await msg.answer(f"❌ Нужен ранг {VIP_RP_RANK}+")
+                return True
             if act in LOVE_RP and not storage.get_user(msg.chat.id, msg.from_user.id).get('marriage_partner'):
-                return await msg.answer("❌ Только в браке")
+                await msg.answer("❌ Только в браке")
+                return True
             if tid == msg.from_user.id and act not in ['извиниться', 'поздравить']:
-                return await msg.answer("❌ Нельзя с собой")
+                await msg.answer("❌ Нельзя с собой")
+                return True
 
             action_text = random.choice(ALL_RP[act][0])
             emoji = ALL_RP[act][1]
@@ -1048,7 +2528,9 @@ async def rp_handler(msg: Message):
                 f"{emoji} {mention(msg.chat.id, msg.from_user)} {action_text} {mention(msg.chat.id, tid)}",
                 disable_web_page_preview=True
             )
-            return
+            return True
+
+    return False
 
 
 # ==================== Команды ====================
@@ -1062,7 +2544,7 @@ COMMANDS = {
     'ранги': 'cmd_ranks_list',
     'название ранга': 'cmd_rank_rename',
     'переранг': 'cmd_rank_rename',
-    '.ид': 'cmd_id',
+    'ид': 'cmd_id',
     'топ': 'cmd_top',
     'статистика чата': 'cmd_chat_stats',
     'статистика': 'cmd_stats',
@@ -1078,22 +2560,35 @@ COMMANDS = {
     'преды': 'show_warnings',
     'варны': 'show_warnings',
     'warns': 'show_warnings',
+    'мутлист': 'cmd_mute_list',
+    'муты': 'cmd_mute_list',
+    'мутылист': 'cmd_mute_list',
+    'список мутов': 'cmd_mute_list',
+    'mutelist': 'cmd_mute_list',
+    'mutes': 'cmd_mute_list',
+    'банлист': 'cmd_ban_list',
+    'баны': 'cmd_ban_list',
+    'список банов': 'cmd_ban_list',
+    'banlist': 'cmd_ban_list',
+    'bans': 'cmd_ban_list',
+    'варнлист': 'cmd_warn_list',
+    'предлист': 'cmd_warn_list',
+    'варнылист': 'cmd_warn_list',
+    'предупреждения': 'cmd_warn_list',
+    'список предупреждений': 'cmd_warn_list',
+    'warnlist': 'cmd_warn_list',
+    'warninglist': 'cmd_warn_list',
+    'warningslist': 'cmd_warn_list',
     'снятьпред': 'cmd_unwarn',
     'снятьварн': 'cmd_unwarn',
     '-пред': 'cmd_unwarn',
     '-варн': 'cmd_unwarn',
     'unwarn': 'cmd_unwarn',
     '-смс': 'cmd_del',
-    '.пин': 'cmd_pin',
+    'пин': 'cmd_pin',
     'очистить': 'cmd_purge',
     'повысить': 'cmd_promote',
     'понизить': 'cmd_demote',
-    'закрыть топик': 'cmd_close_topic',
-    'открыть топик': 'cmd_open_topic',
-    'топики': 'cmd_list_topics',
-    '+изоляция': 'cmd_add_iso',
-    '-изоляция': 'cmd_rem_iso',
-    'изоляция': 'cmd_show_iso',
     'наградить': 'cmd_give_award',
     'снять награду': 'cmd_rem_award',
     'мои награды': 'cmd_my_awards',
@@ -1127,9 +2622,20 @@ COMMANDS = {
     'ttt': 'cmd_ttt_menu',
     'погода': 'cmd_weather',
     'п': 'cmd_weather_short',
+    'время': 'cmd_time',
+    'который час': 'cmd_time',
+    'сколько времени': 'cmd_time',
+    'тема графика': 'cmd_activity_graph_theme',
+    'график тема': 'cmd_activity_graph_theme',
     'шутка': 'cmd_random_joke',
+    'шиперим': 'cmd_ship',
+    'шипперим': 'cmd_ship',
+    'моя статья': 'cmd_my_article',
     'опрос': 'cmd_poll',
     'валера': 'cmd_iris',
+    'валера вопрос': 'cmd_iris',
+    'валерка': 'cmd_iris',
+    'валерианыч': 'cmd_iris',
     'репорт': 'cmd_report',
     'ник': 'cmd_nick',
     'погоняло': 'cmd_pogonialo',
@@ -1137,6 +2643,10 @@ COMMANDS = {
     'антиспам': 'cmd_anti_spam',
     'пинг': 'cmd_ping_check',
     'ping': 'cmd_ping_check',
+    'пик выкл': 'cmd_pic_toggle',
+    'пик вкл': 'cmd_pic_toggle',
+    'pic off': 'cmd_pic_toggle',
+    'pic on': 'cmd_pic_toggle',
     'общий сбор': 'cmd_ping',
     'бэкап': 'cmd_backup',
     'восстановить': 'cmd_restore',
@@ -1151,14 +2661,90 @@ COMMANDS = {
     'help': 'cmd_help',
     'инфо': 'cmd_help',
     'info': 'cmd_help',
+    'префикс': 'cmd_prefix',
+    'wordle': 'cmd_wordle',
+    'вордле': 'cmd_wordle',
+    'вордл': 'cmd_wordle',
+    'слово': 'cmd_wordle',
+    'угадай слово': 'cmd_wordle',
+}
+
+COMMAND_ERROR_HINTS = {
+    'кто я': '!кто я',
+    'кто ты': '!кто ты @user',
+    'кто админ': '!кто админ',
+    'мут': '!мут @user 30м флуд',
+    'размут': '!размут @user',
+    'бан': '!бан @user реклама',
+    'разбан': '!разбан @user',
+    'пред': '!пред @user 7 флуд',
+    'варн': '!пред @user 7 флуд',
+    'снятьпред': '!снятьпред @user',
+    'погоняло': '!погоняло @user Крутой',
+    'топ': '!топ день',
+    'статистика': '!статистика',
+    'помощь': '!помощь',
+    'погода': '!погода',
+    'опрос': '!опрос Вопрос? | Да | Нет',
+    'брак': '!брак @user',
+    'награда': '!наградить @user Награда',
+    'пинг': '!пинг',
+    'моя статья': '!моя статья',
+    'мутлист': '!мутлист',
+    'банлист': '!банлист',
+    'варнлист': '!варнлист',
 }
 
 
-def strip_command_prefix(text: str) -> str:
-    """Удаляет префикс команды (!) в начале строки"""
+def get_command_example(cmd_name: str) -> str:
+    return COMMAND_ERROR_HINTS.get(cmd_name, COMMAND_ERROR_HINTS.get(cmd_name.lower(), '!помощь'))
+
+
+async def report_command_error(msg: Message, cmd_name: str, title: str, message: str, example: str = ""):
+    error_msg = await msg.answer(
+        ui_error(title, message, example or get_command_example(cmd_name), message_is_html=True),
+        disable_web_page_preview=True,
+    )
+    asyncio.create_task(delete_message_after(error_msg, 4))
+
+
+async def delete_message_after(msg: Message, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        logger.debug("Не удалось удалить временное сообщение", exc_info=True)
+
+
+def get_command_prefix(chat_id: int) -> str:
+    """Возвращает префикс команд для чата; пустая строка означает команды без префикса."""
+    prefix = storage.get_chat_settings(chat_id).get('command_prefix', '!')
+    return prefix if isinstance(prefix, str) else '!'
+
+
+def strip_command_prefix(text: str, chat_id: Optional[int] = None) -> str:
+    """Удаляет настроенный префикс или совместимый префикс известной команды."""
     text = text.strip()
-    if text and text[0] == '!':
-        return text[1:] if text[1:2] != ' ' else text[1:].lstrip()
+    prefix = get_command_prefix(chat_id) if chat_id is not None else '!'
+    if prefix and text.startswith(prefix):
+        return text[len(prefix):].lstrip()
+
+    if not prefix:
+        if match_command(text)[0] is not None:
+            return text
+        prefix_length = 0
+        for char in text:
+            if not unicodedata.category(char).startswith(('P', 'S')):
+                break
+            prefix_length += 1
+            candidate = text[prefix_length:].lstrip()
+            command_name = match_command(candidate)[0]
+            if command_name is not None or any(
+                candidate.casefold() == action
+                or candidate.casefold().startswith(action + ' ')
+                for action in ALL_RP
+            ):
+                return candidate
     return text
 
 
@@ -1266,8 +2852,132 @@ async def cmd_start(msg: Message):
         "<code>!помощь</code> — все команды\n"
         "<code>!кто я</code> — профиль\n"
         "<code>!опрос</code> — быстрый опрос\n"
-        "<code>!погода</code> — погода\n\n"
+        "<code>!погода</code> — погода\n"
+        "<code>!время [регион]</code> — дата и время в регионе\n\n"
         "Напишите <code>!помощь</code>, чтобы посмотреть всё меню.")
+
+
+PIC_TARGET_GROUP_USERNAME = 'Weltobruhsuperchat'
+PIC_TARGET_GROUP_URL = 'https://t.me/Weltobruhsuperchat'
+
+PIC_SHUFFLE_PHRASES = [
+    "🎲 Перемешиваем колоду...",
+    "🌀 Проверяем шансы...",
+    "🃏 Смотрим, что выпадет сегодня...",
+    "✨ Подготавливаем разворот...",
+    "🔮 Снова врубаем магию...",
+]
+
+PIC_DRAW_PHRASES = [
+    "📦 Вытягиваем карту...",
+    "🎯 Крепко держим и тянем...",
+    "🫧 Проводим последнюю проверку...",
+    "💫 Открываем результат...",
+    "🎭 Момент истины уже близко...",
+]
+
+PIC_APOLOGY_MESSAGES = [
+    "😔 Извините, в этом чате пока нет этого бота. Но он есть в другой группе: <a href='{url}'>{name}</a>.",
+    "💬 Простите, здесь бот не подключён. Его можно найти в другой группе: <a href='{url}'>{name}</a>.",
+    "🙇‍♂️ В этом чате бота нет, но он работает в другой группе: <a href='{url}'>{name}</a>.",
+    "🫡 Извините за неудобство — в этом чате бот отсутствует. Он доступен здесь: <a href='{url}'>{name}</a>.",
+]
+
+
+def get_pic_shuffle_phrase() -> str:
+    return random.choice(PIC_SHUFFLE_PHRASES)
+
+
+def get_pic_draw_phrase() -> str:
+    return random.choice(PIC_DRAW_PHRASES)
+
+
+def get_pic_apology_message() -> str:
+    return random.choice(PIC_APOLOGY_MESSAGES).format(
+        url=PIC_TARGET_GROUP_URL,
+        name=PIC_TARGET_GROUP_USERNAME,
+    )
+
+
+def is_pic_disabled_by_default(chat_id: int, chat_username: Optional[str]) -> bool:
+    username = (chat_username or '').lstrip('@').casefold()
+    return str(chat_id) in PIC_DISABLED_CHATS or username in PIC_DISABLED_CHATS
+
+
+@router.message(Command('pic'))
+async def cmd_pic(msg: Message):
+    settings = storage.get_chat_settings(msg.chat.id)
+    pic_enabled = settings.get(
+        'pic_enabled',
+        not is_pic_disabled_by_default(msg.chat.id, msg.chat.username)
+    )
+    if not pic_enabled:
+        return
+
+    shuffle_phrase = get_pic_shuffle_phrase()
+    draw_phrase = get_pic_draw_phrase()
+
+    thinking_msg = await msg.answer(shuffle_phrase, parse_mode='HTML')
+    await asyncio.sleep(0.8)
+    await thinking_msg.edit_text(draw_phrase, parse_mode='HTML')
+    await asyncio.sleep(0.8)
+
+    await thinking_msg.delete()
+    await asyncio.sleep(0.3)
+
+    await msg.answer(get_pic_apology_message(), parse_mode='HTML', disable_web_page_preview=False)
+
+
+async def cmd_pic_toggle(msg: Message, cmd_name: str):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
+        return await msg.answer("❌ Недостаточно прав! Требуется ранг 5+")
+
+    enabled = cmd_name in ('пик вкл', 'pic on')
+    settings = storage.get_chat_settings(msg.chat.id)
+    settings['pic_enabled'] = enabled
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(f"✅ Ответы на /pic в этом чате {'включены' if enabled else 'отключены'}.")
+
+
+async def cmd_prefix(msg: Message, args: str = ''):
+    if not check_access(msg.from_user.id, msg.chat.id, 'префикс', 5):
+        return await msg.answer("❌ Настроить префикс может только участник с рангом 5+")
+
+    value = args.strip()
+    settings = storage.get_chat_settings(msg.chat.id)
+    if not value or value.casefold() in {'инфо', 'info'}:
+        prefix = get_command_prefix(msg.chat.id)
+        current = html.escape(prefix, quote=False) if prefix else 'отключён'
+        return await msg.answer(
+            f"⚙️ <b>Префикс команд</b>\nТекущий: <code>{current}</code>\n\n"
+            "Изменить: <code>!префикс !</code> или <code>!префикс .</code>\n"
+            "Отключить: <code>!префикс откл</code> — команды будут работать без префикса."
+        )
+
+    if value.casefold() in {'откл', 'отключить', 'выкл', 'off', 'none'}:
+        new_prefix = ''
+    else:
+        if len(value) > 16 or any(
+            char.isspace() or unicodedata.category(char).startswith('C')
+            for char in value
+        ):
+            return await msg.answer(
+                "❌ Префикс должен состоять из 1–16 знаков без пробелов и управляющих символов. "
+                "Для команд без префикса укажите <code>откл</code>."
+            )
+        new_prefix = value
+
+    settings['command_prefix'] = new_prefix
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    shown_prefix = html.escape(new_prefix, quote=False) if new_prefix else 'отключён'
+    await msg.answer(
+        f"✅ Префикс команд в этом чате: <code>{shown_prefix}</code>."
+        + ("" if new_prefix else " Теперь известные команды можно отправлять без префикса.")
+    )
 
 
 # ==================== Справка (блоки + кнопки) ====================
@@ -1275,132 +2985,164 @@ async def cmd_start(msg: Message):
 HELP_SECTIONS = {
     'info': ("📊 Инфо и статистика",
              "📊 <b>Инфо и статистика</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
+             f"{UI_LINE}\n\n"
              "👤 <b>Профиль</b>\n"
-             "  <code>!кто я</code> — ваш профиль\n"
-             "  <code>!кто ты @user</code> — профиль пользователя\n"
-             "  <code>!кто админ</code> — список админов\n\n"
-             "🪜 <b>Ранги и активность</b>\n"
-             "  <code>!ранг</code> / <code>!ранги</code> — иерархия рангов\n"
-             "  <code>!топ</code> — топ активности\n"
-             "  <code>!топ день/неделя/месяц/год</code> — за период\n"
-             "  <code>!статистика</code> / <code>!статистика чата</code>\n\n"
+             "  <code>!кто я</code> / <code>!профиль</code> — ваш профиль (<code>/profile</code>)\n"
+             "  <code>!кто ты @user</code> — информация о пользователе\n"
+             "  <code>!кто админ</code> — администрация и ранги чата\n"
+             "  <code>!ид</code> — ваш ID и ID чата; ответом — ID автора сообщения\n\n"
+             "🏅 <b>Ранги и статистика</b>\n"
+             "  <code>!ранг</code> — ваш ранг; <code>!ранги</code> — список рангов\n"
+             "  <code>!топ [день/неделя/месяц/год/всё]</code> — рейтинг активности (<code>/top</code>)\n"
+             "  <code>!статистика</code> — ваша статистика\n"
+             "  <code>!статистика чата</code> — статистика чата\n"
+             "  <code>!топ наград</code> — рейтинг наград\n\n"
+             "🎨 <b>Оформление</b>\n"
+             "  <code>!тема графика</code> — выбрать светлую или тёмную тему графика активности профиля\n\n"
              "🎲 <b>Разное</b>\n"
-             "  <code>!опрос Вопрос? | Да | Нет</code>\n"
-             "  <code>!погода</code>, <code>!шутка</code>"),
+             "  <code>!опрос Вопрос? | Да | Нет</code> — создать опрос\n"
+             "  <code>!погода</code> / <code>!п</code> — погода (<code>/weather</code>)\n"
+             "  <code>!время [город или регион]</code> / <code>!который час [город или регион]</code> — дата и время (по умолчанию Калининград; поддерживаются города по всему миру, например <code>!время Токио</code>)\n"
+             "  <code>!шутка</code> — случайная шутка\n"
+             "  <code>!шиперим</code> — случайно выбрать пару из знакомых боту участников чата\n"
+             "  <code>!моя статья</code> — случайная статья УК РФ в шуточном приговоре\n"
+             "  <code>!валера</code> / <code>!валерка</code> / <code>!валерианыч</code> — интерактивное меню и функции Валеры\n"
+             "  <code>1 доллар</code> — показать эквивалент суммы в рублях, евро и других валютах\n"
+             "  <code>!пинг</code> / <code>!ping</code> — задержка бота (<code>/ping</code>)\n\n"
+             "⚙️ <b>Префикс команд</b>\n"
+             "  <code>!префикс</code> — показать текущий префикс\n"
+             "  <code>!префикс .</code> — установить свой префикс (1–16 знаков)\n"
+             "  <code>!префикс откл</code> — вызывать известные команды без префикса; настройка доступна рангу 5+\n\n"
+             "🏷️ <b>Ник и тег</b>\n"
+             "  <code>!ник Имя</code> — изменить своё отображаемое имя; ответом или <code>!ник @user Имя</code> — изменить ник участника (администратору)\n"
+             "  <code>!погоняло Текст</code> — установить себе тег; <code>!погоняло сбросить</code> — убрать\n"
+             "  Для справки: <code>!помощь</code> / <code>!help</code> / <code>!инфо</code> / <code>!info</code>"),
     'moderation': ("🛡️ Модерация",
              "🛡️ <b>Модерация</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
-             "🔇 <b>Ограничения</b>\n"
-             "  <code>!мут @user</code> / <code>!-мут @user</code> — ограничить доступ\n"
-             "  <code>!бан @user</code> / <code>!-бан @user</code> — заблокировать пользователя\n"
-             "  <code>!бан причина</code> или ответом на сообщение\n\n"
-             "🏷️ <b>Тег/погоняло</b>\n"
-             "  <code>!погоняло Крутой чел</code> — установить свой тег\n"
-             "  <code>!погоняло @user Крутой</code> — поставить тег администратору\n"
-             "  <code>!погоняло сбросить</code> — убрать тег\n"
-             "  <i>Лимит: до {MAX_TAG_LENGTH} символов</i>\n\n"
+             f"{UI_LINE}\n\n"
+             "🔇 <b>Мут и бан</b>\n"
+             "  <code>!мут @user 30м причина</code> — ограничить участника; можно ответом или кликабельным упоминанием имени без @username\n"
+             "  <code>!мут @user навсегда причина</code> — бессрочный мут; временный срок — не более 1 года\n"
+             "  <code>!размут @user</code> / <code>!-мут @user</code> — снять мут\n"
+             "  <code>!бан @user причина</code> — заблокировать; чтобы забанить канал, ответьте на его сообщение командой <code>!бан причина</code>\n"
+             "  <code>!разбан @user</code> / <code>!-бан @user</code> — снять бан; канал разбанивается ответом на его сообщение командой <code>!разбан</code>\n\n"
              "⚠️ <b>Предупреждения</b>\n"
-             "  <code>!пред @user причина</code> — выдать предупреждение\n"
-             "  <code>!преды @user</code> — посмотреть активные предупреждения\n"
-             "  <code>!снятьпред @user</code> — снять предупреждение\n"
-             "  <code>!снятьпред @user 1</code> — снять только одно\n\n"
+             "  <code>!пред @user причина</code> / <code>!варн</code> / <code>!warn</code> — выдать предупреждение\n"
+             "  <code>!преды @user</code> / <code>!варны</code> / <code>!warns</code> — посмотреть предупреждения\n"
+             "  <code>!варнлист</code> / <code>!предлист</code> / <code>!варнылист</code> / <code>!предупреждения</code> / <code>!список предупреждений</code> / <code>!warnlist</code> / <code>!warninglist</code> / <code>!warningslist</code> — все активные предупреждения\n"
+             "  <code>!снятьпред @user [номер]</code> / <code>!снятьварн</code> / <code>!-пред</code> / <code>!-варн</code> / <code>!unwarn</code> — снять предупреждение\n\n"
+             "🔎 <b>Списки наказаний</b>\n"
+             "  <code>!мутлист</code> / <code>!муты</code> / <code>!мутылист</code> / <code>!список мутов</code> / <code>!mutelist</code> / <code>!mutes</code> — активные муты\n"
+             "  <code>!банлист</code> / <code>!баны</code> / <code>!список банов</code> / <code>!banlist</code> / <code>!bans</code> — действующие баны из списка бота\n\n"
+             "🧹 <b>Сообщения</b>\n"
+             "  <code>!-смс</code> — удалить сообщение (ответом)\n"
+             "  <code>!очистить</code> — очистить сообщения\n"
+             "  <code>!пин</code> — закрепить сообщение (ответом)\n\n"
              "🪜 <b>Ранги</b>\n"
-             "  <code>!повысить @user [ранг]</code> — выдать уровень\n"
-             "  <code>!понизить @user [ранг]</code> — понизить\n\n"
-             "🧹 <b>Чистка</b>\n"
-             "  <code>!очистить</code> — очистить чат\n"
-             "  <code>!-смс</code> — удалить сообщение (ответом)\n\n"
-             "💡 При ответе на сообщение многие команды работают без указания @user".format(MAX_TAG_LENGTH=MAX_TAG_LENGTH)),
-    'topics': ("📂 Топики и изоляция",
-             "📂 <b>Топики и изоляция</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
-             "🗂️ <b>Топики</b>\n"
-             "  <code>!закрыть топик</code> — закрыть текущий топик\n"
-             "  <code>!закрыть топик 5</code> — закрыть для ранга 5+\n"
-             "  <code>!открыть топик</code> — открыть топик\n"
-             "  <code>!топики</code> — список закрытых топиков\n\n"
-             "🔒 <b>Изоляция</b>\n"
-             "  <code>!+изоляция @user 60 спам</code> — ограничить на 60 мин\n"
-             "  <code>!-изоляция @user</code> — снять изоляцию\n"
-             "  <code>!изоляция</code> — список изолированных\n\n"
-             "💡 Работает и по ответу на сообщение, и по @username"),
+             "  <code>!повысить @user [ранг]</code> / <code>!понизить @user [ранг]</code> — изменить ранг\n"
+             "  Владелец Telegram-чата автоматически получает ранг 5; его ранг нельзя изменить этими командами.\n\n"
+             "📝 <b>Ещё</b>\n"
+             "  <code>!репорт текст</code> — отправить жалобу\n"
+             "  <code>!погоняло @user Текст</code> — изменить тег другого участника\n\n"
+             "Для мута и бана нужны права администратора Telegram и соответствующий ранг бота. Остальные команды требуют указанный для них ранг; ответ на сообщение часто заменяет <code>@user</code>."),
     'awards': ("🏆 Награды и браки",
              "🏆 <b>Награды и браки</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
+             f"{UI_LINE}\n\n"
              "🎖️ <b>Награды</b>\n"
-             "  <code>!наградить @user</code>\n"
-             "  <code>!снять награду @user</code>\n"
-             "  <code>!мои награды</code>\n"
-             "  <code>!топ наград</code>\n\n"
+             "  <code>!наградить @user Название</code> — выдать награду\n"
+             "  <code>!снять награду @user</code> — снять награду\n"
+             "  <code>!мои награды</code> — ваши награды\n"
+             "  <code>!топ наград</code> — рейтинг наград\n\n"
              "💍 <b>Браки</b>\n"
              "  <code>!брак @user</code> — предложение\n"
+             "  <code>!принять брак</code> / <code>!отклонить брак</code> — ответить на предложение\n"
              "  <code>!развод</code> — расторгнуть\n"
              "  <code>!браки</code> — список пар"),
-    'games': ("🎮 Игры, РП, репутация",
-             "🎮 <b>Игры, РП, репутация</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
+    'phrases': ("💬 Фразы и правила",
+             "💬 <b>Фразы, приветствия и правила</b>\n"
+             f"{UI_LINE}\n\n"
+             "🗨️ <b>Фразы</b>\n"
+             "  <code>!добавить фразу [-any] слово ответ</code> — добавить автоответ\n"
+             "  <code>!удалить фразу слово [ответ]</code> — удалить фразу\n"
+             "  <code>!фразы</code> — список фраз\n"
+             "  <code>!показать фразу слово</code> — ответы на триггер\n"
+             "  <code>!статистика фраз</code> — частота использования\n\n"
+             "👋 <b>Приветствие и прощание</b>\n"
+             "  <code>!приветствие вкл/выкл</code>, <code>!приветствие текст ...</code> или <code>!приветствие картинка URL</code>\n"
+             "  <code>!прощание вкл/выкл</code> / <code>!прощание текст ...</code> / <code>!прощание картинка URL</code> — настроить прощание\n\n"
+             "📜 <b>Правила</b>\n"
+             "  <code>!правила</code> — посмотреть правила\n"
+             "  <code>!добавитьправило текст</code> — добавить правило\n"
+             "  <code>!очиститьправила</code> — удалить правила"),
+    'games': ("🎮 Игры, РП и репутация",
+             "🎮 <b>Игры, РП и репутация</b>\n"
+             f"{UI_LINE}\n\n"
              "🕹️ <b>Игры</b>\n"
-             "  <code>!игра</code> — меню игр\n"
-             "  <code>!кнб</code> — камень-ножницы-бумага\n"
-             "  <code>!крестики нолики</code> — игра в крестики\n\n"
+             "  <code>!игры</code> / <code>!игра</code> / <code>!играть</code> / <code>!game</code> — меню игр (<code>/game</code>)\n"
+             "  <code>!кнб</code> — камень-ножницы-бумага; <code>!кнб бот</code> — против бота\n"
+             "  <code>!камень</code> / <code>!ножницы</code> / <code>!бумага</code> — ход в КНБ\n"
+             "  <code>!крестики нолики</code> / <code>!ttt</code> — крестики-нолики\n"
+             "  <code>!wordle</code> / <code>!вордле</code> / <code>!вордл</code> / <code>!слово</code> / <code>!угадай слово</code> — Wordle\n"
+             "  В Wordle отвечайте словом на сообщение игры; <code>!wordle exit</code> — выйти, <code>!wordle stop</code> — остановить.\n\n"
              "🎭 <b>РП</b>\n"
-             "  <code>!рп</code> — полный список РП-команд\n\n"
+             "  <code>!рп</code> — меню РП-команд\n"
+             "  Используйте команду РП с <code>@user</code> или ответом на его сообщение.\n\n"
              "⭐ <b>Репутация</b>\n"
-             "  Ответьте на сообщение символом <code>+</code>\n"
-             "  Или напишите <code>спасибо</code>, <code>плюс</code>, <code>респект</code>\n\n"
-             "🧩 <b>Прочее</b>\n"
-             "  <code>!репорт</code> — сообщить о нарушении\n"
-             "  <code>!ник</code> — сменить никнейм"),
+             "  Ответьте на сообщение символом <code>+</code> или словом/эмодзи одобрения; для снятия — <code>-</code> или дизлайк.\n"
+             "  Действуют лимиты на выдачу репутации; некоторые действия доступны с рангом или в браке."),
     'settings': ("⚙️ Настройки и ДК",
              "⚙️ <b>Настройки и ДК</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
+             f"{UI_LINE}\n\n"
              "🛠️ <b>Общие настройки</b>\n"
              "  <code>!антимодерация</code> — включить/выключить анти-модерацию\n"
              "  <code>!антиспам</code> — включить/выключить анти-спам\n\n"
              "🔐 <b>Доступ к командам (ДК)</b>\n"
              "  <code>!дк команда 0-5/откл</code> — задать уровень команды\n"
              "  <code>!дк инфо</code> — показать текущие настройки\n"
-             "  <code>!+дк команда</code> / <code>!-дк команда</code> — включить/отключить\n"
-             "  <code>!+лдк команда @user</code> / <code>!-лдк команда @user</code> — персональный доступ\n\n"
-             "<i>Примеры: мут, бан, пред, варн, награда, брак, игра, статистика</i>"),
+             "  <code>!+дк команда</code> / <code>!-дк команда</code> — разрешить/отключить команду\n"
+             "  <code>!+лдк команда @user</code> / <code>!-лдк команда @user</code> — выдать/отозвать личный доступ\n"
+             "  <code>!дкм</code> — открыть меню настроек ДК\n\n"
+             "Менять настройки ДК могут пользователи с рангом 5."),
     'admin': ("🛠️ Админ",
              "🛠️ <b>Админ</b>\n"
-             "━━━━━━━━━━━━━━━\n\n"
+             f"{UI_LINE}\n\n"
+             "📢 <b>Вызов и проверка</b>\n"
+             "  <code>!общий сбор</code> — упомянуть администраторов (ранг 5)\n"
+             "  <code>!пинг</code> / <code>!ping</code> — проверить задержку; также <code>/ping</code>\n\n"
              "💾 <b>Данные</b>\n"
-             "  <code>!общий сбор</code> — общий список активности\n"
-             "  <code>!бэкап</code> — создать бэкап\n"
-             "  <code>!восстановить</code> — восстановить данные\n\n"
+             "  <code>!бэкап</code> — создать резервную копию\n"
+             "  <code>!восстановить</code> — восстановить последнюю копию\n\n"
              "👑 <b>Управление</b>\n"
-             "  <code>!перед @user</code> — переслать сообщение пользователю\n"
-             "  <code>!переранг 0-5 Название</code> — переименовать ранг\n\n"
-             "⚠️ Команды работают только при наличии нужных прав и ранга"),
+             "  <code>!перед @user</code> — переслать сообщение в ответ на него\n"
+             "  <code>!название ранга 0-5 Название</code> / <code>!переранг 0-5 Название</code> — переименовать ранг\n\n"
+             "🔎 <b>Служебные команды</b>\n"
+             "  <code>/start</code> — приветствие и краткая справка\n"
+             "  <code>/pic</code> — сообщение о карточном боте\n"
+             "  <code>!пик выкл</code> / <code>!pic off</code> — отключить ответы на /pic в этом чате\n"
+             "  <code>!пик вкл</code> / <code>!pic on</code> — снова включить ответы (нужен ранг 5+)\n"
+             "  <code>/help</code> — открыть эту справку\n\n"
+             "Команды с повышенными правами требуют соответствующий ранг; действия модерации также требуют прав администратора Telegram."),
 }
 
 
 def help_main_text() -> str:
-    total_cmds = len(set(COMMANDS.values()))
-    counter_line = f"📦 <b>{total_cmds} команд</b> в {len(HELP_SECTIONS)} разделах\n\n" if total_cmds else ""
-    return ("🐻 <b>ОБКУРЕННЫЙ ВАЛЕРА</b>\n\n"
-            "<i>Мощный и многофункциональный бот для управления чатом</i>\n\n"
-            f"{counter_line}"
-            "� <b>Основные категории:</b>\n"
-            "• <b>Инфо и статистика</b> — профиль, ранг, топ, статистика\n"
-            "• <b>Модерация</b> — мут, бан, предупреждения, чистка\n"
-            "• <b>Топики и изоляция</b> — закрытие топиков и изоляция\n"
-            "• <b>Награды и браки</b> — награды, браки, любовь\n"
-            "• <b>Фразы и приветствия</b> — автоответы и приветствия\n"
-            "• <b>Игры и РП</b> — игры, репутация, РП-команды\n"
-            "• <b>Настройки и ДК</b> — доступ к командам и права\n\n"
-            "👇 <b>Выберите раздел:</b>\n\n"
-            "━━━━━━━━━━━━━━━\n"
-            "💡 Все команды с префиксом <code>!</code>\n"
-            "📌 Примеры: <code>!кто я</code>, <code>!пред @user</code>, <code>!мут @user</code>\n"
-            "🧭 <b>Полезно знать:</b>\n"
-            "• Ответьте на сообщение и напишите команду\n"
-            "• Работают упоминания <code>@username</code>\n"
-            "• Поддерживаются разные падежи и сокращения\n"
-            "• Для перечня команд выберите нужный раздел ниже")
+    total_cmds = len(COMMANDS)
+    counter_line = f"📦 <b>{total_cmds} вариантов команд</b> (включая алиасы)\n\n" if total_cmds else ""
+    return (
+        "🐻 <b>ОБКУРЕННЫЙ ВАЛЕРА</b>\n"
+        f"{UI_LINE}\n"
+        "🧭 <b>Главное меню</b>\n\n"
+        "Выбери раздел ниже 👇\n"
+        f"{counter_line}"
+        "📊 <b>Инфо и статистика</b> — профиль, ранг, топ\n"
+        "🛡 <b>Модерация</b> — мут, бан, предупреждения\n"
+        "🏆 <b>Награды и браки</b> — любовь, награды\n"
+        "🎮 <b>Игры и РП</b> — игры, репутация, РП-команды\n"
+        "⚙️ <b>Настройки</b> — ДК, права, анти-спам\n"
+        f"{UI_LINE}\n"
+        "💡 Префикс команд можно настроить через <code>!префикс</code>\n"
+        "📌 Примеры: <code>!кто я</code>, <code>!пред @user</code>, <code>!мут @user</code>"
+    )
 
 
 def help_main_kb() -> InlineKeyboardMarkup:
@@ -1445,21 +3187,61 @@ async def help_callback(call: CallbackQuery):
             pass
 
 
-@router.message(Command('помощь', prefix='!'))
-@router.message(Command('help', prefix='!'))
-@router.message(Command('инфо', prefix='!'))
-@router.message(Command('info', prefix='!'))
 async def cmd_help(msg: Message):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     await msg.answer(help_main_text(), reply_markup=help_main_kb())
 
 
-@router.message(Command('рп', prefix='!'))
+@router.message(Command('help'))
+async def slash_help(msg: Message):
+    await cmd_help(msg)
+
+
+@router.message(Command('prefix'))
+async def slash_prefix(msg: Message, command: CommandObject):
+    await cmd_prefix(msg, command.args or '')
+
+
+@router.message(Command('profile'))
+async def slash_profile(msg: Message):
+    await who_am_i(msg, 'кто я')
+
+
+@router.message(Command('top'))
+async def slash_top(msg: Message):
+    await cmd_top(msg, '', 'топ')
+
+
+@router.message(Command('game'))
+async def slash_game(msg: Message):
+    await cmd_games_menu(msg, 'игры')
+
+
+@router.message(Command('weather'))
+async def slash_weather(msg: Message):
+    await cmd_weather(msg, 'погода')
+
+
+@router.message(Command('time'))
+async def slash_time(msg: Message, command: CommandObject):
+    await cmd_time(msg, command.args or '', 'время')
+
+
+@router.message(Command('graphtheme'))
+async def slash_activity_graph_theme(msg: Message):
+    await cmd_activity_graph_theme(msg, 'тема графика')
+
+
+@router.message(Command('ping'))
+async def slash_ping(msg: Message):
+    await cmd_ping_check(msg)
+
+
 async def cmd_rp_list(msg: Message):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     
     # Показываем главное меню РП с кнопками
-    txt = "🎭 <b>РП-команды</b>\n━━━━━━━━━━━━━━━\n"
+    txt = f"🎭 <b>РП-команды</b>\n{UI_LINE}\n"
     txt += f"Всего команд: <b>{len(ALL_RP)}</b>\n\n"
     txt += "Выбери раздел ниже 👇"
     
@@ -1498,7 +3280,7 @@ async def handle_rp_section(query: CallbackQuery):
         return
     
     # Форматируем список команд построчно по 3-4 команды
-    txt = f"{title}\n━━━━━━━━━━━━━━━\n{desc}\n\n"
+    txt = f"{title}\n{UI_LINE}\n{desc}\n\n"
     for i in range(0, len(cmds), 4):
         line = ", ".join(f"<code>{c}</code>" for c in cmds[i:i+4])
         txt += line + "\n"
@@ -1518,7 +3300,7 @@ async def handle_rp_section(query: CallbackQuery):
 @router.callback_query(F.data == "rp_menu")
 async def handle_rp_menu(query: CallbackQuery):
     """Возврат в главное меню РП"""
-    txt = "🎭 <b>РП-команды</b>\n━━━━━━━━━━━━━━━\n"
+    txt = f"🎭 <b>РП-команды</b>\n{UI_LINE}\n"
     txt += f"Всего команд: <b>{len(ALL_RP)}</b>\n\n"
     txt += "Выбери раздел ниже 👇"
     
@@ -1532,23 +3314,169 @@ async def handle_rp_menu(query: CallbackQuery):
     await query.answer()
 
 
+def parse_currency_amount(text: str) -> Optional[Tuple[float, str]]:
+    match = CURRENCY_AMOUNT_PATTERN.search(text)
+    if not match:
+        return None
+
+    currency_text = match.group('currency')
+    currency_code = next(
+        (
+            code for code, aliases in CURRENCY_ALIASES.items()
+            if any(re.fullmatch(alias, currency_text, re.IGNORECASE) for alias in aliases)
+        ),
+        None,
+    )
+    if not currency_code:
+        return None
+    return float(match.group('amount').replace(',', '.')), currency_code
+
+
+async def get_exchange_rates(base_currency: str) -> Optional[Dict[str, float]]:
+    cached = EXCHANGE_RATE_CACHE.get(base_currency)
+    now = time.monotonic()
+    if cached and now < cached[0]:
+        return cached[1]
+
+    import aiohttp
+
+    url = f"https://open.er-api.com/v6/latest/{base_currency}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                data = await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+        logger.warning("Не удалось получить курсы валют для %s: %s", base_currency, exc)
+        return None
+
+    rates = (
+        data.get('rates')
+        if isinstance(data, dict) and data.get('result') == 'success'
+        else None
+    )
+    if not isinstance(rates, dict):
+        logger.warning("API вернул некорректные курсы валют для %s", base_currency)
+        return None
+
+    EXCHANGE_RATE_CACHE[base_currency] = (now + 3600, rates)
+    return rates
+
+
+async def answer_currency_amount(msg: Message, amount: float, base_currency: str):
+    rates = await get_exchange_rates(base_currency)
+    if rates is None:
+        return await msg.answer("❌ Не удалось получить актуальные курсы валют. Попробуйте позже.")
+
+    def format_money(value: float, code: str) -> str:
+        if code == 'JPY':
+            formatted = f"{value:,.0f}"
+        elif 0 < abs(value) < 0.01:
+            formatted = f"{value:,.6f}"
+        else:
+            formatted = f"{value:,.2f}"
+        formatted = formatted.replace(",", " ")
+        if '.' in formatted:
+            formatted = formatted.rstrip('0').rstrip('.')
+        return formatted
+
+    base_flag, base_name, base_symbol = CURRENCY_DISPLAY[base_currency]
+    amount_text = format_money(amount, base_currency)
+    lines = []
+    for code, (flag, name, symbol) in CURRENCY_DISPLAY.items():
+        if code == base_currency:
+            continue
+        rate = rates.get(code)
+        if not isinstance(rate, (int, float)):
+            continue
+        converted = amount * rate
+        converted_text = format_money(converted, code)
+        lines.append(f"{flag} <b>{converted_text} {symbol}</b> — {name}")
+
+    if not lines:
+        logger.warning("В ответе API нет поддерживаемых курсов для %s", base_currency)
+        return await msg.answer("❌ Для этой валюты сейчас нет доступных курсов.")
+
+    await msg.answer(
+        f"💱 {base_flag} <b>{amount_text} {base_symbol} — {base_name}</b>\n\n"
+        "<i>Примерная стоимость по актуальному курсу:</i>\n"
+        f"<blockquote expandable>{chr(10).join(lines)}</blockquote>\n\n"
+        "<i>Курсы могут отличаться от курса вашего банка.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="currency_close")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "currency_close")
+async def close_currency_message(call: CallbackQuery):
+    if call.message:
+        await call.message.delete()
+    await call.answer()
+
+
+async def handle_wordle_guess(msg: Message, game: dict) -> bool:
+    game_message = msg.reply_to_message
+    is_game_reply = (
+        game_message is not None
+        and game_message.from_user is not None
+        and game_message.from_user.id == bot.id
+        and game_message.message_id == game.get('message_id')
+        and msg.chat.id == game.get('chat_id')
+    )
+    if not is_game_reply:
+        return False
+
+    guess = msg.text.strip().lower()
+    player_name = f"@{msg.from_user.username}" if msg.from_user.username else msg.from_user.full_name
+    player_name = html.escape(player_name)
+    success, response, updated_game = wordle.make_guess(
+        msg.chat.id, msg.from_user.id, guess, player_name
+    )
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    if not success:
+        await msg.answer(response)
+        return True
+
+    if updated_game:
+        user = storage.get_user(msg.chat.id, msg.from_user.id)
+        user['wordle_games'] = user.get('wordle_games', 0) + 1
+        if guess == updated_game['word']:
+            user['wordle_wins'] = user.get('wordle_wins', 0) + 1
+        storage.mark_dirty()
+        await storage.save()
+        wordle.exit_chat_game(msg.chat.id)
+
+    try:
+        await bot.edit_message_text(
+            chat_id=game['chat_id'],
+            message_id=game['message_id'],
+            text=response
+        )
+    except Exception as e:
+        logger.error(f"Ошибка редактирования сообщения Wordle: {e}")
+    return True
+
+
 @router.message(F.text)
 async def main_text_handler(msg: Message):
-    if not msg.text or msg.from_user.is_bot:
+    if not msg.text or not msg.from_user or msg.from_user.is_bot:
         return
 
     # *** ПРОВЕРКА РЕПУТАЦИИ В ПЕРВУЮ ОЧЕРЕДЬ ***
-    # Репутация работает БЕЗ обязательного ! на ответы на сообщения
     if msg.reply_to_message and msg.reply_to_message.from_user:
         if not msg.reply_to_message.from_user.is_bot and msg.from_user.id != msg.reply_to_message.from_user.id:
             text = msg.text.strip()
-            rep_words = [
-                '+', 'плюс', 'спасибо', 'жиза', 'красава', 'респект',
-                'уважение', 'лайк', 'like', 'топ', 'красавчик',
-                'молодец', 'умница', 'based', 'base', 'огонь',
-                'респектую', '👍', '🔥', '💯', '✅'
-            ]
-            if text.lower() in rep_words or (text.startswith('+') and len(text) <= 3):
+            if is_reputation_removal_message(text):
+                await give_reputation(msg, remove=True)
+                return
+            if is_reputation_message(text):
                 await give_reputation(msg)
                 return
 
@@ -1556,42 +3484,65 @@ async def main_text_handler(msg: Message):
     user_id = msg.from_user.id
     main_chat = is_main_chat(chat_id, msg.message_thread_id)
 
-    settings = storage.get_chat_settings(chat_id)
-    if settings.get('anti_spam', {}).get('enabled', True):
-        is_spam, _ = anti_spam.check_message(msg)
-        if is_spam:
-            try:
-                await msg.delete()
-            except:
-                pass
-            return
-
-    user = storage.update_user_from_message(msg)
-    if main_chat:
-        save_activity(chat_id, user_id, 'messages')
-        user = storage.get_user(chat_id, user_id)
-        user['messages_count'] = user.get('messages_count', 0) + 1
-        storage.mark_dirty()
+    user = storage.get_user(chat_id, user_id)
 
     text = msg.text.strip()
+    prefix = get_command_prefix(chat_id)
+    prefixed_command = bool(prefix and text.startswith(prefix))
+    prefix_command = text == '!префикс' or text.startswith('!префикс ')
+    cleaned = strip_command_prefix(text, chat_id)
+    compatible_prefixed_command = not prefix and cleaned != text
+    bare_command = not prefix and match_command(cleaned)[0] is not None
 
-    if text and text[0] == '!':
-        cleaned = strip_command_prefix(text)
-        if cleaned:
-            cmd_name, args = match_command(cleaned)
-            if cmd_name:
-                await execute_command(cmd_name, args, msg, main_chat)
+    # ===== Wordle (обработка ходов) =====
+    if not prefixed_command and not prefix_command and not compatible_prefixed_command and not bare_command:
+        game = wordle.get_chat_game(msg.chat.id)
+        if game is not None and game['status'] == 'active':
+            if await handle_wordle_guess(msg, game):
                 return
 
+    if text == '-смс' or text.startswith('-смс '):
+        await execute_command('-смс', text[len('-смс'):].strip(), msg, main_chat)
+        return
+
+    if prefix_command:
+        await cmd_prefix(msg, text[len('!префикс'):].strip())
+        return
+
+    if prefix and not prefixed_command:
+        cleaned = ''
+    if cleaned and not (cleaned == '-смс' or cleaned.startswith('-смс ')):
+        cmd_name, args = match_command(cleaned)
+        if cmd_name:
+            await execute_command(cmd_name, args, msg, main_chat)
+            return
+        if prefixed_command or compatible_prefixed_command:
+            if await rp_handler(msg):
+                return
+            await report_command_error(
+                msg,
+                cleaned.split()[0],
+                'Неизвестная команда',
+                f"Команда <code>{html.escape(cleaned.split()[0], quote=False)}</code> не найдена или недоступна в этом чате.",
+                '!помощь',
+            )
+            return
+
+    currency_query = parse_currency_amount(text)
+    if currency_query:
+        await answer_currency_amount(msg, *currency_query)
+        return
+
     await rp_handler(msg)
-    await auto_mod(msg)
 
 
 async def execute_command(cmd_name: str, args: str, msg: Message, main_chat: bool):
     """Выполняет команду по её имени"""
 
-    # Маппинг команд на функции
     handlers = {
+        'cmd_help': lambda: cmd_help(msg),
+        'cmd_prefix': lambda: cmd_prefix(msg, args),
+        'cmd_rp_list': lambda: cmd_rp_list(msg),
         'who_am_i': lambda: who_am_i(msg, cmd_name),
         'who_are_you': lambda: who_are_you(msg, args, cmd_name),
         'who_admin': lambda: who_admin(msg),
@@ -1608,18 +3559,15 @@ async def execute_command(cmd_name: str, args: str, msg: Message, main_chat: boo
         'cmd_unban': lambda: cmd_unban(msg, cmd_name),
         'cmd_warn': lambda: cmd_warn(msg, cmd_name),
         'show_warnings': lambda: show_warnings(msg, cmd_name),
+        'cmd_mute_list': lambda: cmd_mute_list(msg, cmd_name),
+        'cmd_ban_list': lambda: cmd_ban_list(msg, cmd_name),
+        'cmd_warn_list': lambda: cmd_warn_list(msg, cmd_name),
         'cmd_unwarn': lambda: cmd_unwarn(msg, cmd_name),
         'cmd_del': lambda: cmd_del(msg, cmd_name),
         'cmd_pin': lambda: cmd_pin(msg, cmd_name),
         'cmd_purge': lambda: cmd_purge(msg, cmd_name),
         'cmd_promote': lambda: cmd_promote(msg, cmd_name),
         'cmd_demote': lambda: cmd_demote(msg, cmd_name),
-        'cmd_close_topic': lambda: cmd_close_topic(msg, cmd_name),
-        'cmd_open_topic': lambda: cmd_open_topic(msg, cmd_name),
-        'cmd_list_topics': lambda: cmd_list_topics(msg, cmd_name),
-        'cmd_add_iso': lambda: cmd_add_iso(msg, cmd_name),
-        'cmd_rem_iso': lambda: cmd_rem_iso(msg, cmd_name),
-        'cmd_show_iso': lambda: cmd_show_iso(msg),
         'cmd_give_award': lambda: cmd_give_award(msg, cmd_name),
         'cmd_rem_award': lambda: cmd_rem_award(msg, cmd_name),
         'cmd_my_awards': lambda: cmd_my_awards(msg, cmd_name),
@@ -1644,13 +3592,21 @@ async def execute_command(cmd_name: str, args: str, msg: Message, main_chat: boo
         'cmd_rps_with_bot': lambda: cmd_rps(msg, cmd_name),
         'cmd_rps_choice': lambda: cmd_rps(msg, cmd_name),
         'cmd_ttt_menu': lambda: cmd_games_menu(msg, cmd_name),
+        'cmd_wordle': lambda: cmd_wordle(msg),
         'cmd_weather': lambda: cmd_weather(msg, cmd_name),
+        'cmd_time': lambda: cmd_time(msg, args, cmd_name),
+        'cmd_activity_graph_theme': lambda: cmd_activity_graph_theme(msg, cmd_name),
         'cmd_random_joke': lambda: cmd_random_joke(msg, cmd_name),
+        'cmd_ship': lambda: cmd_ship(msg, cmd_name),
+        'cmd_my_article': lambda: cmd_my_article(msg, cmd_name),
         'cmd_poll': lambda: cmd_poll(msg, cmd_name),
         'cmd_iris': lambda: cmd_iris(msg, cmd_name),
+        'cmd_report': lambda: cmd_report(msg, cmd_name),
+        'cmd_nick': lambda: cmd_nick(msg, cmd_name),
         'cmd_pogonialo': lambda: cmd_pogonialo(msg, cmd_name),
         'cmd_anti_spam': lambda: cmd_anti_spam(msg, cmd_name),
         'cmd_ping_check': lambda: cmd_ping_check(msg),
+        'cmd_pic_toggle': lambda: cmd_pic_toggle(msg, cmd_name),
         'cmd_ping': lambda: cmd_ping(msg, cmd_name),
         'cmd_backup': lambda: cmd_backup(msg, cmd_name),
         'cmd_restore': lambda: cmd_restore(msg, cmd_name),
@@ -1664,8 +3620,38 @@ async def execute_command(cmd_name: str, args: str, msg: Message, main_chat: boo
     }
 
     func_name = COMMANDS.get(cmd_name)
-    if func_name and func_name in handlers:
+    if not func_name:
+        await report_command_error(
+            msg,
+            cmd_name,
+            'Неизвестная команда',
+            f"Команда <code>{html.escape(str(cmd_name), quote=False)}</code> не распознана.",
+            '!помощь',
+        )
+        return
+
+    if func_name not in handlers:
+        await report_command_error(
+            msg,
+            cmd_name,
+            'Команда не подключена',
+            f"Команда <code>{html.escape(str(cmd_name), quote=False)}</code> есть в списке, но пока не подключена к обработчику.",
+            '!помощь',
+        )
+        return
+
+    try:
         await handlers[func_name]()
+    except Exception as exc:
+        logger.exception('Ошибка выполнения команды %s', cmd_name)
+        detail = str(exc).strip() or 'Проверьте формат вызова и попробуйте ещё раз.'
+        await report_command_error(
+            msg,
+            cmd_name,
+            'Ошибка команды',
+            f"Команда <code>{html.escape(str(cmd_name), quote=False)}</code> завершилась с ошибкой: {html.escape(detail[:250], quote=False)}",
+            get_command_example(cmd_name),
+        )
 
 
 # ==================== Профиль и информация ====================
@@ -1677,10 +3663,12 @@ def build_profile_text(chat_id: int, uid: int, u: dict, show_last_active: bool =
     original_name = u.get('first_name') or (f"@{username}" if username else f"ID:{uid}")
     display_name = custom_name or original_name
 
+    safe_display_name = html.escape(str(display_name), quote=False)
     if username:
-        profile_link = f'<a href="https://t.me/{username}">{display_name}</a>'
+        safe_username = html.escape(str(username), quote=True)
+        profile_link = f'<a href="https://t.me/{safe_username}">{safe_display_name}</a>'
     else:
-        profile_link = f'<a href="tg://user?id={uid}">{display_name}</a>'
+        profile_link = f'<a href="tg://user?id={uid}">{safe_display_name}</a>'
 
     rank = u.get('rank', 0)
     reputation = u.get('reputation', 0)
@@ -1688,51 +3676,46 @@ def build_profile_text(chat_id: int, uid: int, u: dict, show_last_active: bool =
     rank_name = get_rank_name(chat_id, rank)
 
     activity = u.get('activity', {})
-    today = datetime.now().strftime('%Y-%m-%d')
-    today_msgs = activity.get(today, {}).get('messages', 0)
-    week_msgs = sum(
-        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0)
-        for i in range(7))
-    month_msgs = sum(
-        activity.get((datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0)
-        for i in range(30))
+    now = kaliningrad_now()
+    today_msgs = get_activity_message_count(activity, 'day', now)
+    week_msgs = get_activity_message_count(activity, 'week', now)
+    month_msgs = get_activity_message_count(activity, 'month', now)
     total_msgs = u.get('messages_count', 0)
 
     first_seen = u.get('first_seen', time.time())
     first_seen_date = datetime.fromtimestamp(first_seen)
     days_since = (datetime.now() - first_seen_date).days
 
-    # ── Заголовок ──
-    lines = [f"👤 <b>{profile_link}</b>"]
+    wrn = [w for w in u.get('warnings', []) if isinstance(w, dict) and warning_is_active(w)]
+    tag = custom_name or original_name
+
+    lines = [
+        "👤 <b>Профиль</b>",
+        f"{UI_LINE}",
+        f"{profile_link}",
+    ]
     if custom_name:
-        lines.append(f"📝 <i>оригинальное имя: {original_name}</i>")
-    lines.append("━━━━━━━━━━━━━━━")
-
-    # ── Ранг и репутация ──
-    lines.append(f"{rank_emoji} <b>{rank_name}</b> <i>(степень {rank})</i>")
+        lines.append(f"🏷️ <i>Оригинальное имя: {html.escape(str(original_name), quote=False)}</i>")
+    lines.append(f"{rank_emoji} <b>{html.escape(str(rank_name), quote=False)}</b> <i>(уровень {rank})</i>")
     lines.append(f"⭐ Репутация: <b>{reputation}</b>")
-
-    wrn = [w for w in u.get('warnings', []) if w.get('expire_date', 0) > time.time()]
-    if wrn:
-        lines.append(f"⚠️ Предупреждения: <b>{len(wrn)}/{MAX_WARNINGS}</b>")
+    lines.append(f"⚠️ Варны: <b>{len(wrn)}/{MAX_WARNINGS}</b>")
 
     if u.get('marriage_partner'):
         partner = u['marriage_partner']
         marriage_date = u.get('marriage_date')
         if marriage_date:
             days_married = int((time.time() - marriage_date) / 86400)
-            lines.append(f"💍 В браке с {mention(chat_id, partner)} <i>({days_married} дн)</i>")
+            lines.append(f"💍 Брак: {mention(chat_id, partner)} <i>({days_married} дн)</i>")
         else:
-            lines.append(f"💍 В браке с {mention(chat_id, partner)}")
+            lines.append(f"💍 Брак: {mention(chat_id, partner)}")
 
-    # ── Активность ──
-    lines.append("")
+    lines.append(f"{UI_LINE}")
     lines.append("📊 <b>Активность</b>")
-    lines.append(f"  Сегодня: {today_msgs} · Неделя: {week_msgs} · Месяц: {month_msgs}")
-    lines.append(f"  Всего сообщений: <b>{total_msgs}</b>")
-
-    # ── Прочее ──
-    lines.append("")
+    lines.append(f"• Сегодня: {today_msgs}")
+    lines.append(f"• Неделя: {week_msgs}")
+    lines.append(f"• Месяц: {month_msgs}")
+    lines.append(f"• Всего: <b>{total_msgs}</b>")
+    lines.append(f"{UI_LINE}")
     lines.append(f"📅 В чате с {first_seen_date.strftime('%d.%m.%Y')} <i>({days_since} дн)</i>")
 
     if show_last_active:
@@ -1748,20 +3731,19 @@ def build_profile_text(chat_id: int, uid: int, u: dict, show_last_active: bool =
             last_active = f"{diff // 86400} дн назад"
         lines.append(f"🕐 Последний актив: {last_active}")
 
-    # ── Награды ──
     awards = u.get('awards', [])
     recent_awards = sorted(awards, key=lambda x: x.get('given_at', 0), reverse=True)[:5]
     if recent_awards:
-        lines.append("")
+        lines.append(f"{UI_LINE}")
         lines.append("🏆 <b>Последние награды</b>")
         for award in recent_awards:
-            lines.append(f"  • {award['name']} <i>(ст. {award.get('degree', 1)})</i>")
+            lines.append(f"• {html.escape(str(award['name']), quote=False)} <i>(ст. {award.get('degree', 1)})</i>")
 
     return "\n".join(lines)
 
 
 async def who_am_i(msg: Message, cmd_name: str = 'кто я'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+    if not await require_access(msg, cmd_name, 0, title='Нет доступа', message='Эта команда доступна всем участникам.', example='!кто я'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     uid = msg.from_user.id
@@ -1776,8 +3758,82 @@ async def who_am_i(msg: Message, cmd_name: str = 'кто я'):
         await msg.answer(text, disable_web_page_preview=True)
 
 
-async def who_are_you(msg: Message, args: str = None, cmd_name: str = 'кто ты'):
+def activity_graph_theme_keyboard(uid: int, mode: Optional[str] = None, selected_theme: str = '') -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardBuilder()
+    if mode is None:
+        keyboard.button(text='☀️ Светлая', callback_data=f'activity_theme:mode:{uid}:light')
+        keyboard.button(text='🌙 Тёмная', callback_data=f'activity_theme:mode:{uid}:dark')
+        keyboard.adjust(2)
+        return keyboard.as_markup()
+
+    for theme_id, theme in ACTIVITY_GRAPH_THEMES.items():
+        if theme[1] != mode:
+            continue
+        label = f"✅ {theme[0]}" if theme_id == selected_theme else theme[0]
+        keyboard.button(text=label, callback_data=f'activity_theme:set:{uid}:{theme_id}')
+    keyboard.adjust(2)
+    keyboard.row(InlineKeyboardButton(text='◀️ Назад', callback_data=f'activity_theme:back:{uid}'))
+    return keyboard.as_markup()
+
+
+async def cmd_activity_graph_theme(msg: Message, cmd_name: str = 'тема графика'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    current_theme = storage.get_user(msg.chat.id, msg.from_user.id).get('activity_graph_theme', 'dark_default')
+    current_name = ACTIVITY_GRAPH_THEME_NAMES.get(current_theme, 'Стандартная')
+    await msg.answer(
+        f"🎨 <b>Тема графика активности</b>\nТекущая тема: <b>{current_name}</b>\n\nВыберите светлую или тёмную палитру:",
+        reply_markup=activity_graph_theme_keyboard(msg.from_user.id),
+    )
+
+
+@router.callback_query(F.data.startswith('activity_theme:'))
+async def activity_graph_theme_callback(call: CallbackQuery):
+    parts = call.data.split(':')
+    if len(parts) < 3:
+        return await call.answer('Некорректная настройка темы.', show_alert=True)
+
+    action, owner_id = parts[1], parts[2]
+    if not owner_id.isdigit() or int(owner_id) != call.from_user.id:
+        return await call.answer('Эти настройки открыты другим пользователем.', show_alert=True)
+
+    chat_id = call.message.chat.id
+    user = storage.get_user(chat_id, call.from_user.id, use_cache=False)
+    if action == 'mode' and len(parts) == 4 and parts[3] in ('light', 'dark'):
+        mode = parts[3]
+        current_theme = user.get('activity_graph_theme', 'dark_default')
+        await call.message.edit_text(
+            f"🎨 Выберите тему для {'светлого' if mode == 'light' else 'тёмного'} оформления:",
+            reply_markup=activity_graph_theme_keyboard(call.from_user.id, mode, current_theme),
+        )
+    elif action == 'back' and len(parts) == 3:
+        current_theme = user.get('activity_graph_theme', 'dark_default')
+        current_name = ACTIVITY_GRAPH_THEME_NAMES.get(current_theme, 'Стандартная')
+        await call.message.edit_text(
+            f"🎨 <b>Тема графика активности</b>\nТекущая тема: <b>{current_name}</b>\n\nВыберите светлую или тёмную палитру:",
+            reply_markup=activity_graph_theme_keyboard(call.from_user.id),
+        )
+    elif action == 'set' and len(parts) == 4 and parts[3] in ACTIVITY_GRAPH_THEMES:
+        theme_id = parts[3]
+        user['activity_graph_theme'] = theme_id
+        storage.invalidate_user_cache(chat_id, call.from_user.id)
+        storage.mark_dirty()
+        await storage.save()
+        mode = ACTIVITY_GRAPH_THEMES[theme_id][1]
+        await call.message.edit_text(
+            f"✅ Тема графика сохранена: <b>{ACTIVITY_GRAPH_THEME_NAMES[theme_id]}</b>.",
+            reply_markup=activity_graph_theme_keyboard(call.from_user.id, mode, theme_id),
+        )
+        return await call.answer('Тема сохранена')
+    else:
+        return await call.answer('Неизвестная тема графика.', show_alert=True)
+
+    await call.answer()
+
+
+async def who_are_you(msg: Message, args: str = None, cmd_name: str = 'кто ты'):
+    if not await require_access(msg, cmd_name, 0, example='!кто ты @user'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
@@ -1789,7 +3845,7 @@ async def who_are_you(msg: Message, args: str = None, cmd_name: str = 'кто т
         tid = await get_target(msg, args)
 
     if not tid:
-        return await msg.answer("❌ Укажите пользователя:\n<code>кто ты @user</code> или ответьте на сообщение")
+        return await msg.answer(ui_error("Не указан пользователь", "Укажи пользователя через @user или ответь на сообщение пользователя.", "!кто ты @user"), disable_web_page_preview=True)
 
     u = storage.get_user(msg.chat.id, tid)
     text = build_profile_text(msg.chat.id, tid, u, show_last_active=False)
@@ -1802,7 +3858,7 @@ async def who_are_you(msg: Message, args: str = None, cmd_name: str = 'кто т
 
 
 async def who_admin(msg: Message):
-    if not check_access(msg.from_user.id, msg.chat.id, 'кто админ', 0):
+    if not await require_access(msg, 'кто админ', 0, example='!кто админ'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
@@ -1835,18 +3891,19 @@ async def who_admin(msg: Message):
             username = user_data.get('username', '')
             custom_name = user_data.get('custom_name', '')
             display_name = custom_name or user_data.get('first_name') or username or f"ID:{uid}"
+            safe_display_name = html.escape(str(display_name), quote=False)
 
             if username:
-                profile_link = f'<a href="https://t.me/{username}">{display_name}</a>'
+                safe_username = html.escape(str(username), quote=True)
+                profile_link = f'<a href="https://t.me/{safe_username}">{safe_display_name}</a>'
             else:
-                profile_link = f'<a href="tg://user?id={uid}">{display_name}</a>'
+                profile_link = f'<a href="tg://user?id={uid}">{safe_display_name}</a>'
 
-            crown = ' 👑' if uid == MAIN_ADMIN_ID else ''
-            txt += f"{status} {profile_link}{crown}\n"
+            txt += f"{status} {profile_link}\n"
 
         txt += "\n"
 
-    txt += "━━━━━━━━━━━━━━━━\n"
+    txt += f"{UI_LINE}\n"
     txt += "🟢 В сети | ⚪ Не в сети | 🔴 Давно не в сети (1+ день)"
 
     await msg.answer(txt, disable_web_page_preview=True)
@@ -1867,25 +3924,37 @@ async def cmd_ranks_list(msg: Message):
 
 
 async def cmd_rank_rename(msg: Message, cmd_name: str = 'название ранга', args: str = ""):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
-        return await msg.answer("❌ Недостаточно прав!")
+    if not await require_access(msg, cmd_name, 5, title='Недостаточно прав', message='Эта команда доступна только старшему администратору.', example='!переранг 3 Батя'):
+        return
     parts = args.split(maxsplit=1)
     if len(parts) < 2 or not parts[0].isdigit():
-        return await msg.answer(f"❌ <code>!переранг 0-{MAX_RANK} Новое название</code>")
+        return await msg.answer(
+            "❌ <b>Неверный формат</b>\n"
+            "Укажи уровень и новое название\n"
+            f"<code>!переранг 0-{MAX_RANK} Новое название</code>"
+        )
     level = int(parts[0])
     if not (0 <= level <= MAX_RANK):
-        return await msg.answer(f"❌ Уровень должен быть 0-{MAX_RANK}")
+        return await msg.answer(
+            "❌ <b>Неверный уровень</b>\n"
+            f"Уровень должен быть от 0 до {MAX_RANK}\n"
+            "<code>!переранг 3 Батя</code>"
+        )
     new_name = parts[1].strip()
     if not new_name:
-        return await msg.answer("❌ Укажите название")
+        return await msg.answer(
+            "❌ <b>Не указано название</b>\n"
+            "Добавь название для ранга\n"
+            "<code>!переранг 3 Батя</code>"
+        )
     storage.data['rank_names'].setdefault(str(msg.chat.id), {})[str(level)] = new_name
     storage.mark_dirty()
     await storage.save()
-    await msg.answer(f"✅ Ранг {level}: теперь называется «{new_name}»")
+    await msg.answer(f"✅ <b>Ранг {level}</b>: теперь называется «{html.escape(new_name, quote=False)}»")
 
 
-async def cmd_id(msg: Message, cmd_name: str = '.ид'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+async def cmd_id(msg: Message, cmd_name: str = 'ид'):
+    if not await require_access(msg, cmd_name, 0, title='Нет доступа', message='Эта команда доступна всем участникам.', example='!ид'):
         return
     await msg.answer(
         f"🆔 <code>{msg.reply_to_message.from_user.id}</code>" if msg.reply_to_message else f"🆔 Ваш: <code>{msg.from_user.id}</code>\n💬 Чат: <code>{msg.chat.id}</code>")
@@ -1894,7 +3963,7 @@ async def cmd_id(msg: Message, cmd_name: str = '.ид'):
 # ==================== Топы ====================
 
 async def cmd_top(msg: Message, args: str = "", cmd_name: str = 'топ'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+    if not await require_access(msg, cmd_name, 0, title='Нет доступа', message='Эта команда доступна всем участникам.', example='!топ день'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
@@ -1917,8 +3986,7 @@ async def cmd_top(msg: Message, args: str = "", cmd_name: str = 'топ'):
 
 
 async def show_msg_top(msg: Message, period: str = 'all'):
-    today = datetime.now().strftime('%Y-%m-%d')
-    now = datetime.now()
+    now = kaliningrad_now()
 
     users_data = []
 
@@ -1926,17 +3994,8 @@ async def show_msg_top(msg: Message, period: str = 'all'):
         activity = d.get('activity', {})
         msg_count = 0
 
-        if period == 'day':
-            msg_count = activity.get(today, {}).get('messages', 0)
-        elif period == 'week':
-            msg_count = sum(
-                activity.get((now - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in range(7))
-        elif period == 'month':
-            msg_count = sum(
-                activity.get((now - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in range(30))
-        elif period == 'year':
-            msg_count = sum(
-                activity.get((now - timedelta(days=i)).strftime('%Y-%m-%d'), {}).get('messages', 0) for i in range(365))
+        if period in ('day', 'week', 'month', 'year'):
+            msg_count = get_activity_message_count(activity, period, now)
         else:
             msg_count = d.get('messages_count', 0)
 
@@ -1952,17 +4011,31 @@ async def show_msg_top(msg: Message, period: str = 'all'):
                     'all': 'за всё время'}
     period_name = period_names.get(period, 'за всё время')
 
-    txt = f"💬 <b>Топ по сообщениям {period_name}</b>\n\n"
+    txt = f"🏆 <b>Топ активности {period_name}</b>\n{UI_LINE}\n"
 
     for i, (uid, count, rank) in enumerate(users_data[:20], 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        txt += f"{medal} {mention(msg.chat.id, uid)}: {count} сообщ.\n"
+        txt += f"{medal} {mention(msg.chat.id, uid)} — <b>{count}</b> сообщ.\n"
+
+    my_position = None
+    for idx, (uid, count, rank) in enumerate(users_data, 1):
+        if uid == msg.from_user.id:
+            my_position = idx
+            break
+
+    if my_position is not None and my_position > 20:
+        txt += f"\n📍 Ты: <b>{my_position}</b> место — <b>{users_data[my_position - 1][1]}</b> сообщ."
+    elif my_position is not None:
+        txt += f"\n📍 Ты: <b>{my_position}</b> место — <b>{users_data[my_position - 1][1]}</b> сообщ."
+
+    total_messages = sum(count for _, count, _ in users_data)
+    txt += f"\n\n💬 Всего сообщений {period_name}: <b>{total_messages}</b>"
 
     await msg.answer(txt, disable_web_page_preview=True)
 
 
 async def cmd_chat_stats(msg: Message, cmd_name: str = 'статистика чата'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+    if not await require_access(msg, cmd_name, 0, title='Нет доступа', message='Эта команда доступна всем участникам.', example='!статистика чата'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     total_msgs = sum(d.get('messages_count', 0) for d in storage.data['users'].get(str(msg.chat.id), {}).values())
@@ -1974,7 +4047,7 @@ async def cmd_chat_stats(msg: Message, cmd_name: str = 'статистика ч�
 
 
 async def cmd_stats(msg: Message, args: str = "", cmd_name: str = 'статистика'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+    if not await require_access(msg, cmd_name, 0, title='Нет доступа', message='Эта команда доступна всем участникам.', example='!статистика'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     parts = args.split()
@@ -2013,10 +4086,43 @@ async def cmd_stats(msg: Message, args: str = "", cmd_name: str = 'статис�
 
 # ==================== Модерация ====================
 
+def ui_error(title: str, message: str, example: str = "", *, message_is_html: bool = False) -> str:
+    """Возвращает стандартное сообщение об ошибке для доступа/формата команды."""
+    block = (
+        f"❌ <b>{html.escape(str(title), quote=False)}</b>\n\n"
+        f"{str(message) if message_is_html else html.escape(str(message), quote=False)}"
+    )
+    if example:
+        block += f"\n\n💡 Пример: <code>{html.escape(str(example), quote=False)}</code>"
+    return block
+
+
+async def require_access(msg: Message, cmd_name: str, min_rank: int = 0, *, title: str = "Недостаточно прав",
+                        message: Optional[str] = None, example: str = "") -> bool:
+    """Проверяет доступ и возвращает False, если нет прав, с понятной подсказкой."""
+    if check_access(msg.from_user.id, msg.chat.id, cmd_name, min_rank):
+        return True
+
+    rank_text = "всем участникам" if min_rank <= 0 else f"с ранга {min_rank}+"
+    detail = message or f"Эта команда доступна {rank_text}."
+    await msg.answer(ui_error(title, detail, example or get_command_example(cmd_name)), disable_web_page_preview=True)
+    return False
+
+
+async def require_target(msg: Message, target: Optional[int], *, not_found_message: str = "Пользователь не найден") -> bool:
+    """Проверяет, что целевой пользователь найден, и выводит понятную ошибку."""
+    if target:
+        return True
+    await msg.answer(ui_error("Пользователь не найден", not_found_message, "!кто ты @user"), disable_web_page_preview=True)
+    return False
+
+
 async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
-        return await msg.answer("❌ Недостаточно прав!")
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='!мут @user 30м флуд'):
+        return
 
     text = msg.text.strip()
     parts = text.split(maxsplit=2)
@@ -2024,74 +4130,78 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
     tid = None
     dur_text = ""
     reason = "Без причины"
+    permanent = False
 
     # ПРИОРИТЕТ 1: Ответ на сообщение
     if msg.reply_to_message and msg.reply_to_message.from_user:
         tid = msg.reply_to_message.from_user.id
         if len(parts) > 1:
-            # Парсим время и причину - берём весь остаток после команды
-            rest = text[len(parts[0]):].strip()  # Берём весь остаток после "!мут"
-            # Ищем число + слово времени (с полной поддержкой падежей и сокращений)
-            time_match = re.match(r'^(\d+)\s*(тысячелети(?:й|и|е)?|век(?:а|ов)?|год(?:а|ов)?|месяц(?:а|ев)?|дн?(?:и|ей)?|ча?(?:с(?:а|ов)?)?|минут(?:ы|а)?|[дчм])?(?:\s+(.*))?$', rest, re.IGNORECASE)
-            if time_match:
-                num = time_match.group(1)
-                unit = time_match.group(2) or ""
-                reason_part = time_match.group(3) or ""
-                dur_text = f"{num} {unit}".strip()
-                reason = reason_part.strip() or "Без причины"
-            else:
-                reason = rest or "Без причины"
+            rest = text[len(parts[0]):].strip()
+            permanent, dur_text, reason = parse_mute_duration_and_reason(rest)
 
     # ПРИОРИТЕТ 2: Аргументы в команде
     elif len(parts) >= 2:
         target_arg = parts[1]
+        target_mention = get_target_mention_span(msg, target_arg)
         tid = await get_target(msg, target_arg)
 
         if not tid:
             return await msg.answer(
-                f"❌ Пользователь {target_arg} не найден!\n\n"
-                f"💡 Попробуйте ответить на сообщение пользователя"
+                ui_error(
+                    "Пользователь не найден",
+                    f"Не могу определить пользователя <code>{html.escape(str(target_arg), quote=False)}</code>. "
+                    "Используйте @username, числовой ID, кликабельное упоминание Telegram или ответ на его сообщение.",
+                    "!мут @user 30м флуд"
+                ),
+                disable_web_page_preview=True,
             )
 
-        if len(parts) >= 3:
-            rest = parts[2]
-            # Ищем число + слово времени (с полной поддержкой падежей и сокращений)
-            time_match = re.match(r'^(\d+)\s*(тысячелети(?:й|и|е)?|век(?:а|ов)?|год(?:а|ов)?|месяц(?:а|ев)?|дн?(?:и|ей)?|ча?(?:с(?:а|ов)?)?|минут(?:ы|а)?|[дчм])?(?:\s+(.*))?$', rest, re.IGNORECASE)
-            if time_match:
-                num = time_match.group(1)
-                unit = time_match.group(2) or ""
-                reason_part = time_match.group(3) or ""
-                dur_text = f"{num} {unit}".strip()
-                reason = reason_part.strip() or "Без причины"
-            else:
-                reason = rest or "Без причины"
+        if target_mention:
+            rest = msg.text[target_mention[2]:].strip()
+            if rest:
+                permanent, dur_text, reason = parse_mute_duration_and_reason(rest)
+        elif len(parts) >= 3:
+            permanent, dur_text, reason = parse_mute_duration_and_reason(parts[2])
 
     else:
         return await msg.answer(
-            "❌ <b>Использование:</b>\n\n"
-            "• <code>мут @user 30 причина</code>\n"
-            "• <code>мут 30 причина</code> (ответом)\n\n"
-            "⏱️ Время: число + д/ч/м (дни/часы/минуты)\n"
-            "📌 Пример: <code>мут @ivan 2ч флуд</code>"
+            ui_error(
+                "Не указаны аргументы",
+                "Нужно указать пользователя, время и причину",
+                "!мут @user 2ч флуд"
+            )
         )
 
     if not tid:
-        return await msg.answer("❌ Не удалось определить пользователя")
+        return await msg.answer(ui_error("Не удалось определить пользователя", "Не удалось понять, кого именно вы хотите замутить. Ответьте на сообщение пользователя или укажите @user.", "!мут @user 30м флуд"), disable_web_page_preview=True)
 
     if tid == msg.from_user.id:
-        return await msg.answer("❌ Нельзя замутить себя!")
+        return await msg.answer(ui_error("Нельзя замутить себя", "Вы не можете ограничить доступ сами себе.", "!мут @user 30м флуд"), disable_web_page_preview=True)
 
     if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
-        return await msg.answer("❌ Анти-модерация!")
+        return await msg.answer(ui_error("Анти-модерация", "Нельзя применять эту команду к пользователю с равным или более высоким уровнем доступа.", "!мут @user 30м флуд"), disable_web_page_preview=True)
 
     dur = parse_time(dur_text) if dur_text else DEFAULT_MUTE_MINUTES
+    if not permanent and not 1 <= dur <= MAX_MUTE_MINUTES:
+        return await msg.answer("❌ Срок мута должен быть от 1 минуты до 1 года. Для бессрочного мута укажите «навсегда».")
 
     try:
-        until = datetime.now() + timedelta(minutes=dur)
-        await bot.restrict_chat_member(msg.chat.id, tid, ChatPermissions(can_send_messages=False), until_date=int(until.timestamp()))
+        until = None if permanent else datetime.now() + timedelta(minutes=dur)
+        permissions = ChatPermissions(can_send_messages=False)
+        if permanent:
+            await bot.restrict_chat_member(msg.chat.id, tid, permissions)
+            time_str = "навсегда"
+            expire_time = None
+        else:
+            await bot.restrict_chat_member(
+                msg.chat.id, tid, permissions, until_date=int(until.timestamp())
+            )
+            expire_time = until.timestamp()
 
         # Форматируем время
-        if dur >= 525600000:  # тысячелетие (1000 * 365 * 1440)
+        if permanent:
+            pass
+        elif dur >= 525600000:  # тысячелетие (1000 * 365 * 1440)
             count = dur // 525600000
             time_str = f"{count} тысячелетие" if count == 1 else f"{count} тысячелетий"
         elif dur >= 52560000:  # век (100 * 365 * 1440)
@@ -2147,7 +4257,10 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
             storage.data['mutes'][str(msg.chat.id)] = mutes
         mutes.append({
             'user_id': tid,
-            'expire_time': until.timestamp(),
+            'expire_time': expire_time,
+            'permanent': permanent,
+            'issued_at': time.time(),
+            'duration_minutes': dur if not permanent else None,
             'muted_by': msg.from_user.id,
             'reason': reason
         })
@@ -2165,8 +4278,8 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
             await bot.send_message(
                 tid,
                 f"🔇 <b>Вы получили мут!</b>\n\n"
-                f"⏱️ Длительность: {time_str}\n"
-                f"📝 Причина: {reason}\n"
+                f"⏱️ Длительность: {html.escape(time_str, quote=False)}\n"
+                f"📝 Причина: {html.escape(reason, quote=False)}\n"
                 f"👮 Выдал: {mention(msg.chat.id, msg.from_user.id)}",
                 disable_web_page_preview=True
             )
@@ -2175,17 +4288,25 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
 
         # Сообщение в чат
         await msg.answer(
-            f"🔇 {mention(msg.chat.id, tid)} заглушен на {time_str}\n📝 {reason}",
+            "🔇 <b>Мут выдан</b>\n"
+            f"{UI_LINE}\n"
+            f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
+            f"⏱ Срок: {html.escape(str(time_str), quote=False)}\n"
+            f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+            f"👮 Выдал: {mention(msg.chat.id, msg.from_user.id)}",
             disable_web_page_preview=True
         )
 
 
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        logger.exception("Не удалось выдать мут пользователю %s", tid)
+        await msg.answer(f"❌ Не удалось выдать мут: {html.escape(str(e)[:250], quote=False)}")
 
 
 async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='!размут @user'):
         return
 
     text = msg.text.strip()
@@ -2203,17 +4324,30 @@ async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
         tid = await get_target(msg, target_arg)
 
         if not tid:
-            return await msg.answer(f"❌ Пользователь {target_arg} не найден!\n\n💡 Ответьте на сообщение пользователя")
+            return await msg.answer(
+                ui_error(
+                    "Пользователь не найден",
+                    f"Не могу найти <code>{html.escape(str(target_arg), quote=False)}</code> в этом чате. Ответьте на сообщение пользователя или укажите @username.",
+                    "!размут @user"
+                ),
+                disable_web_page_preview=True,
+            )
 
     else:
         return await msg.answer(
-            "❌ <b>Использование:</b>\n\n"
-            "• <code>размут @user</code> или <code>-мут @user</code>\n"
-            "• Ответьте на сообщение пользователя и напишите <code>размут</code>"
+            ui_error(
+                "Неверный формат",
+                "Используйте <code>!размут @user</code> или ответьте на сообщение пользователя и напишите <code>размут</code>",
+                "!размут @user"
+            ),
+            disable_web_page_preview=True,
         )
 
     if not tid:
-        return await msg.answer("❌ Не удалось определить пользователя")
+        return await msg.answer(ui_error("Не удалось определить пользователя", "Не удалось понять, кого именно вы хотите размутить.", "!размут @user"), disable_web_page_preview=True)
+
+    if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
+        return await msg.answer("❌ Нельзя снимать мут с пользователя с равным или более высоким рангом.")
 
     try:
         # Получаем информацию о муте для лога
@@ -2240,7 +4374,10 @@ async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
             storage.data['mutes'][str(msg.chat.id)] = [m for m in mutes if m.get('user_id') != tid]
             await storage.save()
 
-        reason_text = f"\n📝 Причина мута была: {mute_info['reason']}" if mute_info and mute_info.get('reason') else ""
+        reason_text = (
+            f"\n📝 Причина мута была: {html.escape(str(mute_info['reason']), quote=False)}"
+            if mute_info and mute_info.get('reason') else ""
+        )
 
         # Сообщение в чат
         await msg.answer(f"🔊 {mention(msg.chat.id, tid)} размучен{reason_text}",
@@ -2258,16 +4395,61 @@ async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
 
 
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        logger.exception("Не удалось снять мут с пользователя %s", tid)
+        await msg.answer(f"❌ Не удалось снять мут: {html.escape(str(e)[:250], quote=False)}")
 
 
 async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
-        return await msg.answer("❌ Недостаточно прав! Требуется ранг 3+")
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 3, title='Недостаточно прав', message='Для этой команды нужен ранг 3+.', example='!бан @user реклама'):
+        return
 
     text = msg.text.strip()
     parts = text.split(maxsplit=2)
+
+    sender_chat = (
+        msg.reply_to_message.sender_chat
+        if msg.reply_to_message else None
+    )
+    if sender_chat:
+        if sender_chat.id == msg.chat.id:
+            return await msg.answer("❌ Нельзя забанить сам этот чат.")
+        reason = text.split(maxsplit=1)[1] if len(parts) > 1 else "Без причины"
+        try:
+            await bot.ban_chat_sender_chat(msg.chat.id, sender_chat.id)
+
+            chat_id_str = str(msg.chat.id)
+            banned_users = storage.data.setdefault('banned_users', {}).setdefault(chat_id_str, [])
+            banned_users[:] = [
+                ban for ban in banned_users
+                if not isinstance(ban, dict) or ban.get('sender_chat_id') != sender_chat.id
+            ]
+            banned_users.append({
+                'sender_chat_id': sender_chat.id,
+                'sender_chat_title': sender_chat.title,
+                'sender_chat_username': sender_chat.username,
+                'banned_by': msg.from_user.id,
+                'reason': reason,
+                'date': time.time(),
+            })
+            storage.mark_dirty()
+            await storage.save()
+
+            channel_name = html.escape(sender_chat.title or sender_chat.username or str(sender_chat.id), quote=False)
+            await msg.answer(
+                "🚫 <b>Бан канала выдан</b>\n"
+                f"{UI_LINE}\n"
+                f"📢 Канал: <b>{channel_name}</b>\n"
+                f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+                f"👮 Забанил: {mention(msg.chat.id, msg.from_user.id)}",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.exception("Не удалось забанить канал-отправитель %s", sender_chat.id)
+            await msg.answer(f"❌ Не удалось забанить канал: {html.escape(str(e)[:250], quote=False)}")
+        return
 
     tid = None
     reason = "Без причины"
@@ -2281,30 +4463,37 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
     # ПРИОРИТЕТ 2: Аргументы в команде
     elif len(parts) >= 2:
         target_arg = parts[1]
+        target_mention = get_target_mention_span(msg, target_arg)
         tid = await get_target(msg, target_arg)
 
         if not tid:
-            return await msg.answer(f"❌ Пользователь {target_arg} не найден!\n\n💡 Ответьте на сообщение пользователя")
+            return await msg.answer(
+                f"❌ Пользователь <code>{html.escape(str(target_arg), quote=False)}</code> не найден!\n\n"
+                "💡 Ответьте на сообщение пользователя"
+            )
 
-        if len(parts) >= 3:
+        if target_mention:
+            reason = msg.text[target_mention[2]:].strip() or "Без причины"
+        elif len(parts) >= 3:
             reason = parts[2]
 
     else:
         return await msg.answer(
-            "❌ <b>Использование:</b>\n\n"
-            "• <code>бан @user причина</code>\n"
-            "• <code>бан причина</code> (ответом)\n\n"
-            "📌 Пример: <code>бан @ivan реклама</code>"
+            ui_error(
+                "Не указаны аргументы",
+                "Нужно указать пользователя и причину",
+                "!бан @user реклама"
+            )
         )
 
     if not tid:
-        return await msg.answer("❌ Не удалось определить пользователя")
+        return await msg.answer(ui_error("Не удалось определить пользователя", "Не удалось понять, кого именно вы хотите забанить. Ответьте на сообщение пользователя или укажите @user.", "!бан @user реклама"), disable_web_page_preview=True)
 
     if tid == msg.from_user.id:
-        return await msg.answer("❌ Нельзя забанить себя!")
+        return await msg.answer(ui_error("Нельзя забанить себя", "Вы не можете забанить самого себя.", "!бан @user реклама"), disable_web_page_preview=True)
 
     if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
-        return await msg.answer("❌ Анти-модерация!")
+        return await msg.answer(ui_error("Анти-модерация", "Нельзя банить пользователя с равным или более высоким уровнем доступа.", "!бан @user реклама"), disable_web_page_preview=True)
 
     try:
         await bot.ban_chat_member(msg.chat.id, tid)
@@ -2327,7 +4516,11 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
 
         # Сообщение в чат
         await msg.answer(
-            f"🚫 {mention(msg.chat.id, tid)} забанен\n📝 Причина: {reason}",
+            "🚫 <b>Бан выдан</b>\n"
+            f"{UI_LINE}\n"
+            f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
+            f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+            f"👮 Забанил: {mention(msg.chat.id, msg.from_user.id)}",
             disable_web_page_preview=True
         )
 
@@ -2335,22 +4528,71 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
         try:
             await bot.send_message(
                 tid,
-                f"🚫 <b>Вы были забанены!</b>\n\n📝 Причина: {reason}\n👮 Забанил: {mention(msg.chat.id, msg.from_user.id)}",
+                f"🚫 <b>Вы были забанены!</b>\n\n"
+                f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+                f"👮 Забанил: {mention(msg.chat.id, msg.from_user.id)}",
                 disable_web_page_preview=True
             )
         except:
             pass
 
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        logger.exception("Не удалось забанить пользователя %s", tid)
+        await msg.answer(f"❌ Не удалось забанить: {html.escape(str(e)[:250], quote=False)}")
 
 
 async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 3, title='Недостаточно прав', message='Для этой команды нужен ранг 3+.', example='!разбан @user'):
         return
 
     text = msg.text.strip()
     parts = text.split(maxsplit=1)
+
+    sender_chat = (
+        msg.reply_to_message.sender_chat
+        if msg.reply_to_message else None
+    )
+    if sender_chat:
+        if sender_chat.id == msg.chat.id:
+            return await msg.answer("❌ Нельзя снять бан с самого этого чата.")
+        try:
+            await bot.unban_chat_sender_chat(msg.chat.id, sender_chat.id)
+
+            chat_id_str = str(msg.chat.id)
+            banned_users = storage.data.get('banned_users', {}).get(chat_id_str, [])
+            ban_info = next(
+                (
+                    ban for ban in banned_users
+                    if isinstance(ban, dict) and ban.get('sender_chat_id') == sender_chat.id
+                ),
+                None,
+            )
+            if ban_info:
+                storage.data['banned_users'][chat_id_str] = [
+                    ban for ban in banned_users
+                    if not isinstance(ban, dict) or ban.get('sender_chat_id') != sender_chat.id
+                ]
+                storage.mark_dirty()
+                await storage.save()
+
+            channel_name = html.escape(
+                sender_chat.title or sender_chat.username or str(sender_chat.id),
+                quote=False,
+            )
+            reason_text = (
+                f"\n📝 Причина бана: {html.escape(str(ban_info['reason']), quote=False)}"
+                if ban_info and ban_info.get('reason') else ""
+            )
+            await msg.answer(
+                f"✅ Бан канала <b>{channel_name}</b> снят{reason_text}",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.exception("Не удалось снять бан с канала-отправителя %s", sender_chat.id)
+            await msg.answer(f"❌ Не удалось разбанить канал: {html.escape(str(e)[:250], quote=False)}")
+        return
 
     tid = None
 
@@ -2364,17 +4606,30 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
         tid = await get_target(msg, target_arg)
 
         if not tid:
-            return await msg.answer(f"❌ Пользователь {target_arg} не найден!\n\n💡 Ответьте на сообщение пользователя")
+            return await msg.answer(
+                ui_error(
+                    "Пользователь не найден",
+                    f"Не могу найти <code>{html.escape(str(target_arg), quote=False)}</code> в этом чате. Ответьте на сообщение пользователя или укажите @username.",
+                    "!разбан @user"
+                ),
+                disable_web_page_preview=True,
+            )
 
     else:
         return await msg.answer(
-            "❌ <b>Использование:</b>\n\n"
-            "• <code>разбан @user</code> или <code>-бан @user</code>\n"
-            "• Ответьте на сообщение пользователя и напишите <code>разбан</code>"
+            ui_error(
+                "Неверный формат",
+                "Используйте <code>!разбан @user</code> или ответьте на сообщение пользователя и напишите <code>разбан</code>",
+                "!разбан @user"
+            ),
+            disable_web_page_preview=True,
         )
 
     if not tid:
-        return await msg.answer("❌ Не удалось определить пользователя")
+        return await msg.answer(ui_error("Не удалось определить пользователя", "Не удалось понять, кого именно вы хотите разбанить.", "!разбан @user"), disable_web_page_preview=True)
+
+    if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
+        return await msg.answer("❌ Нельзя разбанивать пользователя с равным или более высоким рангом.")
 
     try:
         # Получаем информацию о бане для лога
@@ -2397,7 +4652,10 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
             storage.mark_dirty()
             await storage.save()
 
-        reason_text = f"\n📝 Причина бана: {ban_info['reason']}" if ban_info and ban_info.get('reason') else ""
+        reason_text = (
+            f"\n📝 Причина бана: {html.escape(str(ban_info['reason']), quote=False)}"
+            if ban_info and ban_info.get('reason') else ""
+        )
 
         # Сообщение в чат
         await msg.answer(f"✅ {mention(msg.chat.id, tid)} разбанен{reason_text}",
@@ -2407,7 +4665,7 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
         try:
             await bot.send_message(
                 tid,
-                f"✅ <b>Бан снят!</b>\n\n👮 Снял: {mention(msg.chat.id, msg.from_user.id)}",
+                f"✅ <b>Бан снят!</b>\n\n{reason_text}\n👮 Снял: {mention(msg.chat.id, msg.from_user.id)}",
                 disable_web_page_preview=True
             )
         except:
@@ -2415,12 +4673,15 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
 
 
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        logger.exception("Не удалось выдать предупреждение пользователю %s", tid)
+        await msg.answer(f"❌ Не удалось выдать предупреждение: {html.escape(str(e)[:250], quote=False)}")
 
 
 async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='!пред @user 7 флуд'):
         return
 
     # Определяем какая команда была использована
@@ -2443,22 +4704,29 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     else:
         if len(parts) < 2:
             return await msg.answer(
-                f"❌ <b>Использование:</b>\n\n"
-                f"📌 <code>{command_used} @user [дни] причина</code>\n"
-                f"📌 Или ответьте на сообщение пользователя\n\n"
-                f"💡 Примеры:\n"
-                f"• <code>пред @user 7 флуд</code>\n"
-                f"• <code>варн @user спам</code>\n"
-                f"• <code>warn @user 30 оскорбления</code>"
+                ui_error(
+                    "Не указаны аргументы",
+                    "Укажи пользователя, срок и причину",
+                    "!пред @user 7 флуд"
+                )
             )
         tid = await get_target(msg, parts[1])
         if not tid:
             return await msg.answer("❌ Пользователь не найден")
-        if len(parts) > 2:
+        target_mention = get_target_mention_span(msg, parts[1])
+        if target_mention:
+            trailing_args = msg.text[target_mention[2]:].strip().split(maxsplit=1)
+            if trailing_args:
+                try:
+                    days = int(trailing_args[0])
+                    reason = trailing_args[1] if len(trailing_args) > 1 else 'Без причины'
+                except ValueError:
+                    reason = ' '.join(trailing_args) or 'Без причины'
+        elif len(parts) > 2:
             try:
                 days = int(parts[2])
-                reason = parts[3] if len(parts) > 3 else 'Без причины'
-            except:
+                reason = ' '.join(parts[3:]) or 'Без причины'
+            except ValueError:
                 reason = ' '.join(parts[2:]) or 'Без причины'
 
     if not tid:
@@ -2473,7 +4741,8 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     new_warning = {
         'reason': reason,
         'date': time.time(),
-        'expire_date': (datetime.now() + timedelta(days=days)).timestamp(),
+        'expire_date': (datetime.now() + timedelta(days=days)).timestamp() if days > 0 else None,
+        'permanent': days <= 0,
         'warned_by': msg.from_user.id
     }
     
@@ -2483,7 +4752,7 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     u['warnings'].append(new_warning)
     
     # Получаем активные предупреждения
-    active = [w for w in u['warnings'] if w.get('expire_date', 0) > time.time()]
+    active = [w for w in u['warnings'] if isinstance(w, dict) and warning_is_active(w)]
     
     storage.mark_dirty()
     await storage.save()
@@ -2516,7 +4785,7 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
             await msg.answer(
                 f"🚫 {mention(msg.chat.id, tid)} забанен по лимиту предупреждений\n"
                 f"📊 {len(active)}/{MAX_WARNINGS}\n"
-                f"📝 Причина: {reason}",
+                f"📝 Причина: {html.escape(str(reason), quote=False)}",
                 disable_web_page_preview=True
             )
 
@@ -2525,7 +4794,7 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
                     tid,
                     f"🚫 <b>Вы были забанены!</b>\n\n"
                     f"📊 Достигнут лимит предупреждений: {len(active)}/{MAX_WARNINGS}\n"
-                    f"📝 Последняя причина: {reason}",
+                    f"📝 Последняя причина: {html.escape(str(reason), quote=False)}",
                     disable_web_page_preview=True
                 )
             except:
@@ -2537,10 +4806,11 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
 
     # Уведомление в чат
     await msg.answer(
-        f"⚠️ <b>Предупреждение выдано!</b>\n\n"
-        f"👤 {mention(msg.chat.id, tid)}\n"
-        f"📝 Причина: {reason}\n"
-        f"⏱️ Срок: {time_str}\n"
+        "⚠️ <b>Предупреждение выдано</b>\n"
+        f"{UI_LINE}\n"
+        f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
+        f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+        f"⏱ Срок: {html.escape(str(time_str), quote=False)}\n"
         f"📊 Активных: {len(active)}/{MAX_WARNINGS}\n"
         f"👮 Выдал: {mention(msg.chat.id, msg.from_user.id)}",
         disable_web_page_preview=True
@@ -2550,8 +4820,8 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     try:
         user_msg = (
             f"⚠️ <b>Вы получили предупреждение!</b>\n\n"
-            f"📝 Причина: {reason}\n"
-            f"⏱️ Срок: {time_str}\n"
+            f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+            f"⏱️ Срок: {html.escape(str(time_str), quote=False)}\n"
             f"📊 Всего активных: {len(active)}/{MAX_WARNINGS}\n\n"
             f"📌 При {MAX_WARNINGS} предупреждениях вы получите бан."
         )
@@ -2561,11 +4831,11 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
 
 
 async def show_warnings(msg: Message, cmd_name: str = 'преды'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+    if not await require_access(msg, cmd_name, 0, title='Нет доступа', message='Эта команда доступна всем участникам.', example='!преды'):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
-    parts = msg.text.split()
+    parts = strip_command_prefix(msg.text, msg.chat.id).split()
 
     tid = msg.from_user.id
     if msg.reply_to_message and msg.reply_to_message.from_user:
@@ -2575,11 +4845,16 @@ async def show_warnings(msg: Message, cmd_name: str = 'преды'):
         if target:
             tid = target
 
-    wrn = [w for w in storage.get_user(msg.chat.id, tid).get('warnings', []) if w.get('expire_date', 0) > time.time()]
+    wrn = [
+        w for w in storage.get_user(msg.chat.id, tid).get('warnings', [])
+        if isinstance(w, dict) and warning_is_active(w)
+    ]
 
     if not wrn:
-        msg_to_send = await msg.answer(f"✅ У {mention(msg.chat.id, tid)} нет активных предупреждений",
-                                       disable_web_page_preview=True)
+        msg_to_send = await msg.answer(
+            ui_error("Нет активных предупреждений", f"У {mention(msg.chat.id, tid)} сейчас нет действующих предупреждений.", "!преды"),
+            disable_web_page_preview=True,
+        )
         await asyncio.sleep(3)
         try:
             await msg_to_send.delete()
@@ -2589,14 +4864,263 @@ async def show_warnings(msg: Message, cmd_name: str = 'преды'):
 
     txt = f"⚠️ <b>Предупреждения {mention(msg.chat.id, tid)}:</b> {len(wrn)}/{MAX_WARNINGS}\n\n"
     for i, w in enumerate(wrn, 1):
-        expire_date = datetime.fromtimestamp(w['expire_date']).strftime('%d.%m.%Y')
-        txt += f"{i}. {w['reason']}\n   └ до {expire_date} | выдал: {mention(msg.chat.id, w['warned_by'])}\n"
+        expire_date = (
+            'навсегда'
+            if w.get('permanent') is True
+            else datetime.fromtimestamp(w['expire_date']).strftime('%d.%m.%Y')
+        )
+        txt += (
+            f"{i}. {html.escape(str(w.get('reason') or 'Без причины'), quote=False)}\n"
+            f"   └ до {expire_date} | выдал: {mention(msg.chat.id, w['warned_by'])}\n"
+        )
 
     await msg.answer(txt, disable_web_page_preview=True)
 
 
+async def send_moderation_list(msg: Message, title: str, entries: List[str]):
+    if not entries:
+        return await msg.answer(f"{title}\n\nСписок пуст.")
+
+    lines = [f"{title} ({len(entries)}):\n"]
+    shown = 0
+    for entry in entries:
+        if len("\n".join(lines + [entry])) > 3800:
+            break
+        lines.append(entry)
+        shown += 1
+
+    if shown < len(entries):
+        lines.append(f"\nПоказаны первые {shown} из {len(entries)} записей.")
+    await msg.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_mute_list(msg: Message, cmd_name: str = 'мутлист'):
+    if not await require_access(
+        msg, cmd_name, 1, title='Недостаточно прав',
+        message='Список мутов доступен модераторам и выше.',
+        example='!мутлист'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    mutes = storage.get_chat(msg.chat.id, 'mutes')
+    if not isinstance(mutes, list):
+        logger.error("Некорректный список мутов в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать список мутов.")
+
+    now = time.time()
+    active_mutes = [
+        mute for mute in mutes
+        if isinstance(mute, dict)
+        and (
+            mute.get('permanent') is True
+            or isinstance(mute.get('expire_time'), (int, float)) and mute['expire_time'] > now
+        )
+    ]
+    active_mutes.sort(
+        key=lambda mute: float('inf') if mute.get('permanent') else mute['expire_time']
+    )
+
+    entries = []
+    for mute in active_mutes:
+        expires = (
+            'навсегда'
+            if mute.get('permanent')
+            else datetime.fromtimestamp(mute['expire_time']).strftime('%d.%m.%Y %H:%M')
+        )
+        reason = html.escape(str(mute.get('reason') or 'Без причины')[:120], quote=False)
+        entries.append(
+            f"• {mention(msg.chat.id, mute['user_id'])} — до {expires}; "
+            f"{reason}; выдал: {mention(msg.chat.id, mute.get('muted_by', 'неизвестно'))}"
+            if isinstance(mute.get('user_id'), int)
+            else f"• Некорректная запись мута (ID: {html.escape(str(mute.get('user_id')), quote=False)})"
+        )
+
+    await send_moderation_list(msg, "🔇 Активные муты", entries)
+
+
+async def cmd_ban_list(msg: Message, cmd_name: str = 'банлист'):
+    if not await require_access(
+        msg, cmd_name, 3, title='Недостаточно прав',
+        message='Список банов доступен с ранга 3+.',
+        example='!банлист'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    bans_by_chat = storage.data.get('banned_users', {})
+    if not isinstance(bans_by_chat, dict):
+        logger.error("Некорректное хранилище банов")
+        return await msg.answer("❌ Не удалось прочитать список банов.")
+    banned_users = bans_by_chat.get(str(msg.chat.id), [])
+    if not isinstance(banned_users, list):
+        logger.error("Некорректный список банов в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать список банов.")
+
+    stale_bans = []
+    bans_by_user = {}
+    bans_by_sender_chat = {}
+    for ban in banned_users:
+        if isinstance(ban, dict) and isinstance(ban.get('sender_chat_id'), int):
+            sender_chat_id = ban['sender_chat_id']
+            previous = bans_by_sender_chat.get(sender_chat_id)
+            ban_date = ban.get('date') if isinstance(ban.get('date'), (int, float)) else 0
+            previous_date = (
+                previous.get('date') if previous and isinstance(previous.get('date'), (int, float))
+                else 0
+            )
+            if previous is None or ban_date > previous_date:
+                if previous is not None:
+                    stale_bans.append(previous)
+                bans_by_sender_chat[sender_chat_id] = ban
+            else:
+                stale_bans.append(ban)
+            continue
+
+        if not isinstance(ban, dict) or not isinstance(ban.get('user_id'), int):
+            stale_bans.append(ban)
+            continue
+
+        user_id = ban['user_id']
+        try:
+            member = await bot.get_chat_member(msg.chat.id, user_id)
+        except Exception as e:
+            logger.error(
+                "Не удалось проверить статус бана пользователя %s в чате %s: %s",
+                user_id, msg.chat.id, e
+            )
+            return await msg.answer(
+                "❌ Не удалось проверить актуальность банов в Telegram. "
+                "Список не изменён; попробуйте позже."
+            )
+
+        if member.status != 'kicked':
+            stale_bans.append(ban)
+            continue
+
+        previous = bans_by_user.get(user_id)
+        ban_date = ban.get('date') if isinstance(ban.get('date'), (int, float)) else 0
+        previous_date = (
+            previous.get('date') if previous and isinstance(previous.get('date'), (int, float))
+            else 0
+        )
+        if previous is None or ban_date > previous_date:
+            if previous is not None:
+                stale_bans.append(previous)
+            bans_by_user[user_id] = ban
+        else:
+            stale_bans.append(ban)
+
+    active_bans = list(bans_by_user.values()) + list(bans_by_sender_chat.values())
+    if stale_bans:
+        stale_ids = {id(ban) for ban in stale_bans}
+        storage.data['banned_users'][str(msg.chat.id)] = [
+            ban for ban in banned_users if id(ban) not in stale_ids
+        ]
+        storage.mark_dirty()
+        await storage.save()
+
+    active_bans.sort(
+        key=lambda ban: ban.get('date') if isinstance(ban.get('date'), (int, float)) else 0,
+        reverse=True
+    )
+    entries = []
+    for ban in active_bans:
+        banned_at = ban.get('date')
+        date_text = (
+            datetime.fromtimestamp(banned_at).strftime('%d.%m.%Y %H:%M')
+            if isinstance(banned_at, (int, float)) else 'дата неизвестна'
+        )
+        reason = html.escape(str(ban.get('reason') or 'Без причины')[:120], quote=False)
+        if isinstance(ban.get('user_id'), int):
+            entries.append(
+                f"• {mention(msg.chat.id, ban['user_id'])} — с {date_text}; {reason}; "
+                f"выдал: {mention(msg.chat.id, ban.get('banned_by', 'неизвестно'))}"
+            )
+        elif isinstance(ban.get('sender_chat_id'), int):
+            sender_title = html.escape(
+                str(ban.get('sender_chat_title') or ban.get('sender_chat_username') or ban['sender_chat_id']),
+                quote=False,
+            )
+            sender_username = ban.get('sender_chat_username')
+            sender_label = (
+                f'<a href="https://t.me/{html.escape(str(sender_username), quote=True)}">{sender_title}</a>'
+                if sender_username else f"<b>{sender_title}</b>"
+            )
+            entries.append(
+                f"• 📢 {sender_label} — с {date_text}; {reason}; "
+                f"выдал: {mention(msg.chat.id, ban.get('banned_by', 'неизвестно'))}"
+            )
+        else:
+            entries.append(
+                f"• Некорректная запись бана (ID: "
+                f"{html.escape(str(ban.get('user_id')), quote=False)})"
+            )
+
+    await send_moderation_list(msg, "🚫 Активные баны", entries)
+
+
+async def cmd_warn_list(msg: Message, cmd_name: str = 'варнлист'):
+    if not await require_access(
+        msg, cmd_name, 1, title='Недостаточно прав',
+        message='Общий список предупреждений доступен модераторам и выше.',
+        example='!варнлист'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    users_by_chat = storage.data.get('users', {})
+    if not isinstance(users_by_chat, dict):
+        logger.error("Некорректное хранилище пользователей")
+        return await msg.answer("❌ Не удалось прочитать список предупреждений.")
+    users = users_by_chat.get(str(msg.chat.id), {})
+    if not isinstance(users, dict):
+        logger.error("Некорректные данные пользователей в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать список предупреждений.")
+
+    now = time.time()
+    warnings = []
+    for user_id, user_data in users.items():
+        if not isinstance(user_data, dict):
+            continue
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            logger.warning("Некорректный ID пользователя в списке чата %s: %s", msg.chat.id, user_id)
+            continue
+        user_warnings = user_data.get('warnings', [])
+        if not isinstance(user_warnings, list):
+            logger.warning("Некорректный список предупреждений пользователя %s в чате %s", uid, msg.chat.id)
+            continue
+        for warning in user_warnings:
+            if (
+                isinstance(warning, dict)
+                and warning_is_active(warning, now)
+            ):
+                warnings.append((uid, warning))
+
+    warnings.sort(key=lambda item: item[1].get('date', 0), reverse=True)
+    entries = []
+    for uid, warning in warnings:
+        expire_date = (
+            'навсегда'
+            if warning.get('permanent') is True
+            else datetime.fromtimestamp(warning['expire_date']).strftime('%d.%m.%Y')
+        )
+        reason = html.escape(str(warning.get('reason') or 'Без причины')[:120], quote=False)
+        issuer = warning.get('warned_by', 'неизвестно')
+        entries.append(
+            f"• {mention(msg.chat.id, uid)} — до {expire_date}; {reason}; "
+            f"выдал: {mention(msg.chat.id, issuer) if isinstance(issuer, int) else html.escape(str(issuer), quote=False)}"
+        )
+
+    await send_moderation_list(msg, "⚠️ Активные предупреждения", entries)
+
+
 async def cmd_unwarn(msg: Message, cmd_name: str = 'снятьпред'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 2, title='Недостаточно прав', message='Эта команда доступна только модераторам 2+ и выше.', example='!снятьпред @user 1'):
         return
 
     parts = msg.text.split()
@@ -2609,21 +5133,27 @@ async def cmd_unwarn(msg: Message, cmd_name: str = 'снятьпред'):
 
     if not tid:
         return await msg.answer(
-            "❌ <b>Использование:</b>\n\n"
-            "• <code>снятьпред @user [номер]</code> — снять конкретное\n"
-            "• <code>снятьпред @user</code> — снять все активные\n"
-            "• <code>снятьварн @user [номер]</code>\n"
-            "• <code>unwarn @user [номер]</code>\n"
-            "• Или ответьте на сообщение пользователя"
+            ui_error(
+                "Неверный формат",
+                "Используйте <code>!снятьпред @user [номер]</code>, <code>!снятьпред @user</code> или ответьте на сообщение пользователя.",
+                "!снятьпред @user 1"
+            ),
+            disable_web_page_preview=True,
         )
 
+    if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
+        return await msg.answer("❌ Нельзя снимать предупреждения с пользователя с равным или более высоким рангом.")
+
     u = storage.get_user(msg.chat.id, tid)
-    active = [(i, w) for i, w in enumerate(u.get('warnings', [])) if w.get('expire_date', 0) > time.time()]
+    active = [
+        (i, w) for i, w in enumerate(u.get('warnings', []))
+        if isinstance(w, dict) and warning_is_active(w)
+    ]
 
     if not active:
         chat_msg = await msg.answer(
-            f"✅ У {mention(msg.chat.id, tid)} нет активных предупреждений",
-            disable_web_page_preview=True
+            ui_error("Нет активных предупреждений", f"У {mention(msg.chat.id, tid)} сейчас нет действующих предупреждений.", "!преды"),
+            disable_web_page_preview=True,
         )
         await asyncio.sleep(3)
         try:
@@ -2632,24 +5162,22 @@ async def cmd_unwarn(msg: Message, cmd_name: str = 'снятьпред'):
             pass
         return
 
-    # Проверяем если указан номер
     num_idx = 2 if not msg.reply_to_message else 1
     if len(parts) > num_idx and parts[num_idx].isdigit():
         idx = int(parts[num_idx]) - 1
         if 0 <= idx < len(active):
-            # Снимаем конкретное предупреждение по его индексу в исходном массиве
             removed_warning = u['warnings'][active[idx][0]]
             del u['warnings'][active[idx][0]]
-            
+
             storage.mark_dirty()
             await storage.save()
-            
+
             logger.info(f"Снято предупреждение #{idx + 1} у {tid}")
 
             chat_msg = await msg.answer(
                 f"✅ Снято предупреждение #{idx + 1} у {mention(msg.chat.id, tid)}\n"
-                f"📝 Причина была: {removed_warning['reason']}",
-                disable_web_page_preview=True
+                f"📝 Причина была: {html.escape(str(removed_warning.get('reason') or 'Без причины'), quote=False)}",
+                disable_web_page_preview=True,
             )
             await asyncio.sleep(3)
             try:
@@ -2658,57 +5186,66 @@ async def cmd_unwarn(msg: Message, cmd_name: str = 'снятьпред'):
                 pass
             return
         else:
-            return await msg.answer(f"❌ Предупреждение #{idx + 1} не найдено")
+            return await msg.answer(ui_error("Предупреждение не найдено", f"У пользователя {mention(msg.chat.id, tid)} нет предупреждения под номером {idx + 1}.", "!снятьпред @user 1"), disable_web_page_preview=True)
 
-    # Если не указан номер, снимаем ВСЕ АКТИВНЫЕ
     before_count = len(active)
-    # Удаляем активные предупреждения в обратном порядке (чтобы не сбить индексы)
     for idx, _ in sorted(active, key=lambda x: x[0], reverse=True):
         del u['warnings'][idx]
-    
+
     storage.mark_dirty()
     await storage.save()
-    
+
     logger.info(f"Снято {before_count} предупреждений у {tid}")
 
     await msg.answer(
         f"✅ Снято <b>{before_count}</b> предупреждений у {mention(msg.chat.id, tid)}",
-        disable_web_page_preview=True
+        disable_web_page_preview=True,
     )
 
 
 async def cmd_del(msg: Message, cmd_name: str = '-смс'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 1):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='! -смс'):
         return
     if msg.reply_to_message:
         try:
             await msg.reply_to_message.delete()
             await msg.delete()
-        except:
-            pass
+        except Exception:
+            await msg.answer(ui_error("Не удалось удалить сообщение", "Бот не может удалить это сообщение. Возможно, оно слишком старое или у бота нет прав.", "-смс"), disable_web_page_preview=True)
+    else:
+        await msg.answer(ui_error("Неверный формат", "Ответьте на сообщение, которое нужно удалить, и затем используйте <code>-смс</code>.", "-смс"), disable_web_page_preview=True)
 
 
-async def cmd_pin(msg: Message, cmd_name: str = '.пин'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
+async def cmd_pin(msg: Message, cmd_name: str = 'пин'):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 2, title='Недостаточно прав', message='Эта команда доступна только модераторам 2+ и выше.', example='!пин'):
         return
     if msg.reply_to_message:
         try:
             await msg.reply_to_message.pin()
-        except:
-            pass
+        except Exception:
+            await msg.answer(ui_error("Не удалось закрепить сообщение", "Бот не может закрепить это сообщение. Возможно, у бота нет прав или сообщение уже закреплено.", "!пин"), disable_web_page_preview=True)
+    else:
+        await msg.answer(ui_error("Не выбрано сообщение", "Ответьте на сообщение, которое нужно закрепить, и затем используйте <code>!пин</code>.", "!пин"), disable_web_page_preview=True)
 
 
 async def cmd_purge(msg: Message, cmd_name: str = 'очистить'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(msg, cmd_name, 2, title='Недостаточно прав', message='Эта команда доступна только модераторам 2+ и выше.', example='!очистить'):
         return
 
-    # Обязательно нужно ответить на сообщение
     if not msg.reply_to_message:
         return await msg.answer(
-            "❌ <b>Как использовать очистку:</b>\n\n"
-            "1. Ответьте на сообщение, с которого хотите начать очистку\n"
-            "2. Напишите <code>очистить</code>\n\n"
-            "📌 <i>Будут удалены все сообщения от отвеченного и выше</i>"
+            ui_error(
+                "Как использовать очистку",
+                "1. Ответьте на сообщение, с которого хотите начать очистку\n2. Напишите <code>очистить</code>\n\n📌 Будут удалены все сообщения от отвеченного и выше.",
+                "!очистить"
+            ),
+            disable_web_page_preview=True,
         )
 
     try:
@@ -2738,214 +5275,11 @@ async def cmd_purge(msg: Message, cmd_name: str = 'очистить'):
     except Exception as e:
         error_msg = str(e)
         if "message can't be deleted" in error_msg.lower():
-            await msg.answer("❌ Нельзя удалять сообщения старше 48 часов")
+            await msg.answer(ui_error("Нельзя удалить часть сообщений", "Сообщения слишком старые: Telegram запрещает удалять сообщения старше 48 часов.", "!очистить"), disable_web_page_preview=True)
         elif "not enough rights" in error_msg.lower():
-            await msg.answer("❌ У бота нет прав на удаление сообщений")
+            await msg.answer(ui_error("Нет прав на удаление", "У бота нет прав на удаление сообщений в этом чате.", "!очистить"), disable_web_page_preview=True)
         else:
-            await msg.answer(f"❌ Ошибка: {error_msg[:100]}")
-
-
-# ==================== Топики ====================
-
-async def cmd_close_topic(msg: Message, cmd_name: str = 'закрыть топик'):
-    """Закрыть топик - теперь поддерживает @упоминания для исключений"""
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
-        return
-
-    # Парсим аргументы: может быть ранг ИЛИ @упоминания
-    parts = msg.text.split()
-
-    rank = 0
-    allowed_users = []
-
-    for part in parts[1:]:  # пропускаем "закрыть" и "топик"
-        if part.isdigit():
-            rank = int(part)
-        elif part.startswith('@'):
-            username = part[1:].lower()
-            uid = storage.get_user_by_username(msg.chat.id, username)
-            if uid is not None:
-                allowed_users.append(str(uid))
-
-    # Определяем топик
-    topic_id = msg.message_thread_id
-    if topic_id is None or topic_id == 1:
-        topic_id = 0
-        topic_name = "основной чат"
-    else:
-        topic_name = f"топик {topic_id}"
-
-    # Сохраняем (теперь с поддержкой и ранга, и пользователей)
-    if 'closed_topics' not in storage.data:
-        storage.data['closed_topics'] = {}
-    if str(msg.chat.id) not in storage.data['closed_topics']:
-        storage.data['closed_topics'][str(msg.chat.id)] = {}
-
-    storage.data['closed_topics'][str(msg.chat.id)][str(topic_id)] = {
-        'required_rank': rank,
-        'allowed_users': allowed_users,  # НОВОЕ: список пользователей с доступом
-        'closed_by': msg.from_user.id,
-        'closed_at': time.time()
-    }
-
-    storage.mark_dirty()
-    await storage.save()
-
-    # Ответ
-    response = f"🔒 <b>Закрыт: {topic_name}</b>\n👮 Закрыл: {mention(msg.chat.id, msg.from_user.id)}\n"
-
-    if rank > 0:
-        response += f"🔐 Требуется ранг: {rank}+\n"
-
-    if allowed_users:
-        users_list = ', '.join([mention(msg.chat.id, uid) for uid in allowed_users])
-        response += f"👤 Исключения: {users_list}\n"
-
-    if rank == 0 and not allowed_users:
-        response += f"🔓 Могут писать все\n"
-    elif rank > 0 and allowed_users:
-        response += f"💡 Доступ: ранг {rank}+ ИЛИ из списка исключений"
-
-    await msg.answer(response, disable_web_page_preview=True)
-
-
-async def cmd_open_topic(msg: Message, cmd_name: str = 'открыть топик'):
-    """Открыть топик (без изменений)"""
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 2):
-        return
-
-    topic_id = msg.message_thread_id
-    if topic_id is None or topic_id == 1:
-        topic_id = 0
-
-    chat_topics = storage.data.get('closed_topics', {}).get(str(msg.chat.id), {})
-
-    if str(topic_id) in chat_topics:
-        del chat_topics[str(topic_id)]
-        storage.mark_dirty()
-        await storage.save()
-
-        topic_name = "основной чат" if topic_id == 0 else f"топик {topic_id}"
-        await msg.answer(f"🔓 <b>Открыт {topic_name}</b>", disable_web_page_preview=True)
-    else:
-        await msg.answer("❌ Этот топик не был закрыт")
-
-
-async def cmd_list_topics(msg: Message, cmd_name: str = 'топики'):
-    """Показать список закрытых топиков (обновлено с показом исключений)"""
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
-        return
-    chat_topics = storage.data.get('closed_topics', {}).get(str(msg.chat.id), {})
-
-    if not chat_topics:
-        return await msg.answer("📂 <b>Нет закрытых топиков</b>\n\n"
-                                "💡 <code>закрыть топик 5</code> - по рангу\n"
-                                "💡 <code>закрыть топик @user1 @user2</code> - по исключениям\n"
-                                "💡 <code>закрыть топик 5 @user1</code> - комбинированный")
-
-    txt = "🔒 <b>Закрытые топики:</b>\n\n"
-    for topic_id_str, data in chat_topics.items():
-        topic_id = int(topic_id_str)
-        topic_name = "основной чат" if topic_id == 0 else f"топик {topic_id}"
-        rank = data.get('required_rank', 0)
-        allowed = data.get('allowed_users', [])
-        closed_by = mention(msg.chat.id, data.get('closed_by'))
-        closed_at = datetime.fromtimestamp(data.get('closed_at', time.time())).strftime('%d.%m.%Y %H:%M')
-
-        txt += f"📌 <b>{topic_name}</b>\n"
-        txt += f"   👮 Закрыл: {closed_by}\n"
-        txt += f"   🕐 {closed_at}\n"
-
-        if rank > 0:
-            txt += f"   🔐 Ранг: {rank}+\n"
-        if allowed:
-            users_preview = ', '.join([mention(msg.chat.id, uid) for uid in allowed[:3]])
-            if len(allowed) > 3:
-                users_preview += f" +{len(allowed) - 3}"
-            txt += f"   👤 Исключения: {users_preview}\n"
-
-        txt += "\n"
-
-    await msg.answer(txt, disable_web_page_preview=True)
-
-
-# ==================== Изоляция ====================
-
-async def cmd_add_iso(msg: Message, cmd_name: str = '+изоляция'):
-    save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
-        return
-
-    parts = msg.text.split(maxsplit=5)
-
-    tid = None
-    arg_start = 1
-
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        tid = msg.reply_to_message.from_user.id
-        arg_start = 1
-    else:
-        if len(parts) < 2:
-            return await msg.answer("❌ <code>+изоляция @user главный/ID время причина</code> или ответом")
-        tid = await get_target(msg, parts[1])
-        if not tid:
-            return await msg.answer("❌ Пользователь не найден")
-        arg_start = 2
-
-    remaining = parts[arg_start:]
-    if len(remaining) < 2:
-        return await msg.answer("❌ Не хватает аргументов: <code>+изоляция [@user] тип время причина</code>")
-
-    iso_type = remaining[0]
-    duration_text = remaining[1]
-    reason = ' '.join(remaining[2:]) if len(remaining) > 2 else 'Без причины'
-
-    if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
-        return await msg.answer("❌ Анти-модерация!")
-
-    iso = {
-        'chat_id': msg.chat.id,
-        'type': iso_type,
-        'reason': reason,
-        'expire_time': (datetime.now() + timedelta(minutes=parse_time(duration_text))).timestamp(),
-        'isolated_by': msg.from_user.id
-    }
-    storage.data['isolation'][str(tid)] = iso
-    storage.get_user(msg.chat.id, tid)['isolation'] = iso
-    storage.mark_dirty()
-    await storage.save()
-    await msg.answer(f"🔒 {mention(msg.chat.id, tid)} изолирован на {parse_time(duration_text)} мин.\n📝 {reason}",
-                     disable_web_page_preview=True)
-
-
-async def cmd_rem_iso(msg: Message, cmd_name: str = '-изоляция'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 3):
-        return
-
-    parts = msg.text.split()
-    tid = None
-
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        tid = msg.reply_to_message.from_user.id
-    elif len(parts) > 1:
-        tid = await get_target(msg, parts[1])
-
-    if tid:
-        storage.data['isolation'].pop(str(tid), None)
-        storage.get_user(msg.chat.id, tid)['isolation'] = None
-        storage.mark_dirty()
-        await storage.save()
-        await msg.answer(f"🔓 Изоляция снята с {mention(msg.chat.id, tid)}", disable_web_page_preview=True)
-
-
-async def cmd_show_iso(msg: Message):
-    iso = storage.data.get('isolation', {})
-    if not iso:
-        return await msg.answer("✅ Нет изолированных")
-    txt = "🔒 <b>Изолированные:</b>\n\n"
-    for uid, data in iso.items():
-        txt += f"• {mention(msg.chat.id, int(uid))}: {data['reason']} (до {datetime.fromtimestamp(data['expire_time']).strftime('%d.%m.%Y %H:%M')})\n"
-    await msg.answer(txt, disable_web_page_preview=True)
+            await msg.answer(ui_error("Ошибка очистки", f"Не удалось завершить очистку: {html.escape(error_msg[:120], quote=False)}", "!очистить"), disable_web_page_preview=True)
 
 
 # ==================== Награды ====================
@@ -2957,10 +5291,7 @@ async def cmd_give_award(msg: Message, cmd_name: str = 'наградить'):
 
     text = msg.text.strip()
 
-    for prefix in ['!']:
-        if text.startswith(prefix):
-            text = text[1:].strip()
-            break
+    text = strip_command_prefix(text, msg.chat.id)
 
     if text.lower().startswith('наградить'):
         remaining = text[9:].strip()
@@ -3000,11 +5331,16 @@ async def cmd_give_award(msg: Message, cmd_name: str = 'наградить'):
         award_name = text
     else:
         parts = text.split(None, 1)
+        target_mention = get_target_mention_span(msg, parts[0])
         potential_tid = await get_target(msg, parts[0])
 
         if potential_tid:
             tid = potential_tid
-            award_name = parts[1] if len(parts) > 1 else None
+            award_name = (
+                msg.text[target_mention[2]:].strip()
+                if target_mention
+                else parts[1] if len(parts) > 1 else None
+            )
         else:
             return await msg.answer("❌ Пользователь не найден. Используйте @username или ответьте на сообщение")
 
@@ -3039,11 +5375,12 @@ async def cmd_give_award(msg: Message, cmd_name: str = 'наградить'):
     medal = medals.get(degree, '🏅')
 
     total = len(target_user['awards'])
+    safe_award_name = html.escape(award_name, quote=False)
 
     await msg.answer(
         f"{medal} <b>Награда вручена!</b>\n\n"
         f"👤 Получатель: {mention(msg.chat.id, tid)}\n"
-        f"🏅 Награда: {award_name}\n"
+        f"🏅 Награда: {safe_award_name}\n"
         f"⭐ Степень: {degree}\n"
         f"📊 Всего наград: {total}\n"
         f"👮 Выдал: {mention(msg.chat.id, msg.from_user.id)}",
@@ -3057,10 +5394,7 @@ async def cmd_rem_award(msg: Message, cmd_name: str = 'снять награду
 
     text = msg.text.strip()
 
-    for prefix in ['!']:
-        if text.startswith(prefix):
-            text = text[1:].strip()
-            break
+    text = strip_command_prefix(text, msg.chat.id)
 
     for cmd_word in ['снять награду', 'снятьнаграду']:
         if text.lower().startswith(cmd_word):
@@ -3081,11 +5415,16 @@ async def cmd_rem_award(msg: Message, cmd_name: str = 'снять награду
         award_name = text
     else:
         parts = text.split(None, 1)
+        target_mention = get_target_mention_span(msg, parts[0])
         potential_tid = await get_target(msg, parts[0])
 
         if potential_tid:
             tid = potential_tid
-            award_name = parts[1] if len(parts) > 1 else None
+            award_name = (
+                msg.text[target_mention[2]:].strip()
+                if target_mention
+                else parts[1] if len(parts) > 1 else None
+            )
         else:
             return await msg.answer("❌ Пользователь не найден")
 
@@ -3096,6 +5435,9 @@ async def cmd_rem_award(msg: Message, cmd_name: str = 'снять награду
         return await msg.answer("❌ Укажите название награды для снятия")
 
     award_name = award_name.strip()
+
+    if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
+        return await msg.answer("❌ Нельзя снимать награды у пользователя с равным или более высоким рангом.")
 
     target_user = storage.get_user(msg.chat.id, tid)
     awards = target_user.get('awards', [])
@@ -3115,10 +5457,11 @@ async def cmd_rem_award(msg: Message, cmd_name: str = 'снять награду
         storage.mark_dirty()
         await storage.save()
 
+        safe_award_name = html.escape(str(found_award.get('name') or ''), quote=False)
         await msg.answer(
             f"✅ <b>Награда снята</b>\n\n"
             f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
-            f"🏅 Награда: {found_award['name']}\n"
+            f"🏅 Награда: {safe_award_name}\n"
             f"⭐ Степень: {found_award.get('degree', '?')}\n"
             f"📊 Осталось наград: {len(awards)}",
             disable_web_page_preview=True
@@ -3127,11 +5470,16 @@ async def cmd_rem_award(msg: Message, cmd_name: str = 'снять награду
 
     similar = [a for a in awards if award_name.lower() in a['name'].lower()]
     if similar:
-        similar_list = "\n".join([f"• {a['name']} (ст. {a.get('degree', '?')})" for a in similar[:10]])
-        return await msg.answer(f"❌ Награда '{award_name}' не найдена\n\n🔍 <b>Похожие:</b>\n{similar_list}",
+        similar_list = "\n".join([
+            f"• {html.escape(str(a.get('name') or ''), quote=False)} (ст. {a.get('degree', '?')})"
+            for a in similar[:10]
+        ])
+        safe_award_name = html.escape(award_name, quote=False)
+        return await msg.answer(f"❌ Награда '{safe_award_name}' не найдена\n\n🔍 <b>Похожие:</b>\n{similar_list}",
                                 disable_web_page_preview=True)
 
-    await msg.answer(f"❌ Награда '{award_name}' не найдена у {mention(msg.chat.id, tid)}",
+    await msg.answer(
+                     f"❌ Награда '{html.escape(award_name, quote=False)}' не найдена у {mention(msg.chat.id, tid)}",
                      disable_web_page_preview=True)
 
 
@@ -3146,10 +5494,7 @@ async def cmd_my_awards(msg: Message, cmd_name: str = 'мои награды'):
         tid = msg.reply_to_message.from_user.id
     else:
         text = msg.text.strip()
-        for prefix in ['!']:
-            if text.startswith(prefix):
-                text = text[1:].strip()
-                break
+        text = strip_command_prefix(text, msg.chat.id)
         if text.lower().startswith('мои награды'):
             text = text[10:].strip()
         if text:
@@ -3184,7 +5529,7 @@ async def cmd_my_awards(msg: Message, cmd_name: str = 'мои награды'):
         else:
             medal = "🥉"
 
-        txt += f"{medal} <b>{name}</b> (ст. {degree})\n"
+        txt += f"{medal} <b>{html.escape(str(name), quote=False)}</b> (ст. {degree})\n"
 
     await msg.answer(txt, disable_web_page_preview=True)
 
@@ -3544,7 +5889,11 @@ async def cmd_add_phrase(msg: Message, cmd_name: str = 'добавить фра�
     storage.mark_dirty()
     await storage.save()
 
-    await msg.answer(f"✅ Фраза добавлена: {trigger} → {response}\n📊 Теперь у этого слова {count} вариант(ов) ответа")
+    await msg.answer(
+        f"✅ Фраза добавлена: {html.escape(trigger, quote=False)} → "
+        f"{html.escape(response, quote=False)}\n"
+        f"📊 Теперь у этого слова {count} вариант(ов) ответа"
+    )
 
 
 async def cmd_list_phrases(msg: Message, cmd_name: str = 'фразы'):
@@ -3569,12 +5918,15 @@ async def cmd_list_phrases(msg: Message, cmd_name: str = 'фразы'):
         responses_count = len(items)
         # Показываем первый ответ как пример
         preview = items[0]['response'][:30] + "..." if len(items[0]['response']) > 30 else items[0]['response']
-        txt += f"{anywhere_icon} <b>{trigger}</b>: {responses_count} отв. (напр. {preview})\n"
+        txt += (
+            f"{anywhere_icon} <b>{html.escape(str(trigger), quote=False)}</b>: "
+            f"{responses_count} отв. (напр. {html.escape(str(preview), quote=False)})\n"
+        )
 
         # Опционально: показать все ответы
         if len(items) <= 3:
             for p in items:
-                txt += f"   └ {p['response'][:40]}\n"
+                txt += f"   └ {html.escape(str(p.get('response') or '')[:40], quote=False)}\n"
 
     await msg.answer(txt)
 
@@ -3586,7 +5938,7 @@ async def cmd_phrase_stats(msg: Message):
     sorted_p = sorted(phrases, key=lambda x: x.get('uses', 0), reverse=True)
     txt = "📊 <b>Статистика фраз:</b>\n\n"
     for p in sorted_p[:20]:
-        txt += f"• {p['trigger']}: {p.get('uses', 0)} раз\n"
+        txt += f"• {html.escape(str(p.get('trigger') or ''), quote=False)}: {p.get('uses', 0)} раз\n"
     await msg.answer(txt)
 
 
@@ -3614,12 +5966,16 @@ async def cmd_del_phrase(msg: Message, cmd_name: str = 'удалить фраз�
         phrases[:] = [p for p in phrases if
                       not (p['trigger'] == trigger and p['response'].lower() == response_text.lower())]
         removed = before_count - len(phrases)
-        await msg.answer(f"✅ Удалено {removed} фраз с ответом '{response_text}'")
+        await msg.answer(
+            f"✅ Удалено {removed} фраз с ответом '{html.escape(response_text, quote=False)}'"
+        )
     else:
         # Удаляем все фразы с таким триггером
         phrases[:] = [p for p in phrases if p['trigger'] != trigger]
         removed = before_count - len(phrases)
-        await msg.answer(f"✅ Удалено {removed} фраз с триггером '{trigger}'")
+        await msg.answer(
+            f"✅ Удалено {removed} фраз с триггером '{html.escape(trigger, quote=False)}'"
+        )
 
     storage.mark_dirty()
     await storage.save()
@@ -3642,13 +5998,16 @@ async def cmd_phrase_show(msg: Message, cmd_name: str = 'показать фра
     matching = [p for p in phrases if p['trigger'] == trigger]
 
     if not matching:
-        return await msg.answer(f"❌ Нет фраз с триггером '{trigger}'")
+        return await msg.answer(f"❌ Нет фраз с триггером '{html.escape(trigger, quote=False)}'")
 
-    txt = f"📝 <b>Все ответы на '{trigger}':</b>\n\n"
+    txt = f"📝 <b>Все ответы на '{html.escape(trigger, quote=False)}':</b>\n\n"
     for i, p in enumerate(matching, 1):
         anywhere = "🌐 (везде)" if p.get('anywhere') else "📌 (точно)"
         uses = p.get('uses', 0)
-        txt += f"{i}. {p['response']}\n   └ {anywhere} | использовано: {uses} раз\n\n"
+        txt += (
+            f"{i}. {html.escape(str(p.get('response') or ''), quote=False)}\n"
+            f"   └ {anywhere} | использовано: {uses} раз\n\n"
+        )
 
     await msg.answer(txt)
 
@@ -3743,7 +6102,7 @@ async def cmd_rules(msg: Message):
         return await msg.answer("📜 Правила чата пока не установлены.")
     txt = "📜 <b>Правила чата:</b>\n\n"
     for i, rule in enumerate(rules_list, 1):
-        txt += f"{i}. {rule}\n"
+        txt += f"{i}. {html.escape(str(rule), quote=False)}\n"
     await msg.answer(txt)
 
 
@@ -3789,7 +6148,8 @@ async def cmd_games_menu(msg: Message, cmd_name: str = 'игры'):
             InlineKeyboardButton(text="🤝 КНБ (с игроком)", callback_data="game_rps_player")
         ],
         [
-            InlineKeyboardButton(text="❌ Крестики-Нолики", callback_data="game_ttt_menu")
+            InlineKeyboardButton(text="❌ Крестики-Нолики", callback_data="game_ttt_menu"),
+            InlineKeyboardButton(text="🎲 Wordle", callback_data="game_wordle")
         ],
         [
             InlineKeyboardButton(text="❌ Закрыть", callback_data="game_cancel")
@@ -3802,12 +6162,96 @@ async def cmd_games_menu(msg: Message, cmd_name: str = 'игры'):
         reply_markup=kb
     )
 
+def get_wordle_menu_text() -> str:
+    return (
+        "🎲 <b>Wordle (русский)</b>\n\n"
+        "Выберите сложность — игра сразу начнётся в этом чате:\n\n"
+        "🟢 <b>Лёгкий</b> — распространённые слова\n"
+        "🟡 <b>Средний</b> — обычные слова\n"
+        "🔴 <b>Сложный</b> — редкие сочетания букв\n"
+        "⚫ <b>Экспертный</b> — самые необычные слова\n\n"
+        "После запуска отвечайте на сообщение игры словом из 5 букв.\n\n"
+        "Длина: 4-6 букв · Попытки: 4-6\n"
+        "Если сложность не указана, используется средняя."
+    )
+
+
+def get_wordle_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 Лёгкий", callback_data="wordle_difficulty_easy"),
+            InlineKeyboardButton(text="🟡 Средний", callback_data="wordle_difficulty_medium")
+        ],
+        [
+            InlineKeyboardButton(text="🔴 Сложный", callback_data="wordle_difficulty_hard"),
+            InlineKeyboardButton(text="⚫ Экспертный", callback_data="wordle_difficulty_expert")
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="game_back_to_menu")]
+    ])
+
+
+async def cmd_wordle(msg: Message):
+    if not check_access(msg.from_user.id, msg.chat.id, 'wordle', 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    parts = msg.text.split()
+    if len(parts) == 1:
+        await msg.answer(get_wordle_menu_text(), reply_markup=get_wordle_menu_keyboard())
+        return
+
+    if len(parts) > 1 and parts[1].lower() == 'exit':
+        if wordle.exit_chat_game(msg.chat.id):
+            await msg.answer("❌ Вы вышли из игры Wordle.")
+        else:
+            await msg.answer("❌ В этом чате нет активной игры.")
+        return
+
+    # Админ-команда: !wordle stop
+    if len(parts) > 1 and parts[1].lower() == 'stop':
+        is_admin = storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) >= 1
+        if not is_admin:
+            await msg.answer("❌ Только администраторы могут остановить игру.")
+            return
+        if wordle.exit_chat_game(msg.chat.id):
+            await msg.answer("⏹️ Администратор остановил игру Wordle.")
+        else:
+            await msg.answer("❌ В этом чате нет активной игры.")
+        return
+
+    length = 5
+    attempts = 6
+    difficulty = 'medium'
+    arguments = parts[1:]
+    difficulty_tokens = {'лёгкий', 'легкий', 'легкая', 'лёгкая', 'easy', "легко",
+                         'средний', 'средняя', 'medium', 'сложный', 'сложная', 'hard',
+                         'эксперт', 'экспертный', 'экспертная', 'expert'}
+    difficulty_argument = next((item for item in arguments if item.lower() in difficulty_tokens), None)
+    if difficulty_argument:
+        difficulty = wordle.normalize_difficulty(difficulty_argument.lower())
+        arguments.remove(difficulty_argument)
+
+    numeric_arguments = [item for item in arguments if item.isdigit()]
+    if numeric_arguments:
+        length = int(numeric_arguments[0])
+        if length < 4 or length > 6:
+            return await msg.answer("❌ Длина слова должна быть от 4 до 6.")
+    if len(numeric_arguments) > 1:
+        attempts = int(numeric_arguments[1])
+        if attempts < 4 or attempts > 6:
+            return await msg.answer("❌ Количество попыток должно быть от 4 до 6.")
+
+    success, response = wordle.start_chat_game(
+        msg.chat.id, msg.from_user.id, length, attempts, difficulty
+    )
+    game_msg = await msg.answer(response)
+    if success:
+        wordle.set_game_message(msg.from_user.id, msg.chat.id, game_msg.message_id)
 
 # ==================== ОБРАБОТЧИК ВСЕХ ИГРОВЫХ CALLBACK'ОВ ====================
 
 @router.callback_query(lambda c: c.data and c.data.startswith('game_'))
 async def game_menu_handler(call: CallbackQuery):
-    """Обработчик кнопок главного меню"""
     action = call.data
 
     if action == "game_rps_bot":
@@ -3826,6 +6270,11 @@ async def game_menu_handler(call: CallbackQuery):
             "🎮 <b>Крестики-Нолики</b>\n\nВыберите режим:",
             reply_markup=kb
         )
+    elif action == "game_wordle":
+        await call.message.edit_text(
+            get_wordle_menu_text(),
+            reply_markup=get_wordle_menu_keyboard()
+        )
     elif action == "game_back_to_menu":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -3833,7 +6282,8 @@ async def game_menu_handler(call: CallbackQuery):
                 InlineKeyboardButton(text="🤝 КНБ (с игроком)", callback_data="game_rps_player")
             ],
             [
-                InlineKeyboardButton(text="❌ Крестики-Нолики", callback_data="game_ttt_menu")
+                InlineKeyboardButton(text="❌ Крестики-Нолики", callback_data="game_ttt_menu"),
+                InlineKeyboardButton(text="🎲 Wordle", callback_data="game_wordle")
             ],
             [
                 InlineKeyboardButton(text="❌ Закрыть", callback_data="game_cancel")
@@ -3855,6 +6305,28 @@ async def game_menu_handler(call: CallbackQuery):
             pending_challenges.pop(cid, None)
         await call.message.edit_text("❌ Вызов отменён", reply_markup=None)
 
+    await call.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith('wordle_difficulty_'))
+async def wordle_difficulty_handler(call: CallbackQuery):
+    difficulty = call.data.replace('wordle_difficulty_', '')
+    difficulty_name = wordle.DIFFICULTY_NAMES.get(difficulty)
+    if not difficulty_name:
+        await call.answer("❌ Неизвестная сложность", show_alert=True)
+        return
+
+    success, response = wordle.start_chat_game(
+        call.message.chat.id,
+        call.from_user.id,
+        DEFAULT_WORDLE_LENGTH,
+        DEFAULT_WORDLE_ATTEMPTS,
+        difficulty,
+    )
+    game_msg = await call.message.answer(response)
+    if success:
+        wordle.set_game_message(call.from_user.id, call.message.chat.id, game_msg.message_id)
+        await call.message.delete()
     await call.answer()
 
 
@@ -4035,7 +6507,8 @@ async def start_rps_duel(call: CallbackQuery, challenge: dict):
         'players': [p1, p2],
         'choices': {},
         'chat_id': call.message.chat.id,
-        'message_id': call.message.message_id
+        'message_id': call.message.message_id,
+        'started_at': time.time()
     }
 
     await call.message.edit_text(
@@ -4145,7 +6618,8 @@ async def start_ttt_bot(call: CallbackQuery):
         'board': board,
         'current': 'player',
         'status': 'active',
-        'chat_id': call.message.chat.id
+        'chat_id': call.message.chat.id,
+        'started_at': time.time()
     }
 
     await draw_ttt_board(call.message, game_id, "🎮 Крестики-Нолики с ботом\nВаш ход:")
@@ -4434,7 +6908,8 @@ async def start_ttt_duel(call: CallbackQuery, challenge: dict):
         'board': board,
         'current': p1,
         'status': 'active',
-        'chat_id': call.message.chat.id
+        'chat_id': call.message.chat.id,
+        'started_at': time.time()
     }
 
     await draw_ttt_board(call.message, game_id,
@@ -4446,14 +6921,22 @@ async def start_ttt_duel(call: CallbackQuery, challenge: dict):
 
 @router.callback_query(lambda c: c.data and c.data.startswith('tttexit_'))
 async def ttt_exit_handler(call: CallbackQuery):
-    """Выход из игры"""
+    """Завершает игру только по запросу одного из её участников."""
     game_id = '_'.join(call.data.split('_')[1:])
-    game = active_games.pop(game_id, None)
+    game = active_games.get(game_id)
+    if not game:
+        await call.answer("❌ Игра уже завершена.", show_alert=True)
+        return
+    players = game.get('players', [])
+    player = game.get('player')
+    if call.from_user.id not in players and call.from_user.id != player:
+        await call.answer("❌ Выйти из этой игры может только её участник.", show_alert=True)
+        return
 
-    if game:
-        game['status'] = 'finished'
-
-    await call.message.edit_text("❌ Вы вышли из игры", reply_markup=None)
+    active_games.pop(game_id, None)
+    game['status'] = 'finished'
+    if call.message:
+        await call.message.edit_text("❌ Игра завершена по запросу участника.", reply_markup=None)
     await call.answer()
 
 
@@ -4554,10 +7037,7 @@ async def cmd_rps(msg: Message, cmd_name: str = 'кнб'):
     save_activity(msg.chat.id, msg.from_user.id, 'games')
 
     text = msg.text.strip()
-    for prefix in ['!']:
-        if text.startswith(prefix):
-            text = text[1:].strip()
-            break
+    text = strip_command_prefix(text, msg.chat.id)
 
     for cmd_word in ['кнб', 'кнб бот', 'камень ножницы бумага']:
         if text.lower().startswith(cmd_word):
@@ -4714,6 +7194,44 @@ async def poll_vote_handler(call: CallbackQuery):
 
 # ==================== Интеграции ====================
 
+async def cmd_time(msg: Message, region: str = '', cmd_name: str = 'время'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    try:
+        region_name, region_timezone = resolve_time_region(region)
+    except (ZoneInfoNotFoundError, ValueError):
+        try:
+            lookup_result = await lookup_time_region(region)
+        except (ImportError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Не удалось определить время для региона %r: %s", region, exc)
+            await msg.answer("❌ Не удалось получить время для региона. Попробуй ещё раз позже.")
+            return
+        if lookup_result is None:
+            await msg.answer(
+                "❌ Регион не найден. Укажи название города, например "
+                "<code>!время Токио</code> или <code>!время Нью-Йорк</code>."
+            )
+            return
+        region_name, local_time, offset = lookup_result
+    else:
+        local_time = datetime.now(region_timezone)
+        offset = local_time.utcoffset()
+
+    if offset is None:
+        raise ValueError(f"Часовой пояс региона {region_name!r} не имеет UTC-смещения")
+    offset_minutes = int(offset.total_seconds() // 60)
+    offset_sign = '+' if offset_minutes >= 0 else '-'
+    offset_hours, offset_minutes = divmod(abs(offset_minutes), 60)
+    gmt_offset = f"GMT{offset_sign}{offset_hours:02d}:{offset_minutes:02d}"
+
+    await msg.answer(
+        f"🕒 Время в <b>{html.escape(region_name, quote=False)}</b>:\n"
+        f"📅 {local_time.strftime('%d.%m.%Y %H:%M')} ({gmt_offset})"
+    )
+
+
 async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
     """Погода через Open-Meteo (с редактированием сообщения)"""
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
@@ -4721,7 +7239,8 @@ async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     parts = msg.text.split(maxsplit=1)
-    city = parts[1].strip() if len(parts) > 1 else 'Moscow'
+    city = parts[1].strip() if len(parts) > 1 else 'Калининград'
+    safe_city = html.escape(city, quote=False)
 
     # Отправляем сообщение "Ищу погоду..."
     status_msg = await msg.answer("🌤️ <i>Ищу погоду...</i>")
@@ -4738,17 +7257,18 @@ async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
             'format': 'json'
         }
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             # Поиск города
             async with session.get(geo_url, params=params) as resp:
                 if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Город '{city}' не найден")
+                    await status_msg.edit_text(f"❌ Город '{safe_city}' не найден")
                     return
 
                 geo_data = await resp.json()
 
             if not geo_data.get('results'):
-                await status_msg.edit_text(f"❌ Город '{city}' не найден")
+                await status_msg.edit_text(f"❌ Город '{safe_city}' не найден")
                 return
 
             location = geo_data['results'][0]
@@ -4756,23 +7276,31 @@ async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
             lon = location['longitude']
             city_name = location.get('name', city)
             country = location.get('country', '')
+            safe_city_name = html.escape(str(city_name), quote=False)
+            safe_country = html.escape(str(country), quote=False)
 
             # Обновляем статус
-            await status_msg.edit_text(f"🌤️ <i>Получаю погоду для {city_name}...</i>")
+            await status_msg.edit_text(f"🌤️ <i>Получаю погоду для {safe_city_name}...</i>")
 
             # Получаем погоду
             weather_url = "https://api.open-meteo.com/v1/forecast"
             weather_params = {
                 'latitude': lat,
                 'longitude': lon,
-                'current': 'temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,pressure_msl',
+                'current': 'temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,precipitation,rain,snowfall,uv_index',
+                'daily': 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,sunrise,sunset,uv_index_max',
+                'forecast_days': 3,
                 'timezone': 'auto'
             }
 
             async with session.get(weather_url, params=weather_params) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text("❌ Сервис погоды временно недоступен")
+                    return
                 weather_data = await resp.json()
 
         current = weather_data['current']
+        daily = weather_data.get('daily', {})
 
         # Коды погоды
         weather_codes = {
@@ -4816,16 +7344,49 @@ async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
 
         # Давление
         pressure = current.get('pressure_msl', 0)
+        precipitation = current.get('precipitation', 0)
+        rain = current.get('rain', 0)
+        snowfall = current.get('snowfall', 0)
+        gusts = current.get('wind_gusts_10m', 0)
+        uv_index = current.get('uv_index', 0)
+
+        def format_clock(value: str) -> str:
+            return value.split('T')[-1][:5] if value else '--:--'
+
+        forecast_lines = []
+        forecast_dates = daily.get('time', [])
+        for index, forecast_date in enumerate(forecast_dates):
+            forecast_code = daily.get('weather_code', [])[index]
+            forecast_emoji, _ = weather_codes.get(forecast_code, ('🌡️', 'Неизвестно'))
+            forecast_min = daily.get('temperature_2m_min', [])[index]
+            forecast_max = daily.get('temperature_2m_max', [])[index]
+            forecast_probability = daily.get('precipitation_probability_max', [])[index]
+            forecast_sum = daily.get('precipitation_sum', [])[index]
+            day_label = 'сегодня' if index == 0 else 'завтра' if index == 1 else forecast_date[5:]
+            forecast_lines.append(
+                f"{forecast_emoji} <b>{day_label}</b>: {forecast_min:.0f}...{forecast_max:.0f}°C, "
+                f"осадки {forecast_probability}%, {forecast_sum:.1f} мм"
+            )
 
         # Формируем ответ
         text = (
-            f"{emoji} <b>Погода в {city_name}{', ' + country if country else ''}</b>\n\n"
-            f"🌡️ <b>Температура:</b> {current['temperature_2m']}°C\n"
-            f"🤔 <b>Ощущается:</b> {current['apparent_temperature']}°C\n"
-            f"📝 <b>Описание:</b> {description}\n"
-            f"💧 <b>Влажность:</b> {current['relative_humidity_2m']}%\n"
-            f"💨 <b>Ветер:</b> {current['wind_speed_10m']} км/ч {wind_dir_text}\n"
-            f"🔵 <b>Давление:</b> {pressure:.0f} гПа"
+            f"{emoji} <b>Погода — {safe_city_name}{', ' + safe_country if safe_country else ''}</b>\n"
+            f"{UI_LINE}\n"
+            f"🌡 Температура: <b>{current['temperature_2m']}°C</b>\n"
+            f"🤔 Ощущается: <b>{current['apparent_temperature']}°C</b>\n"
+            f"📝 Описание: <b>{description}</b>\n"
+            f"💧 Влажность: <b>{current['relative_humidity_2m']}%</b>\n"
+            f"💨 Ветер: <b>{current['wind_speed_10m']} км/ч {wind_dir_text}</b>\n"
+            f"💨 Порывы: <b>до {gusts} км/ч</b>\n"
+            f"🌧 Осадки сейчас: <b>{precipitation:.1f} мм</b>"
+            f"{f' (дождь {rain:.1f} мм)' if rain else ''}"
+            f"{f' (снег {snowfall:.1f} мм)' if snowfall else ''}\n"
+            f"☀️ UV-индекс: <b>{uv_index:.1f}</b>\n"
+            f"🔵 Давление: <b>{pressure:.0f} гПа</b>\n"
+            f"🌅 Восход: <b>{format_clock(daily.get('sunrise', [''])[0])}</b>  "
+            f"🌇 Закат: <b>{format_clock(daily.get('sunset', [''])[0])}</b>\n\n"
+            f"📅 <b>Прогноз на 3 дня</b>\n"
+            + "\n".join(forecast_lines)
         )
 
         # Редактируем сообщение
@@ -4837,90 +7398,401 @@ async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
         await status_msg.edit_text("⏳ Таймаут. Попробуйте позже.")
     except Exception as e:
         logger.error(f"Ошибка погоды: {e}")
-        await status_msg.edit_text(f"❌ Не удалось получить погоду для '{city}'")
+        await status_msg.edit_text(f"❌ Не удалось получить погоду для '{safe_city}'")
 
 
 async def cmd_random_joke(msg: Message, cmd_name: str = 'шутка'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            try:
-                url = f"http://rzhunemogu.ru/RandJSON.aspx?CType=1&{random.randint(1, 100000)}"
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        match = re.search(r'"content":"([^"]+)"', text)
-                        if match:
-                            joke = match.group(1).replace('\\n', '\n').replace('\\"', '"')
-                            if len(joke) > 5:
-                                return await msg.answer(f"😂 <b>Анекдот:</b>\n\n{joke}")
-            except:
-                pass
-            async with session.get('https://v2.jokeapi.dev/joke/Any?type=single') as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    joke = data.get('joke', '') or f"{data.get('setup', '')}\n\n{data.get('delivery', '')}"
-                    return await msg.answer(f"😂 <b>Шутка:</b>\n\n{joke}")
-            return await msg.answer("❌ Не удалось получить шутку")
-    except:
-        await msg.answer("❌ Ошибка")
+    local_jokes = [
+        "Я хотел рассказать шутку про уборку, но она пока лежит в черновиках.",
+        "Мой будильник звонит так убедительно, что я каждый раз откладываю жизнь ещё на пять минут.",
+        "Диалог с холодильником всегда заканчивается одинаково: он молчит, а я снова что-нибудь беру.",
+        "Взрослая жизнь — это когда список дел длиннее, чем список причин всё отложить.",
+        "Я не ленивый. Я просто экономлю энергию до действительно важного момента.",
+    ]
+    joke = html.escape(random.choice(local_jokes), quote=False)
+    return await msg.answer(f"😂 <b>Шутка:</b>\n\n{joke}")
+
+
+async def cmd_ship(msg: Message, cmd_name: str = 'шиперим'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    chat_users = storage.data.get('users', {}).get(str(msg.chat.id), {})
+    user_ids = []
+    for user_id, user_data in chat_users.items():
+        if not isinstance(user_data, dict):
+            continue
+        try:
+            parsed_user_id = int(user_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_user_id > 0:
+            user_ids.append(parsed_user_id)
+
+    if len(user_ids) < 2:
+        return await msg.answer(
+            "💔 Пока не с кем шиперить: боту нужно узнать хотя бы двух участников чата."
+        )
+
+    first_id, second_id = random.sample(user_ids, 2)
+    first = mention(msg.chat.id, first_id)
+    second = mention(msg.chat.id, second_id)
+    ship_texts = [
+        f"💘 Кажется, между {first} и {second} пробежала искра! Или это просто статическое электричество.",
+        f"🎬 {first} и {second} — главные герои нового сериала «Случайно оказались в одном чате».",
+        f"🧲 Магнитное поле чата тянет {first} и {second} друг к другу. Учёные пока не вмешиваются.",
+        f"🍿 {first} + {second}: чат уже запасся попкорном и ждёт продолжения.",
+        f"🔮 Хрустальный шар предсказал: {first} и {second} однажды одновременно напишут «привет». Романтика!",
+        f"🎵 Для пары {first} и {second} уже играет музыка. Правда, похоже, у кого-то включён микрофон.",
+        f"🕵️ Детектив чата выяснил: {first} и {second} подозрительно хорошо смотрятся в одном сообщении.",
+        f"📚 История {first} и {second} начинается с фразы: «А кто это тут у нас?»",
+        f"💌 Купидон прицелился в {first} и {second}, но отвлёкся на уведомление.",
+        f"🌟 Совместимость {first} и {second} проверена: вместе они создают отличную активность в чате!",
+        f"🧪 Формула дня: {first} + {second} = химия. Химик ушёл за реактивами, так что это пока гипотеза.",
+        f"🛳️ Корабль «{first} × {second}» отправляется в плавание! Спасательные круги — в закрепе.",
+        f"🤝 {first} и {second} сегодня назначены самой неожиданной парой чата. Возражения принимаются у купидона.",
+        f"🎲 Случай выбрал {first} и {second}. Даже кубик намекает: пора хотя бы поздороваться!",
+        f"💫 Если бы у чата был романтический постер, на нём сегодня были бы {first} и {second}.",
+    ]
+    await msg.answer(random.choice(ship_texts), disable_web_page_preview=True)
+
+
+@lru_cache(maxsize=1)
+def load_uk_rf_articles() -> List[Dict[str, str]]:
+    with UK_RF_ARTICLES_FILE.open(encoding='utf-8') as articles_file:
+        article_data = json.load(articles_file)
+
+    if not isinstance(article_data, dict) or not isinstance(article_data.get('articles'), list):
+        raise ValueError(f'Некорректный формат файла статей УК РФ: {UK_RF_ARTICLES_FILE}')
+    articles = article_data['articles']
+    if not articles or any(
+        not isinstance(article, dict)
+        or not isinstance(article.get('number'), str)
+        or not isinstance(article.get('title'), str)
+        or not article['title'].strip()
+        for article in articles
+    ):
+        raise ValueError(f'В файле статей УК РФ есть некорректные записи: {UK_RF_ARTICLES_FILE}')
+    return articles
+
+
+async def cmd_my_article(msg: Message, cmd_name: str = 'моя статья'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    articles = load_uk_rf_articles()
+    today = datetime.now().date().isoformat()
+    user = storage.get_user(msg.chat.id, msg.from_user.id, use_cache=False)
+    state = user.get('my_article_state')
+    article_by_number = {item['number']: item for item in articles}
+
+    article_number = state.get('article_number') if isinstance(state, dict) else None
+    article = (
+        article_by_number.get(article_number)
+        if isinstance(state, dict) and state.get('date') == today and isinstance(article_number, str)
+        else None
+    )
+    if article is None:
+        used_numbers = state.get('used_numbers', []) if isinstance(state, dict) else []
+        if not isinstance(used_numbers, list):
+            used_numbers = []
+        used_numbers = list(dict.fromkeys(
+            number for number in used_numbers if isinstance(number, str) and number in article_by_number
+        ))
+
+        if len(used_numbers) >= len(articles):
+            previous_number = article_number
+            used_numbers = []
+            available_articles = [
+                item for item in articles if item['number'] != previous_number
+            ] or articles
+        else:
+            used_set = set(used_numbers)
+            available_articles = [item for item in articles if item['number'] not in used_set]
+
+        article = random.choice(available_articles)
+        used_numbers.append(article['number'])
+        user['my_article_state'] = {
+            'date': today,
+            'article_number': article['number'],
+            'used_numbers': used_numbers,
+        }
+        storage.invalidate_user_cache(msg.chat.id, msg.from_user.id)
+        storage.mark_dirty()
+        await storage.save()
+
+    target = mention(msg.chat.id, msg.from_user.id)
+    verdict_openings = [
+        f"Сегодня {target} приговаривается к",
+        f"По решению суда чата сегодня {target} приговаривается к",
+        f"После короткого заседания сегодня {target} приговаривается к",
+        f"В этот судьбоносный день {target} приговаривается к",
+        f"Народный суд постановил: сегодня {target} приговаривается к",
+        f"Коллегия присяжных решила: сегодня {target} приговаривается к",
+        f"Из зала суда сообщают: сегодня {target} приговаривается к",
+        f"После тщательного изучения переписки {target} сегодня приговаривается к",
+        f"Суд чата огласил вердикт: сегодня {target} приговаривается к",
+        f"По итогам народного голосования {target} сегодня приговаривается к",
+        f"Верховный чат постановил: сегодня {target} приговаривается к",
+        f"Судья вынес решение: сегодня {target} приговаривается к",
+        f"После совещания судей чата {target} сегодня приговаривается к",
+        f"Судебное заседание завершено: сегодня {target} приговаривается к",
+        f"Вердикт дня уже готов: сегодня {target} приговаривается к",
+    ]
+    opening = random.choice(verdict_openings)
+    await msg.answer(
+        f"📜 <b>Приговор дня</b>\n\n"
+        f"{opening} "
+        f"статье <b>{html.escape(article['number'], quote=False)}</b> — "
+        f"{html.escape(article['title'], quote=False)}.",
+        disable_web_page_preview=True,
+    )
+
+
+VALERA_CHANCE_TEMPLATES = (
+    '🐻 Шанс на «{question}» — {chance}%.',
+    '🔮 Валера прикинул: «{question}» случится с вероятностью {chance}%.',
+    '📊 По медвежьим расчётам, шанс на «{question}» составляет {chance}%.',
+    '🎲 Валера бросил воображаемый кубик: шанс на «{question}» — {chance}%.',
+    '🧪 Лаборатория желейной вероятности оценивает «{question}» в {chance}%.',
+    '🌟 Звёзды шепчут, что вероятность «{question}» — {chance}%.',
+    '🍯 После консультации с мёдом Валера даёт «{question}» шанс {chance}%.',
+    '🧸 Медвежий прогноз: «{question}» может произойти с шансом {chance}%.',
+    '📈 Индекс Валеры для события «{question}» — {chance}%.',
+    '🤔 Валера долго думал и постановил: шанс «{question}» равен {chance}%.',
+    '🎯 Попадание в событие «{question}» оценивается в {chance}%.',
+    '🌀 По версии желейной интуиции, вероятность «{question}» — {chance}%.',
+    '📜 Валера вынес вердикт: «{question}» — шанс {chance}%.',
+    '🐾 Следы ведут к вероятности {chance}% для события «{question}».',
+    '✨ Предсказание готово: шанс, что «{question}», составляет {chance}%.',
+)
+
+VALERA_MENU_TEXT = (
+    '🐻 <b>Валера на связи!</b>\n\n'
+    'Вызвать можно командами <code>!валера</code>, <code>!валерка</code> или '
+    '<code>!валерианыч</code>.\n\n'
+    'Выбери функцию, чтобы узнать, как ей пользоваться:'
+)
+
+
+def valera_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎲 Бросить кубик", callback_data="valera_help_dice"),
+            InlineKeyboardButton(text="🔮 Шанс события", callback_data="valera_help_chance"),
+        ],
+        [InlineKeyboardButton(text="🎱 Шар гадания", callback_data="valera_help_ball")],
+        [
+            InlineKeyboardButton(text="🪙 Монетка", callback_data="valera_help_coin"),
+            InlineKeyboardButton(text="🎯 Выбор", callback_data="valera_help_choice"),
+        ],
+        [InlineKeyboardButton(text="💞 Совместимость", callback_data="valera_help_compatibility")],
+    ])
+
+
+@router.callback_query(F.data.startswith('valera_help_'))
+async def valera_help_callback(call: CallbackQuery):
+    action = call.data.replace('valera_help_', '', 1)
+    if action == 'menu':
+        await call.message.edit_text(VALERA_MENU_TEXT, reply_markup=valera_menu_keyboard())
+        await call.answer()
+        return
+    if action == 'dice':
+        text = (
+            '🎲 <b>Бросок кубика</b>\n\n'
+            'Нажми команду, чтобы бот отправил настоящий кубик Telegram:\n'
+            '<code>!валера кубик</code>\n\n'
+            'Также работают варианты <code>кость</code> и <code>кинь кубик</code>. '
+            'Сообщение с командой бот удалит после броска.'
+        )
+    elif action == 'chance':
+        text = (
+            '🔮 <b>Шанс события</b>\n\n'
+            'Добавь после команды событие, и Валера оценит его шуточную вероятность '
+            'от 0 до 100% одной из 15 случайных фраз:\n'
+            '<code>!валера инфо я сегодня съем гамбургер</code>\n\n'
+            'Короткий вариант:\n'
+            '<code>!валера вопрос я сегодня съем гамбургер</code>'
+        )
+    elif action == 'ball':
+        text = (
+            '🎱 <b>Шар гадания</b>\n\n'
+            'Задай вопрос после слова «шар», и Валера ответит случайной фразой '
+            'магического шара:\n'
+            '<code>!валера шар я крутой?</code>\n\n'
+            'Можно также написать <code>гадание</code> или '
+            '<code>шар гадания</code>. Функция работает с алиасами '
+            '<code>!валерка</code> и <code>!валерианыч</code> тоже.'
+        )
+    elif action == 'coin':
+        text = (
+            '🪙 <b>Монетка</b>\n\n'
+            'Введи команду, и Валера случайно выберет орла или решку:\n'
+            '<code>!валера монетка</code>\n\n'
+            'Также работают команды <code>монета</code> и <code>монету</code>.'
+        )
+    elif action == 'choice':
+        text = (
+            '🎯 <b>Случайный выбор</b>\n\n'
+            'Перечисли варианты через «или», вертикальную черту или запятую — '
+            'Валера случайно выберет один:\n'
+            '<code>!валера выбор пицца или суши</code>\n'
+            '<code>!валера выбор гулять | смотреть кино</code>'
+        )
+    elif action == 'compatibility':
+        text = (
+            '💞 <b>Совместимость</b>\n\n'
+            'Напиши имена или описание пары, и Валера выдаст шуточный процент '
+            'совместимости от 0 до 100:\n'
+            '<code>!валера совместимость я и Вася</code>'
+        )
+    else:
+        await call.answer('Неизвестная функция', show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К функциям", callback_data="valera_help_menu")],
+    ])
+    await call.message.edit_text(text, reply_markup=keyboard)
+    await call.answer()
 
 
 async def cmd_iris(msg: Message, cmd_name: str = 'валера'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
         return
-    query = re.sub(r'^\S+\s*', '', msg.text, count=1).strip().lower()
-    responses = {'характер': '🐻 Я обкуренный желейный медведь-помощник!', 'версия': '🐻 Обкуренный Валера v3.0',
-                 'помощь': 'Используйте !помощь'}
-    for key, resp in responses.items():
-        if key in query:
-            return await msg.answer(resp)
-    await msg.answer("🐻 Спросите: характер, версия, помощь")
+    command_text = strip_command_prefix(msg.text or '', msg.chat.id)
+    query = command_text[len(cmd_name):].strip()
+    normalized_query = query.casefold()
 
-
-async def cmd_report(msg: Message, cmd_name: str = 'репорт'):
-    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
-        return
-    parts = msg.text.split(maxsplit=1)
-    reason = parts[1] if len(parts) > 1 else 'Не указана'
-    text = f"🚨 <b>Репорт</b>\n👤 {mention(msg.chat.id, msg.from_user.id)}\n💬 {msg.chat.title}\n📝 {reason}"
-
-    recipients = {MAIN_ADMIN_ID}
-    for uid, d in storage.data['users'].get(str(msg.chat.id), {}).items():
-        if d.get('rank', 0) >= 1:
-            recipients.add(int(uid))
-
-    sent = 0
-    for admin_id in recipients:
+    if normalized_query in {'кость', 'кубик', 'кинь кубик'}:
+        await msg.answer_dice(emoji='🎲')
         try:
-            await bot.send_message(
-                admin_id,
-                text,
-                disable_web_page_preview=True,
-                parse_mode=ParseMode.HTML
-            )
-            sent += 1
+            await msg.delete()
         except Exception:
-            continue
+            logger.debug("Не удалось удалить команду броска кубика", exc_info=True)
+        return
 
-    if sent == 0:
-        return await msg.answer("❌ Ошибка: не удалось отправить репорт ни одному админу")
+    if normalized_query in {'монетка', 'монета', 'монету'}:
+        await msg.answer('🪙')
+        try:
+            await msg.delete()
+        except Exception:
+            logger.debug("Не удалось удалить команду броска монетки", exc_info=True)
+        return
 
-    storage.get_user(msg.chat.id, msg.from_user.id)['reports_sent'] = storage.get_user(msg.chat.id,
-                                                                                       msg.from_user.id).get(
-        'reports_sent', 0) + 1
-    storage.mark_dirty()
-    await storage.save()
-    await msg.answer("✅ Отправлено")
+    choice_prefixes = ('выбор', 'выбери')
+    choice_prefix = next(
+        (prefix for prefix in choice_prefixes
+         if normalized_query == prefix or normalized_query.startswith(prefix + ' ')),
+        None,
+    )
+    if choice_prefix:
+        options_text = query[len(choice_prefix):].strip()
+        options = [
+            option.strip()
+            for option in re.split(r'\s+или\s+|\s*\|\s*|,\s*', options_text, flags=re.IGNORECASE)
+            if option.strip()
+        ]
+        if len(options) < 2:
+            return await msg.answer(
+                '🎯 Укажи хотя бы два варианта, например: '
+                '<code>!валера выбор пицца или суши</code>'
+            )
+        selected = html.escape(random.choice(options), quote=False)
+        return await msg.answer(f'🎯 Валера выбирает: <b>{selected}</b>!')
+
+    compatibility_prefix = 'совместимость'
+    if normalized_query == compatibility_prefix or normalized_query.startswith(compatibility_prefix + ' '):
+        pair = query[len(compatibility_prefix):].strip()
+        if not pair:
+            return await msg.answer(
+                '💞 Напиши, для кого посчитать совместимость, например: '
+                '<code>!валера совместимость я и Вася</code>'
+            )
+        safe_pair = html.escape(pair, quote=False)
+        percent = random.randint(0, 100)
+        return await msg.answer(
+            f'💞 Совместимость «{safe_pair}» — <b>{percent}%</b>!\n'
+            f'{random.choice(("Любовь витает в воздухе!", "Звёзды одобряют!", "Валера верит в эту пару!", "Всё зависит от вас двоих!"))}'
+        )
+
+    ball_prefixes = ('шар гадания', 'шар', 'гадание', 'погадай')
+    ball_prefix = next(
+        (prefix for prefix in ball_prefixes
+         if normalized_query == prefix or normalized_query.startswith(prefix + ' ')),
+        None,
+    )
+    if ball_prefix:
+        fortune_question = query[len(ball_prefix):].strip()
+        if not fortune_question:
+            return await msg.answer(
+                '🎱 Задай вопрос после слова «шар», например: '
+                '<code>!валера шар я крутой?</code>'
+            )
+        ball_answers = (
+            'Бесспорно.',
+            'Это предрешено.',
+            'Никаких сомнений.',
+            'Определённо да.',
+            'Можешь быть уверен.',
+            'Мне кажется — да.',
+            'Скорее всего.',
+            'Знаки говорят — да.',
+            'Ответ туманный, попробуй позже.',
+            'Спроси ещё раз.',
+            'Пока неясно.',
+            'Сейчас лучше не предсказывать.',
+            'Даже шар затрудняется ответить.',
+            'Не рассчитывай на это.',
+            'Мой ответ — нет.',
+            'Перспективы не очень.',
+            'Весьма сомнительно.',
+            'Шар говорит: «Лучше спроси после мёда».',
+            'Судя по всему — да, но шар может ошибаться.',
+            'Вероятность высока, но решать тебе.',
+        )
+        safe_question = html.escape(fortune_question, quote=False)
+        answer = random.choice(ball_answers)
+        return await msg.answer(
+            f'🎱 <b>Шар гадания</b>\n'
+            f'❔ «{safe_question}»\n'
+            f'🔮 {answer}'
+        )
+
+    question = None
+    if cmd_name.endswith(' вопрос'):
+        question = query
+    elif normalized_query == 'инфо' or normalized_query.startswith('инфо '):
+        question = query[len('инфо'):].strip()
+    elif normalized_query == 'вопрос' or normalized_query.startswith('вопрос '):
+        question = query[len('вопрос'):].strip()
+
+    if question is not None:
+        if not question:
+            return await msg.answer(
+                '💬 Напиши событие для оценки, например: '
+                '<code>!валера инфо я сегодня съем гамбургер</code> '
+                'или <code>!валера вопрос я сегодня съем гамбургер</code>'
+            )
+        safe_question = html.escape(question, quote=False)
+        chance = random.randint(0, 100)
+        template = random.choice(VALERA_CHANCE_TEMPLATES)
+        return await msg.answer(template.format(question=safe_question, chance=chance))
+
+    await msg.answer(VALERA_MENU_TEXT, reply_markup=valera_menu_keyboard())
 
 
 # ==================== Ранги ====================
 
 async def cmd_promote(msg: Message, cmd_name: str = 'повысить'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    if not await require_telegram_admin(msg):
+        return
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return await msg.answer("❌ Недостаточно прав!")
 
@@ -4936,16 +7808,28 @@ async def cmd_promote(msg: Message, cmd_name: str = 'повысить'):
     else:
         if len(parts) < 2:
             return await msg.answer("❌ <code>повысить @user 3</code> или ответом")
+        target_mention = get_target_mention_span(msg, parts[1])
         tid = await get_target(msg, parts[1])
         if not tid:
             return await msg.answer("❌ Пользователь не найден")
-        if len(parts) > 2:
+        if target_mention:
+            trailing = msg.text[target_mention[2]:].strip().split()
+            if trailing:
+                rank_arg = trailing[0]
+        elif len(parts) > 2:
             rank_arg = parts[2]
 
     if not tid:
         return await msg.answer("❌ Пользователь не найден")
 
+    chat_owner = storage.data.get('chat_owners', {}).get(str(msg.chat.id), {})
+    if isinstance(chat_owner, dict) and chat_owner.get('user_id') == tid:
+        return await msg.answer("❌ Нельзя изменить ранг владельца чата.")
+
     current = storage.get_user(msg.chat.id, tid).get('rank', 0)
+    actor_rank = storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0)
+    if tid == msg.from_user.id or current >= actor_rank:
+        return await msg.answer("❌ Нельзя менять свой ранг или ранг равного/старшего администратора.")
     try:
         if rank_arg and rank_arg.startswith('+'):
             new_rank = current + int(rank_arg[1:])
@@ -4960,6 +7844,8 @@ async def cmd_promote(msg: Message, cmd_name: str = 'повысить'):
 
     if new_rank < 0 or new_rank > MAX_RANK:
         return await msg.answer(f"❌ Ранг 0-{MAX_RANK}")
+    if new_rank >= actor_rank:
+        return await msg.answer("❌ Нельзя назначить ранг, равный вашему или выше.")
 
     storage.get_user(msg.chat.id, tid)['rank'] = new_rank
     storage.mark_dirty()
@@ -4970,6 +7856,8 @@ async def cmd_promote(msg: Message, cmd_name: str = 'повысить'):
 
 async def cmd_demote(msg: Message, cmd_name: str = 'понизить'):
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    if not await require_telegram_admin(msg):
+        return
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return await msg.answer("❌ Недостаточно прав!")
 
@@ -4985,14 +7873,26 @@ async def cmd_demote(msg: Message, cmd_name: str = 'понизить'):
     else:
         if len(parts) < 2:
             return await msg.answer("❌ <code>понизить @user</code> или ответом")
+        target_mention = get_target_mention_span(msg, parts[1])
         tid = await get_target(msg, parts[1])
-        if len(parts) > 2:
+        if target_mention:
+            trailing = msg.text[target_mention[2]:].strip().split()
+            if trailing:
+                rank_arg = trailing[0]
+        elif len(parts) > 2:
             rank_arg = parts[2]
 
     if not tid:
         return await msg.answer("❌ <code>понизить @user</code> или ответом")
 
+    chat_owner = storage.data.get('chat_owners', {}).get(str(msg.chat.id), {})
+    if isinstance(chat_owner, dict) and chat_owner.get('user_id') == tid:
+        return await msg.answer("❌ Нельзя изменить ранг владельца чата.")
+
     current = storage.get_user(msg.chat.id, tid).get('rank', 0)
+    actor_rank = storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0)
+    if tid == msg.from_user.id or current >= actor_rank:
+        return await msg.answer("❌ Нельзя менять свой ранг или ранг равного/старшего администратора.")
     try:
         if rank_arg and rank_arg.startswith('+'):
             new_rank = current + int(rank_arg[1:])
@@ -5007,6 +7907,8 @@ async def cmd_demote(msg: Message, cmd_name: str = 'понизить'):
 
     if new_rank < 0 or new_rank > MAX_RANK:
         return await msg.answer(f"❌ Ранг 0-{MAX_RANK}")
+    if new_rank >= actor_rank:
+        return await msg.answer("❌ Нельзя назначить ранг, равный вашему или выше.")
 
     storage.get_user(msg.chat.id, tid)['rank'] = new_rank
     storage.mark_dirty()
@@ -5016,6 +7918,32 @@ async def cmd_demote(msg: Message, cmd_name: str = 'понизить'):
 
 
 # ==================== Погоняло и ник ====================
+
+async def _get_native_tag_permissions(chat_id: int, target_id: int) -> Tuple[bool, bool, bool]:
+    """Проверяет, можно ли менять нативные Telegram-теги в этом чате."""
+    try:
+        bot_member = await bot.get_chat_member(chat_id, bot.id)
+        target_member = await bot.get_chat_member(chat_id, target_id)
+    except Exception as e:
+        logger.warning(f"Не удалось проверить права для Telegram-тега в {chat_id}: {e}")
+        return False, False, False
+
+    target_is_admin = target_member.status in ('administrator', 'creator')
+    bot_can_set_title = (
+        bot_member.status == 'creator'
+        or (
+            bot_member.status == 'administrator'
+            and bool(getattr(bot_member, 'can_promote_members', False))
+        )
+    )
+    bot_can_manage_tags = (
+        bot_member.status == 'creator'
+        or (
+            bot_member.status == 'administrator'
+            and bool(getattr(bot_member, 'can_manage_tags', False))
+        )
+    )
+    return target_is_admin, target_is_admin and bot_can_set_title, bot_can_manage_tags
 
 async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
     """Устанавливает/сбрасывает тег пользователя.
@@ -5029,12 +7957,11 @@ async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
 
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
     raw = msg.text.strip()
-    if raw.startswith('!'):
-        raw = raw[1:].strip()
+    raw = strip_command_prefix(raw, msg.chat.id)
 
     args = raw[len(cmd_name):].strip() if raw.lower().startswith(cmd_name.lower()) else raw
     if not args:
-        user_tag = (storage.get_user(msg.chat.id, msg.from_user.id).get('custom_tag') or '').strip()
+        user_tag = html.escape((storage.get_user(msg.chat.id, msg.from_user.id).get('custom_tag') or '').strip(), quote=False)
         return await msg.answer(
             "🏷️ <b>Погоняло</b>\n\n"
             f"Текущий тег: <b>{user_tag or 'не установлен'}</b>\n\n"
@@ -5048,10 +7975,15 @@ async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
     target_id = None
     target_name = None
 
-    if parts and parts[0].startswith('@'):
-        if msg.from_user.id != MAIN_ADMIN_ID and storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) < 1:
-            return await msg.answer("❌ Сменить тег другому человеку могут только администраторы.")
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+        target_name = args.strip()
+        is_other_user = target_id != msg.from_user.id
+    elif parts and parts[0].startswith('@'):
         target_id = await get_target(msg, parts[0])
+        is_other_user = target_id != msg.from_user.id if target_id else True
+        if is_other_user and storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) < 1:
+            return await msg.answer("❌ Сменить тег другому человеку могут только администраторы.")
         if not target_id:
             return await msg.answer("❌ Не удалось найти пользователя.")
         if len(parts) < 2:
@@ -5062,6 +7994,10 @@ async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
     else:
         target_id = msg.from_user.id
         target_name = args.strip()
+        is_other_user = False
+
+    if is_other_user and storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) < 1:
+        return await msg.answer("❌ Сменить тег другому человеку могут только администраторы.")
 
     if target_name.lower() in ('сбросить', 'очистить', 'reset'):
         storage.get_user(msg.chat.id, target_id)['custom_tag'] = ''
@@ -5070,20 +8006,31 @@ async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
         storage.mark_dirty()
         await storage.save()
 
-        try:
-            await bot.set_chat_administrator_custom_title(msg.chat.id, target_id, "")
-        except Exception:
-            pass
+        target_is_admin, can_set_title, bot_can_manage_tags = await _get_native_tag_permissions(msg.chat.id, target_id)
+        if can_set_title:
+            try:
+                await bot.set_chat_administrator_custom_title(msg.chat.id, target_id, "")
+            except Exception:
+                pass
+
+        if target_is_admin:
+            return await msg.answer(
+                "💡 Это админский Telegram-тег. Бот не меняет его напрямую; "
+                "изменяйте вручную через настройки администратора."
+            )
 
         tag_error = None
-        try:
-            await bot.set_chat_member_tag(msg.chat.id, target_id, "")
-        except Exception as e:
-            tag_error = str(e)
-            logger.warning(f"set_chat_member_tag (сброс) не сработал для {target_id} в {msg.chat.id}: {e}")
+        if bot_can_manage_tags:
+            try:
+                await bot.set_chat_member_tag(msg.chat.id, target_id, "")
+            except Exception as e:
+                tag_error = str(e)
+                logger.warning(f"set_chat_member_tag (сброс) не сработал для {target_id} в {msg.chat.id}: {e}")
+        else:
+            return await msg.answer("❌ У бота нет права управления тегами участников Telegram.")
 
         if tag_error:
-            return await msg.answer(f"✅ Тег сброшен.\n⚠️ Видимый тег в Telegram не убран: <code>{html.escape(tag_error)}</code>")
+            return await msg.answer("✅ Тег сброшен.\n⚠️ Видимый тег в Telegram не удалось убрать. Проверьте права бота.")
         return await msg.answer("✅ Тег сброшен.")
 
     text = target_name.strip()
@@ -5091,6 +8038,8 @@ async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
         return await msg.answer("❌ Тег не может быть пустым.")
     if len(text) > MAX_TAG_LENGTH:
         return await msg.answer(f"❌ Слишком длинный тег. Максимум {MAX_TAG_LENGTH} символов.")
+    if len(text) > 16:
+        return await msg.answer("❌ Админский тег Telegram может содержать максимум 16 символов.")
 
     storage.get_user(msg.chat.id, target_id)['custom_tag'] = text
     storage.invalidate_user_cache(msg.chat.id, target_id)
@@ -5098,25 +8047,44 @@ async def cmd_pogonialo(msg: Message, cmd_name: str = 'погоняло'):
     storage.mark_dirty()
     await storage.save()
 
-    try:
-        await bot.set_chat_administrator_custom_title(msg.chat.id, target_id, text)
-    except Exception:
-        pass
+    tag_errors = []
+    target_is_admin, can_set_title, bot_can_manage_tags = await _get_native_tag_permissions(msg.chat.id, target_id)
+    if can_set_title:
+        try:
+            await bot.set_chat_administrator_custom_title(msg.chat.id, target_id, text)
+        except Exception as e:
+            logger.warning(f"set_chat_administrator_custom_title не сработал для {target_id} в {msg.chat.id}: {e}")
 
-    tag_error = None
-    try:
-        await bot.set_chat_member_tag(msg.chat.id, target_id, text[:16])
-    except Exception as e:
-        tag_error = str(e)
-        logger.warning(f"set_chat_member_tag не сработал для {target_id} в {msg.chat.id}: {e}")
+    if target_is_admin:
+        if target_id == msg.from_user.id:
+            result_msg = (
+                "💡 Это админский Telegram-тег. Бот не меняет его напрямую."
+                "\nОткройте список пользователей группы, выберите себя и"
+                " измените админское звание/тег вручную."
+            )
+        else:
+            result_msg = (
+                "💡 Это админский Telegram-тег. Бот не меняет его напрямую для администраторов."
+                f"\nДля {mention(msg.chat.id, target_id)} нужно менять вручную через настройки группы."
+            )
+        return await msg.answer(result_msg)
+
+    if bot_can_manage_tags:
+        try:
+            await bot.set_chat_member_tag(msg.chat.id, target_id, text)
+        except Exception as e:
+            tag_errors.append(f"видимый тег: {e}")
+            logger.warning(f"set_chat_member_tag не сработал для {target_id} в {msg.chat.id}: {e}")
+    else:
+        return await msg.answer("❌ У бота нет права управления тегами участников Telegram.")
 
     if target_id == msg.from_user.id:
         result_msg = f"✅ Погоняло изменено!\n🏷️ <b>{text}</b>"
     else:
         result_msg = f"✅ Погоняло для {mention(msg.chat.id, target_id)} изменено на <b>{text}</b>"
 
-    if tag_error:
-        result_msg += f"\n⚠️ Видимый тег в Telegram не установлен: <code>{html.escape(tag_error)}</code>"
+    if tag_errors:
+        result_msg += "\n⚠️ Telegram не применил тег: <code>" + html.escape("; ".join(tag_errors)) + "</code>"
 
     return await msg.answer(result_msg)
 
@@ -5129,10 +8097,7 @@ async def cmd_nick(msg: Message, cmd_name: str = 'ник'):
     text = msg.text.strip()
 
     # Очищаем от префиксов
-    for prefix in ['!']:
-        if text.startswith(prefix):
-            text = text[1:].strip()
-            break
+    text = strip_command_prefix(text, msg.chat.id)
 
     # Убираем слово "ник"
     if text.lower().startswith('ник'):
@@ -5142,48 +8107,129 @@ async def cmd_nick(msg: Message, cmd_name: str = 'ник'):
 
     if not args:
         u = storage.get_user(msg.chat.id, msg.from_user.id)
-        custom = u.get('custom_name', '')
+        custom = html.escape(str(u.get('custom_name') or ''), quote=False)
         return await msg.answer(
             f"👤 <b>Ваше отображаемое имя:</b> {get_display_name(msg.chat.id, msg.from_user.id)}\n"
             f"{'📝 Кастомное: ' + custom if custom else '💡 У вас нет кастомного ника'}\n\n"
             f"<code>ник Новое Имя</code> — установить ник\n"
             f"<code>ник @user</code> — посмотреть чужой ник\n"
+            f"<code>ник @user Новое Имя</code> — изменить ник участника (администратору)\n"
+            f"<code>ник Новое Имя</code> ответом на сообщение — изменить ник участника (администратору)\n"
             f"<code>ник сбросить</code> — убрать кастомный ник"
         )
 
-    if args.lower() == 'сбросить':
-        storage.get_user(msg.chat.id, msg.from_user.id)['custom_name'] = ''
-        storage.invalidate_user_cache(msg.chat.id, msg.from_user.id)  # ← Это есть
-        mention_cache.invalidate(f"mention_{msg.from_user.id}")  # ← ДОБАВЬТЕ ЭТО
-        storage.mark_dirty()
-        await storage.save()
-        return await msg.answer("✅ Кастомный ник сброшен.")
-
-    # Проверяем, смотрим ли мы чужой ник
-    if args.startswith('@'):
-        tid = await get_target(msg, args)
-        if tid:
-            u = storage.get_user(msg.chat.id, tid)
+    target_id = msg.from_user.id
+    new_name = args
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+    elif args.split() and get_target_mention_span(msg, args.split(maxsplit=1)[0]):
+        target_mention = get_target_mention_span(msg, args.split(maxsplit=1)[0])
+        target_id = target_mention[0]
+        new_name = msg.text[target_mention[2]:].strip()
+        if not new_name:
+            u = storage.get_user(msg.chat.id, target_id)
+            custom_name = html.escape(str(u.get('custom_name') or 'не установлен'), quote=False)
             return await msg.answer(
-                f"👤 <b>{mention(msg.chat.id, tid)}</b>\n📝 Ник: {u.get('custom_name') or 'не установлен'}",
+                f"👤 <b>{mention(msg.chat.id, target_id)}</b>\n📝 Ник: {custom_name}",
+                disable_web_page_preview=True,
+            )
+    elif args.startswith('@'):
+        target_parts = args.split(maxsplit=1)
+        target_arg = target_parts[0]
+        if len(target_parts) == 1:
+            tid = await get_target(msg, target_arg)
+            if not tid:
+                return await msg.answer("❌ Не удалось найти пользователя.")
+            u = storage.get_user(msg.chat.id, tid)
+            custom_name = html.escape(str(u.get('custom_name') or 'не установлен'), quote=False)
+            return await msg.answer(
+                f"👤 <b>{mention(msg.chat.id, tid)}</b>\n📝 Ник: {custom_name}",
                 disable_web_page_preview=True)
 
-    # Устанавливаем новый ник
-    new_name = args.strip()
+        target_id = await get_target(msg, target_arg)
+        if not target_id:
+            return await msg.answer("❌ Не удалось найти пользователя.")
+        new_name = target_parts[1].strip()
+
+    if target_id != msg.from_user.id:
+        rank = storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0)
+        if rank < 1:
+            return await msg.answer("❌ Изменять ник другим участникам могут только администраторы.")
+
+    if new_name.lower() == 'сбросить':
+        storage.get_user(msg.chat.id, target_id)['custom_name'] = ''
+        storage.invalidate_user_cache(msg.chat.id, target_id)
+        storage.mark_dirty()
+        await storage.save()
+        if target_id == msg.from_user.id:
+            return await msg.answer("✅ Кастомный ник сброшен.")
+        return await msg.answer(f"✅ Кастомный ник для {mention(msg.chat.id, target_id)} сброшен.")
+
     if len(new_name) > 64:
         return await msg.answer("❌ Слишком длинное имя (макс. 64 символа)")
+    if not new_name:
+        return await msg.answer("❌ Ник не может быть пустым.")
 
-    old = get_display_name(msg.chat.id, msg.from_user.id)
-    storage.get_user(msg.chat.id, msg.from_user.id)['custom_name'] = new_name
-
-    # Сбрасываем ВСЕ кеши
-    storage.invalidate_user_cache(msg.chat.id, msg.from_user.id)
-    mention_cache.invalidate(f"mention_{msg.from_user.id}")  # ← ДОБАВЬТЕ ЭТУ СТРОКУ
+    old = get_display_name(msg.chat.id, target_id)
+    storage.get_user(msg.chat.id, target_id)['custom_name'] = new_name
+    storage.invalidate_user_cache(msg.chat.id, target_id)
 
     storage.mark_dirty()
     await storage.save()
 
-    return await msg.answer(f"✅ Ник изменён!\n📝 {old} → <b>{new_name}</b>")
+    safe_new_name = html.escape(new_name, quote=False)
+    if target_id == msg.from_user.id:
+        return await msg.answer(f"✅ Ник изменён!\n📝 {old} → <b>{safe_new_name}</b>")
+    return await msg.answer(
+        f"✅ Ник для {mention(msg.chat.id, target_id)} изменён!\n📝 {old} → <b>{safe_new_name}</b>")
+
+
+async def cmd_report(msg: Message, cmd_name: str = 'репорт'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    parts = (msg.text or '').split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("❌ Напишите текст жалобы: <code>!репорт описание</code>")
+
+    report_text = html.escape(parts[1].strip()[:1500], quote=False)
+    try:
+        admins = await bot.get_chat_administrators(msg.chat.id)
+    except Exception as exc:
+        logger.error("Не удалось получить администраторов чата %s для репорта: %s", msg.chat.id, exc)
+        return await msg.answer("❌ Не удалось найти администраторов чата. Попробуйте позже.")
+    recipients = [admin.user for admin in admins if not admin.user.is_bot]
+    if not recipients:
+        return await msg.answer("❌ В этом чате не удалось найти администраторов для отправки жалобы.")
+
+    notification = (
+        f"🚨 <b>Жалоба из чата</b>\n"
+        f"Чат: <code>{msg.chat.id}</code>\n"
+        f"От: {mention(msg.chat.id, msg.from_user.id)}\n\n"
+        f"{report_text}"
+    )
+    delivered = 0
+    for admin in recipients:
+        try:
+            await bot.send_message(admin.id, notification, disable_web_page_preview=True)
+            delivered += 1
+        except Exception as exc:
+            logger.warning(
+                "Не удалось доставить репорт администратору %s чата %s: %s",
+                admin.id, msg.chat.id, exc
+            )
+
+    user = storage.get_user(msg.chat.id, msg.from_user.id)
+    user['reports_sent'] = user.get('reports_sent', 0) + 1
+    storage.mark_dirty()
+    await storage.save()
+
+    if delivered:
+        return await msg.answer(f"✅ Жалоба отправлена администраторам ({delivered}/{len(recipients)}).")
+    return await msg.answer(
+        "❌ Не удалось доставить жалобу администраторам. Возможно, они не открывали боту личный чат."
+    )
 
 
 async def cmd_anti_moderation(msg: Message, cmd_name: str = 'антимодерация'):
@@ -5212,7 +8258,14 @@ async def cmd_anti_spam(msg: Message, cmd_name: str = 'антиспам'):
     await storage.save()
 
     status = "🛡️ включена" if anti_spam_settings['enabled'] else "⚠️ выключена"
-    await msg.answer(f"🛡️ <b>Анти-спам система</b>\n\nСтатус: {status}")
+    await msg.answer(
+        f"🛡️ <b>Анти-спам система</b>\n\n"
+        f"Статус: {status}\n\n"
+        "Проверяет сообщения и команды (12+ за 10 секунд или 31+ за минуту), "
+        "повторы, короткий флуд, капс, ссылки, массовые упоминания, стикеры и GIF.\n"
+        "Также отклоняет частые нажатия кнопок (11+ за 5 секунд). "
+        "При спаме сообщениями удаляет их и временно ограничивает отправку."
+    )
 
 
 # ==================== ДК-система ====================
@@ -5230,12 +8283,13 @@ FUNCTION_MIN_RANK = {
     'cmd_mute': 1, 'cmd_unmute': 1,
     'cmd_ban': 3, 'cmd_unban': 3,
     'cmd_warn': 1,
+    'cmd_mute_list': 1,
+    'cmd_ban_list': 3,
+    'cmd_warn_list': 1,
     'cmd_unwarn': 2,
     'cmd_del': 1,
     'cmd_pin': 2,
     'cmd_purge': 2,
-    'cmd_close_topic': 2, 'cmd_open_topic': 2,
-    'cmd_add_iso': 3, 'cmd_rem_iso': 3,
     'cmd_give_award': 4, 'cmd_rem_award': 4,
     'cmd_add_phrase': 1, 'cmd_del_phrase': 1,
     'cmd_welcome': 2, 'cmd_farewell': 2,
@@ -5245,6 +8299,7 @@ FUNCTION_MIN_RANK = {
     'cmd_dk_set': 5, 'cmd_dk_enable': 5, 'cmd_dk_disable': 5,
     'cmd_ldk_add': 5, 'cmd_ldk_rem': 5, 'cmd_dk_menu': 5,
     'cmd_ping': 5, 'cmd_backup': 5, 'cmd_restore': 5,
+    'cmd_pic_toggle': 5,
     'cmd_forward': 3,
 }
 
@@ -5266,33 +8321,33 @@ DK_CATEGORIES = {
         (['кто ты'], None),
         (['кто админ'], None),
         (['ранг', 'ранги'], None),
-        (['.ид'], None),
+        (['ид'], None),
         (['топ'], None),
         (['статистика чата', 'статистика'], None),
         (['опрос'], None),
         (['погода', 'п'], None),
         (['шутка'], None),
+        (['шиперим'], None),
+        (['моя статья'], None),
         (['валера'], None),
     ]),
     'moderation': ("🛡️ Модерация", [
         (['мут', 'размут', '-мут'], None),
+        (['мутлист', 'муты', 'мутылист', 'список мутов', 'mutelist', 'mutes'], None),
         (['бан', 'разбан', '-бан'], None),
+        (['банлист', 'баны', 'список банов', 'banlist', 'bans'], None),
         (['пред', 'варн', 'warn'], None),
         (['преды', 'варны', 'warns'], None),
+        (['варнлист', 'предлист', 'варнылист', 'предупреждения', 'список предупреждений',
+          'warnlist', 'warninglist', 'warningslist'], None),
         (['снятьпред', 'снятьварн', '-пред', '-варн', 'unwarn'], None),
         (['-смс'], None),
-        (['.пин'], None),
+        (['пин'], None),
         (['очистить'], None),
         (['повысить'], None),
         (['понизить'], None),
         (['репорт'], None),
         (['ник'], None),
-    ]),
-    'topics': ("📂 Топики и изоляция", [
-        (['закрыть топик', 'открыть топик'], None),
-        (['топики'], None),
-        (['+изоляция', '-изоляция'], None),
-        (['изоляция'], None),
     ]),
     'awards': ("🏆 Награды и браки", [
         (['наградить', 'снять награду'], None),
@@ -5318,6 +8373,7 @@ DK_CATEGORIES = {
         (['кнб', 'кнб бот'], None),
         (['камень', 'ножницы', 'бумага'], None),
         (['крестики нолики', 'ttt'], None),
+        (['wordle', 'вордле', 'вордл', 'слово', 'угадай слово'], None),
     ]),
     'settings': ("⚙️ Настройки и ДК", [
         (['антимодерация'], None),
@@ -5333,13 +8389,14 @@ DK_CATEGORIES = {
         (['восстановить'], None),
         (['перед'], None),
         (['название ранга', 'переранг'], None),
+        (['пик выкл', 'пик вкл', 'pic off', 'pic on'], None),
     ]),
 }
 
 
 def match_dk_command(tokens: List[str]) -> tuple:
     """Ищет команду ДК в начале списка токенов: команды могут состоять
-    из 1 или 2 слов ('дк', 'закрыть топик' и т.д.). Возвращает
+    из 1 или 2 слов. Возвращает
     (найденная_команда, оставшиеся_токены) либо (None, tokens), если
     совпадение не найдено. Пробуем сначала 2 слова, чтобы не потерять
     составные команды."""
@@ -5457,7 +8514,9 @@ async def cmd_dk_set(msg: Message, cmd_name: str = 'дк'):
     level = 9 if level_token == 'откл' else (int(level_token) if level_token.isdigit() else None)
     if level is None or not (0 <= level <= 5):
         return await msg.answer("❌ Уровень 0-5 или откл")
-    storage.data['command_access'].setdefault(str(msg.chat.id), {})[command] = level
+    command_access = storage.data['command_access'].setdefault(str(msg.chat.id), {})
+    for alias in get_command_aliases(command):
+        command_access[alias] = level
     storage.mark_dirty();
     await storage.save()
     await msg.answer(f"✅ Доступ к команде '{command}' установлен на уровень {level}")
@@ -5542,7 +8601,9 @@ async def cmd_dk_enable(msg: Message, cmd_name: str = '+дк'):
     command = ' '.join(msg.text.split()[1:]).lower().strip()
     if command not in COMMANDS:
         return await msg.answer(f"❌ Неизвестная команда '{command}'")
-    storage.data['command_access'].setdefault(str(msg.chat.id), {})[command] = 0
+    command_access = storage.data['command_access'].setdefault(str(msg.chat.id), {})
+    for alias in get_command_aliases(command):
+        command_access[alias] = 0
     storage.mark_dirty();
     await storage.save()
     await msg.answer(f"✅ Команда '{command}' включена (доступна всем)")
@@ -5554,7 +8615,9 @@ async def cmd_dk_disable(msg: Message, cmd_name: str = '-дк'):
     command = ' '.join(msg.text.split()[1:]).lower().strip()
     if command not in COMMANDS:
         return await msg.answer(f"❌ Неизвестная команда '{command}'")
-    storage.data['command_access'].setdefault(str(msg.chat.id), {})[command] = 9
+    command_access = storage.data['command_access'].setdefault(str(msg.chat.id), {})
+    for alias in get_command_aliases(command):
+        command_access[alias] = 9
     storage.mark_dirty();
     await storage.save()
     await msg.answer(f"❌ Команда '{command}' отключена")
@@ -5574,11 +8637,13 @@ async def cmd_ldk_add(msg: Message, cmd_name: str = '+лдк'):
     tid = await get_target(msg, rest[0])
     if not tid:
         return await msg.answer("❌ Пользователь не найден")
-    access_list = storage.data['personal_access'].setdefault(str(msg.chat.id), {}).setdefault(command, [])
-    if tid in access_list:
+    personal = storage.data['personal_access'].setdefault(str(msg.chat.id), {})
+    aliases = get_command_aliases(command)
+    if any(tid in personal.get(alias, []) for alias in aliases):
         return await msg.answer(f"⚠️ У {mention(msg.chat.id, tid)} уже есть личный доступ к команде '{command}'",
                                  disable_web_page_preview=True)
-    access_list.append(tid)
+    for alias in aliases:
+        personal.setdefault(alias, []).append(tid)
     storage.mark_dirty();
     await storage.save()
     await msg.answer(f"✅ Личный доступ к команде '{command}' выдан {mention(msg.chat.id, tid)}", disable_web_page_preview=True)
@@ -5598,9 +8663,13 @@ async def cmd_ldk_rem(msg: Message, cmd_name: str = '-лдк'):
     tid = await get_target(msg, rest[0])
     if not tid:
         return await msg.answer("❌ Пользователь не найден")
-    acc = storage.data['personal_access'].get(str(msg.chat.id), {}).get(command, [])
-    if tid in acc:
-        acc.remove(tid)
+    personal = storage.data['personal_access'].get(str(msg.chat.id), {})
+    aliases = get_command_aliases(command)
+    if any(tid in personal.get(alias, []) for alias in aliases):
+        for alias in aliases:
+            access_list = personal.get(alias, [])
+            if tid in access_list:
+                access_list.remove(tid)
         storage.mark_dirty();
         await storage.save()
         await msg.answer(f"✅ Доступ к команде '{command}' отозван у {mention(msg.chat.id, tid)}",
@@ -5613,11 +8682,50 @@ async def cmd_ldk_rem(msg: Message, cmd_name: str = '-лдк'):
 # ==================== Админ-команды ====================
 
 async def cmd_ping_check(msg: Message):
-    """Простой пинг бота без обращения к базе и админским правам."""
-    start = time.perf_counter()
-    await msg.answer(f"🏓 Пинг: {0} мс", disable_web_page_preview=True)
-    latency = round((time.perf_counter() - start) * 1000, 1)
-    await msg.edit_text(f"🏓 Пинг: {latency} мс", disable_web_page_preview=True)
+    """Проверяет задержку Telegram API и состояние локального хранилища."""
+    storage_start = time.monotonic()
+    storage.data.get('users', {})
+    storage_latency = (time.monotonic() - storage_start) * 1000
+
+    api_start = time.monotonic()
+    test_msg = await msg.answer("🏓")
+    send_latency = (time.monotonic() - api_start) * 1000
+
+    edit_start = time.monotonic()
+    await test_msg.edit_text("🏓 Проверка соединения…")
+    edit_latency = (time.monotonic() - edit_start) * 1000
+
+    delete_start = time.monotonic()
+    await test_msg.delete()
+    delete_latency = (time.monotonic() - delete_start) * 1000
+
+    bot_info_start = time.monotonic()
+    await bot.get_me()
+    bot_info_latency = (time.monotonic() - bot_info_start) * 1000
+
+    api_average = (send_latency + edit_latency + delete_latency + bot_info_latency) / 4
+    if api_average < 100:
+        status = "🟢 Отличное"
+    elif api_average < 300:
+        status = "🟡 Хорошее"
+    elif api_average < 600:
+        status = "🟠 Среднее"
+    else:
+        status = "🔴 Медленное"
+
+    await msg.answer(
+        "🏓 <b>Понг! Диагностика соединения</b>\n\n"
+        f"📶 <b>Статус:</b> {status}\n\n"
+        "📡 <b>Задержки Telegram API:</b>\n"
+        f"├ 📤 Отправка сообщения: <code>{send_latency:.1f} мс</code>\n"
+        f"├ ✏️ Редактирование: <code>{edit_latency:.1f} мс</code>\n"
+        f"├ 🗑️ Удаление: <code>{delete_latency:.1f} мс</code>\n"
+        f"├ 🤖 Информация о боте: <code>{bot_info_latency:.1f} мс</code>\n"
+        f"└ 📊 Средняя задержка: <code>{api_average:.1f} мс</code>\n\n"
+        "💾 <b>Хранилище:</b>\n"
+        f"└ 📂 Чтение данных: <code>{storage_latency:.1f} мс</code>",
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_ping(msg: Message, cmd_name: str = 'общий сбор'):
@@ -5636,12 +8744,18 @@ async def cmd_backup(msg: Message, cmd_name: str = 'бэкап'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
     await storage.save()
-    backup = {'ts': time.time(), 'data': json.loads(json.dumps(storage.data))}
+    snapshot = json.loads(json.dumps(storage.data))
+    snapshot['backups'] = []
+    backup = {'ts': time.time(), 'data': snapshot}
     storage.data.setdefault('backups', []).append(backup)
     storage.data['backups'] = storage.data['backups'][-10:]
     filename = f"{BACKUP_DIR}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(filename, 'w', encoding='utf-8') as f:
+    temp_filename = f'{filename}.tmp'
+    with open(temp_filename, 'w', encoding='utf-8') as f:
         json.dump(backup, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_filename, filename)
     await storage.save()
     await msg.answer(f"✅ Бэкап: {filename}")
 
@@ -5649,11 +8763,102 @@ async def cmd_backup(msg: Message, cmd_name: str = 'бэкап'):
 async def cmd_restore(msg: Message, cmd_name: str = 'восстановить'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 5):
         return
-    if not storage.data.get('backups'):
+    backups = storage.data.get('backups')
+    if not isinstance(backups, list) or not backups:
         return await msg.answer("❌ Нет бэкапов")
-    storage.data = storage.data['backups'][-1]['data']
+    backup = backups[-1]
+    if not isinstance(backup, dict) or not isinstance(backup.get('ts'), (int, float)):
+        logger.error("Последний бэкап не содержит корректную временную метку")
+        return await msg.answer("❌ Последний бэкап повреждён или имеет неподдерживаемый формат.")
+    backup_data = backup.get('data') if isinstance(backup, dict) else None
+    if not validate_backup_data(backup_data):
+        logger.error("Последний бэкап имеет некорректную структуру")
+        return await msg.answer("❌ Последний бэкап повреждён или имеет неподдерживаемый формат.")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Да, восстановить",
+            callback_data=f"restore_confirm_{msg.from_user.id}_{backup['ts']}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"restore_cancel_{msg.from_user.id}_{backup['ts']}",
+        ),
+    ]])
+    await msg.answer(
+        "⚠️ <b>Подтвердите восстановление</b>\n"
+        "Текущие данные будут заменены содержимым последнего бэкапа.",
+        reply_markup=keyboard,
+    )
+
+
+def validate_backup_data(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    defaults = DataStorage._get_default_data()
+    for key, default_value in defaults.items():
+        if key in data and not isinstance(data[key], type(default_value)):
+            return False
+    users = data.get('users')
+    if not isinstance(users, dict):
+        return False
+    for chat_users in users.values():
+        if not isinstance(chat_users, dict):
+            return False
+        if any(not isinstance(user_data, dict) for user_data in chat_users.values()):
+            return False
+    return True
+
+
+@router.callback_query(F.data.startswith('restore_'))
+async def restore_backup_callback(call: CallbackQuery):
+    if not call.message:
+        return await call.answer("❌ Сообщение восстановления недоступно.", show_alert=True)
+
+    try:
+        _, action, requester_id, backup_ts = call.data.split('_', maxsplit=3)
+        requester_id = int(requester_id)
+        backup_ts = float(backup_ts)
+    except (ValueError, AttributeError):
+        logger.warning("Получены некорректные данные callback восстановления")
+        return await call.answer("❌ Кнопка восстановления недействительна.", show_alert=True)
+
+    if call.from_user.id != requester_id:
+        return await call.answer("❌ Подтвердить восстановление может только инициатор.", show_alert=True)
+    if not check_access(call.from_user.id, call.message.chat.id, 'восстановить', 5):
+        return await call.answer("❌ Недостаточно прав.", show_alert=True)
+    backups = storage.data.get('backups', [])
+    backup = backups[-1] if isinstance(backups, list) and backups else None
+    current_backup_ts = backup.get('ts') if isinstance(backup, dict) else None
+    if (
+        not isinstance(current_backup_ts, (int, float))
+        or float(current_backup_ts) != backup_ts
+    ):
+        return await call.answer("❌ Список бэкапов изменился. Запустите восстановление заново.", show_alert=True)
+    if action == 'cancel':
+        await call.message.edit_text("✅ Восстановление отменено.", reply_markup=None)
+        return await call.answer()
+    if action != 'confirm':
+        return await call.answer("❌ Неизвестное действие.", show_alert=True)
+
+    backup_data = backup.get('data') if isinstance(backup, dict) else None
+    if not validate_backup_data(backup_data):
+        logger.error("Последний бэкап имеет некорректную структуру при подтверждении")
+        await call.message.edit_text("❌ Бэкап повреждён или имеет неподдерживаемый формат.", reply_markup=None)
+        return await call.answer("Восстановление не выполнено.", show_alert=True)
+
+    restored_data = DataStorage._get_default_data()
+    restored_data.update(backup_data)
+    restored_data['backups'] = backups
+    storage.data = restored_data
+    user_cache.clear()
+    chat_settings_cache.clear()
+    mention_cache.clear()
+    storage._chat_user_index.clear()
+    storage.mark_dirty()
     await storage.save()
-    await msg.answer("✅ Восстановлено")
+    await call.message.edit_text("✅ Данные восстановлены из последнего бэкапа.", reply_markup=None)
+    await call.answer()
 
 
 async def cmd_forward(msg: Message, cmd_name: str = 'перед'):
@@ -5674,7 +8879,8 @@ async def cmd_forward(msg: Message, cmd_name: str = 'перед'):
         await msg.reply_to_message.forward(tid)
         await msg.answer("✅ Переслано")
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        logger.warning("Не удалось переслать сообщение пользователю %s: %s", tid, e)
+        await msg.answer("❌ Не удалось переслать сообщение. Проверьте, что пользователь не заблокировал бота.")
 
 
 # ==================== Репутация ====================
@@ -5704,81 +8910,115 @@ async def reputation_handler(msg: Message):
     # Проверяем текст сообщения
     text = msg.text.strip()
 
-    # Список слов для выдачи репутации (БЕЗ обязательного !)
-    rep_words = [
-        '+', 'плюс', 'спасибо', 'жиза', 'красава', 'респект',
-        'уважение', 'лайк', 'like', 'топ', 'красавчик',
-        'молодец', 'умница', 'based', 'base', 'огонь',
-        'респектую', '👍', '🔥', '💯', '✅'
-    ]
-
     # Проверяем точное совпадение ИЛИ начинается с +
-    if text.lower() in rep_words or (text.startswith('+') and len(text) <= 3):
+    if is_reputation_removal_message(text):
+        logger.debug(f"Снижение репутации: {msg.from_user.id} -> {msg.reply_to_message.from_user.id}, текст='{text}'")
+        await give_reputation(msg, remove=True)
+        return
+    if is_reputation_message(text):
         logger.debug(f"Репутация: {msg.from_user.id} -> {msg.reply_to_message.from_user.id}, текст='{text}'")
         await give_reputation(msg)
         return
 
 
-async def give_reputation(msg: Message):
-    """Выдача репутации"""
+async def give_reputation(msg: Message, remove: bool = False):
+    """Начисляет или снимает один балл репутации."""
     try:
         giver_id = msg.from_user.id
         receiver_id = msg.reply_to_message.from_user.id
-        
-        logger.info(f"Выдача репутации: {giver_id} -> {receiver_id}")
 
         giver = storage.get_user(msg.chat.id, giver_id, use_cache=False)
         receiver = storage.get_user(msg.chat.id, receiver_id, use_cache=False)
 
         now = time.time()
         today = datetime.now().strftime('%Y-%m-%d')
+        action = 'Снижение репутации' if remove else 'Выдача репутации'
+        cooldown = REPUTATION_REMOVE_COOLDOWN if remove else REPUTATION_COOLDOWN
+        daily_limit = REPUTATION_REMOVE_DAILY_LIMIT if remove else REPUTATION_DAILY_LIMIT
+        last_action_key = 'last_rep_removed_time_by_target' if remove else 'last_rep_time_by_target'
+        daily_actions_key = 'rep_removed_today' if remove else 'rep_given_today'
+        reply_to_receiver = "снимали" if remove else "повышали"
+
+        logger.info(f"{action}: {giver_id} -> {receiver_id}")
 
         # Проверка кулдауна
-        last_rep = giver.get('last_rep_time', 0)
-        if now - last_rep < REPUTATION_COOLDOWN:
-            remaining = int(REPUTATION_COOLDOWN - (now - last_rep))
-            minutes = remaining // 60
-            seconds = remaining % 60
-            msg_text = f"⏳ Кулдаун! Подождите {minutes}м {seconds}с" if minutes > 0 else f"⏳ Кулдаун! Подождите {seconds}с"
-            logger.debug(f"Репутация: кулдаун для {giver_id}")
-            await msg.reply(msg_text)
+        cooldowns = giver.get(last_action_key, {})
+        if not isinstance(cooldowns, dict):
+            cooldowns = {}
+        cooldowns = {
+            target_id: timestamp
+            for target_id, timestamp in cooldowns.items()
+            if now - timestamp < cooldown
+        }
+        last_action = cooldowns.get(str(receiver_id), 0)
+        if now - last_action < cooldown:
+            remaining = int(cooldown - (now - last_action))
+            hours, remainder = divmod(remaining, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            wait_parts = []
+            if hours:
+                wait_parts.append(f"{hours} ч")
+            if minutes or hours:
+                wait_parts.append(f"{minutes} мин")
+            wait_parts.append(f"{seconds} сек")
+            action_label = "-реп (снять 1 балл)" if remove else "+реп (добавить 1 балл)"
+            msg_text = (
+                f"⏳ Кулдаун на {action_label} для {mention(msg.chat.id, receiver_id)}.\n"
+                f"Повторить действие можно через <b>{' '.join(wait_parts)}</b>.\n"
+                "Кулдаун считается отдельно для каждого пользователя."
+            )
+            logger.debug(f"{action}: кулдаун для пары {giver_id} -> {receiver_id}")
+            await msg.reply(msg_text, disable_web_page_preview=True)
             return
 
         # Проверка дневного лимита
-        rep_today = giver.get('rep_given_today', {})
-        today_count = rep_today.get(today, 0)
-        if today_count >= REPUTATION_DAILY_LIMIT:
-            logger.debug(f"Репутация: дневной лимит для {giver_id}")
-            await msg.reply(f"❌ Дневной лимит исчерпан ({today_count}/{REPUTATION_DAILY_LIMIT})")
+        action_today = giver.get(daily_actions_key, {})
+        today_count = action_today.get(today, 0)
+        if today_count >= daily_limit:
+            logger.debug(f"{action}: дневной лимит для {giver_id}")
+            await msg.reply(f"❌ Дневной лимит исчерпан ({today_count}/{daily_limit})")
             return
 
-        # Проверка что сегодня ещё не давали этому пользователю
-        targets_today = rep_today.get('targets', {})
+        targets_by_day = action_today.get('targets_by_day', {})
+        if not isinstance(targets_by_day, dict):
+            targets_by_day = {}
+        targets_today = targets_by_day.get(today, {})
+        if not isinstance(targets_today, dict):
+            targets_today = {}
+
+        # Ограничиваем каждое направление одним изменением на пользователя в день.
         if str(receiver_id) in targets_today:
-            logger.debug(f"Репутация: {giver_id} уже давал сегодня {receiver_id}")
-            # Уже давали сегодня - молча игнорируем
+            logger.debug(f"{action}: {giver_id} уже изменял репутацию {receiver_id} сегодня")
+            await msg.reply(f"⭐ Вы уже {reply_to_receiver} репутацию этому пользователю сегодня.")
             return
 
-        # ВЫДАЁМ РЕПУТАЦИЮ
-        receiver['reputation'] = receiver.get('reputation', 0) + 1
-        logger.info(f"✅ Репутация выдана: {giver_id} -> {receiver_id}, всего: {receiver['reputation']}")
+        current_reputation = receiver.get('reputation', 0)
+        receiver['reputation'] = current_reputation - 1 if remove else current_reputation + 1
+        logger.info(
+            "✅ Репутация %s: %s -> %s, всего: %s",
+            "снята" if remove else "выдана",
+            giver_id,
+            receiver_id,
+            receiver['reputation'],
+        )
 
         # Обновляем данные дающего
-        giver['last_rep_time'] = now
+        cooldowns[str(receiver_id)] = now
+        giver[last_action_key] = cooldowns
 
-        if today not in rep_today:
-            rep_today[today] = 0
-        rep_today[today] = today_count + 1
+        if today not in action_today:
+            action_today[today] = 0
+        action_today[today] = today_count + 1
 
-        if 'targets' not in rep_today:
-            rep_today['targets'] = {}
-        rep_today['targets'][str(receiver_id)] = True
+        targets_today[str(receiver_id)] = True
+        action_today['targets_by_day'] = {today: targets_today}
 
-        giver['rep_given_today'] = rep_today
-        giver['rep_given_total'] = giver.get('rep_given_total', 0) + 1
+        giver[daily_actions_key] = action_today
+        total_key = 'rep_removed_total' if remove else 'rep_given_total'
+        giver[total_key] = giver.get(total_key, 0) + 1
 
         # Сохраняем активность
-        save_activity(msg.chat.id, receiver_id, 'reputation')
+        save_activity(msg.chat.id, receiver_id, 'reputation', amount=-1 if remove else 1)
 
         # Очищаем кэш
         storage.invalidate_user_cache(msg.chat.id, giver_id)
@@ -5789,7 +9029,7 @@ async def give_reputation(msg: Message):
         # Отправляем подтверждение
         total_rep = receiver['reputation']
         await msg.reply(
-            f"⭐ +1 {mention(msg.chat.id, receiver_id)}\n"
+            f"⭐ {'-1' if remove else '+1'} {mention(msg.chat.id, receiver_id)}\n"
             f"📊 Репутация: {total_rep}",
             disable_web_page_preview=True
         )
@@ -5800,156 +9040,6 @@ async def give_reputation(msg: Message):
             await msg.reply(f"❌ Ошибка репутации: {str(e)[:80]}")
         except:
             pass
-
-
-# ==================== Автомодерация ====================
-
-async def auto_mod(msg: Message):
-    if msg.from_user.is_bot:
-        return
-
-    uid = msg.from_user.id
-    chat_id = msg.chat.id
-
-    # === ПРОВЕРКА ЗАКРЫТЫХ ТОПИКОВ (ОБНОВЛЕНО) ===
-    topic_id = msg.message_thread_id
-    if topic_id is None or topic_id == 1:
-        topic_id = 0
-
-    closed_topics = storage.data.get('closed_topics', {}).get(str(chat_id), {})
-    closed_topic = closed_topics.get(str(topic_id))
-
-    if closed_topic:
-        required_rank = closed_topic.get('required_rank', 0)
-        allowed_users = closed_topic.get('allowed_users', [])
-        user_rank = storage.get_user(msg.chat.id, uid).get('rank', 0)
-
-        # НОВАЯ ПРОВЕРКА: ранг ИЛИ в списке исключений
-        has_access = (user_rank >= required_rank) or (uid in allowed_users)
-
-        if not has_access:
-            try:
-                await msg.delete()
-
-                u = storage.get_user(msg.chat.id, uid)
-                now = time.time()
-                if now - u.get('last_violation_time', 0) > 300:
-                    u['violations_count'] = 0
-                u['violations_count'] = u.get('violations_count', 0) + 1
-                u['last_violation_time'] = now
-
-                location = "основном чате" if topic_id == 0 else f"топике {topic_id}"
-
-                warning_msg = f"🚫 <b>Топик закрыт!</b>\n\n📌 Вы попытались написать в {location}.\n"
-
-                if required_rank > 0:
-                    warning_msg += f"🔐 Требуется ранг: {required_rank}+\n"
-                if allowed_users:
-                    users_list = ', '.join([mention(msg.chat.id, uid) for uid in allowed_users[:3]])
-                    if len(allowed_users) > 3:
-                        users_list += f" +{len(allowed_users) - 3}"
-                    warning_msg += f"👤 Исключения: {users_list}\n"
-
-                warning_msg += f"\n⚠️ Нарушение #{u['violations_count']}/3"
-
-                sent_msg = await msg.answer(warning_msg, disable_web_page_preview=True)
-
-                if u['violations_count'] >= 3:
-                    until = datetime.now() + timedelta(minutes=10)
-                    await bot.restrict_chat_member(chat_id, uid,
-                                                   ChatPermissions(can_send_messages=False), until_date=int(until.timestamp()))
-
-                    mutes = storage.get_chat(chat_id, 'mutes')
-                    if not isinstance(mutes, list):
-                        mutes = []
-                        storage.data['mutes'][str(chat_id)] = mutes
-                    mutes.append({
-                        'user_id': uid,
-                        'expire_time': until.timestamp(),
-                        'muted_by': 'auto',
-                        'reason': f'3 нарушения в закрытом топике'
-                    })
-
-                    await sent_msg.edit_text(
-                        f"🔇 <b>Автоматический мут!</b>\n\n"
-                        f"⚠️ Вы получили 3 нарушения за попытку писать в закрытом топике.\n"
-                        f"⏱️ Вы заглушены на 10 минут.",
-                        disable_web_page_preview=True
-                    )
-                    u['violations_count'] = 0
-                    await asyncio.sleep(5)
-                    try:
-                        await sent_msg.delete()
-                    except:
-                        pass
-                else:
-                    await asyncio.sleep(3)
-                    try:
-                        await sent_msg.delete()
-                    except:
-                        pass
-
-                storage.mark_dirty()
-                await storage.save()
-
-            except Exception as e:
-                logger.error(f"Ошибка авто-модерации топика: {e}")
-            return
-
-    # === ПРОВЕРКА ИЗОЛЯЦИИ (оставляем как есть) ===
-    iso = storage.get_user(msg.chat.id, uid).get('isolation')
-    if iso and iso.get('expire_time', 0) > time.time():
-        try:
-            await msg.delete()
-
-            until_time = datetime.fromtimestamp(iso['expire_time']).strftime('%H:%M:%S')
-            iso_msg = (
-                f"🔒 <b>Вы в изоляции!</b>\n\n"
-                f"📝 Причина: {iso.get('reason', 'Не указана')}\n"
-                f"⏱️ Действует до: {until_time}\n\n"
-                f"⚠️ Ваше сообщение удалено."
-            )
-            sent_msg = await msg.answer(iso_msg, disable_web_page_preview=True)
-            await asyncio.sleep(3)
-            try:
-                await sent_msg.delete()
-            except:
-                pass
-
-            # Наказание за нарушение изоляции
-            mutes = storage.get_chat(msg.chat.id, 'mutes')
-            if not isinstance(mutes, list):
-                mutes = []
-                storage.data['mutes'][str(chat_id)] = mutes
-
-            cnt = len([m for m in mutes if m.get('user_id') == uid])
-            mute_durations = [30, 60, 120, 240, 480, 1440]
-            duration = mute_durations[min(cnt, 5)]
-
-            until = datetime.now() + timedelta(minutes=duration)
-            await bot.restrict_chat_member(
-                chat_id, uid,
-                ChatPermissions(can_send_messages=False),
-                until_date=int(until.timestamp())
-            )
-
-            mutes.append({
-                'user_id': uid,
-                'expire_time': until.timestamp(),
-                'muted_by': 'auto',
-                'reason': f'Нарушение изоляции: {iso.get("reason", "Неизвестно")}'
-            })
-
-            storage.mark_dirty()
-            await storage.save()
-
-        except Exception as e:
-            logger.error(f"Ошибка авто-модерации изоляции: {e}")
-        return
-
-    # === ФРАЗЫ ОТКЛЮЧЕНЫ ===
-    # Автоответы по триггерам больше не обрабатываются.
-    # Команды управления фразами остаются, но бот не реагирует на них автоматически.
 
 
 # ==================== Проверка мутов ====================
@@ -5963,7 +9053,13 @@ async def check_mutes():
                 mutes = storage.data['mutes'][cid]
                 if not isinstance(mutes, list):
                     continue
-                expired = [m for m in mutes if now >= m.get('expire_time', 0)]
+                expired = [
+                    m for m in mutes
+                    if m.get('permanent') is not True
+                    and isinstance(m.get('expire_time'), (int, float))
+                    and now >= m['expire_time']
+                ]
+                removed_any = False
                 for m in expired:
                     try:
                         await bot.restrict_chat_member(int(cid), m['user_id'], ChatPermissions(
@@ -5972,11 +9068,82 @@ async def check_mutes():
                             can_send_other_messages=True,
                             can_add_web_page_previews=True
                         ))
-                        # Убираем отсюда увеличение счётчика, так как он уже увеличен при выдаче мута
                     except Exception as e:
-                        logger.error(f"Ошибка размута: {e}")
-                    mutes.remove(m)
-                if expired:
+                        logger.error(
+                            "Не удалось снять истёкший мут пользователя %s в чате %s: %s",
+                            m.get('user_id'), cid, e
+                        )
+                    else:
+                        mutes.remove(m)
+                        removed_any = True
+                        try:
+                            user_id = int(m['user_id'])
+                            is_anti_spam_mute = (
+                                m.get('auto_mute') is True
+                                or m.get('muted_by') == 'auto'
+                                or str(m.get('reason') or '').startswith('Антиспам:')
+                            )
+                            user_data = storage.get_user(int(cid), user_id)
+                            username = str(user_data.get('username') or '').strip().lstrip('@')
+                            display_user = (
+                                f"@{html.escape(username, quote=False)}"
+                                if username
+                                else f"{html.escape(str(user_data.get('first_name') or 'Участник'), quote=False)} "
+                                     f"(ID <code>{user_id}</code>)"
+                            )
+                            reason = html.escape(
+                                str(m.get('reason') or ('Антиспам' if is_anti_spam_mute else 'Без причины')),
+                                quote=False,
+                            )
+                            issued_by = m.get('muted_by')
+                            if is_anti_spam_mute or issued_by == 'auto':
+                                issuer_text = 'антиспам-система'
+                            elif isinstance(issued_by, int):
+                                issuer_data = storage.get_user(int(cid), issued_by)
+                                issuer_username = str(issuer_data.get('username') or '').strip().lstrip('@')
+                                issuer_text = (
+                                    f"@{html.escape(issuer_username, quote=False)}"
+                                    if issuer_username
+                                    else f"{html.escape(str(issuer_data.get('first_name') or 'Администратор'), quote=False)} "
+                                         f"(ID <code>{issued_by}</code>)"
+                                )
+                            else:
+                                issuer_text = 'неизвестно'
+
+                            duration_minutes = m.get('duration_minutes')
+                            if not isinstance(duration_minutes, (int, float)):
+                                issued_at = m.get('issued_at')
+                                if isinstance(issued_at, (int, float)):
+                                    duration_minutes = max(1, round((m['expire_time'] - issued_at) / 60))
+                                else:
+                                    duration_minutes = None
+                            duration_text = (
+                                html.escape(format_mute_duration(int(duration_minutes)), quote=False)
+                                if duration_minutes is not None
+                                else 'не указана'
+                            )
+                            ended_at = datetime.fromtimestamp(m['expire_time']).strftime('%d.%m.%Y %H:%M')
+                            notice = await bot.send_message(
+                                int(cid),
+                                (
+                                    f"🔊 <b>Мут автоматически снят</b>\n"
+                                    f"👤 Пользователь: {display_user}\n"
+                                    f"⏱ Длительность: {duration_text}\n"
+                                    f"📝 Причина: {reason}\n"
+                                    f"👮 Выдал: {issuer_text}\n"
+                                    f"🕒 Истёк: {ended_at}"
+                                ),
+                                disable_web_page_preview=True,
+                            )
+                            asyncio.create_task(
+                                delete_message_after(notice, 10 if is_anti_spam_mute else 60)
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Не удалось уведомить об окончании мута пользователя %s в чате %s: %s",
+                                m.get('user_id'), cid, e
+                            )
+                if removed_any:
                     storage.mark_dirty()
                     await storage.save()
         except Exception as e:
@@ -6075,14 +9242,35 @@ async def left_member_handler(msg: Message):
         pass
 
 
+# ==================== Настройка команд бота ====================
+
+async def setup_bot_commands():
+    """Регистрирует стандартные команды в меню Telegram."""
+    commands = [
+        BotCommand(command='start', description='Старт'),
+        BotCommand(command='help', description='Помощь'),
+        BotCommand(command='time', description='Время в регионе'),
+        BotCommand(command='graphtheme', description='Тема графика активности'),
+        BotCommand(command='game', description='Игры и мини-игры'),
+        BotCommand(command='profile', description='Профиль пользователя'),
+        BotCommand(command='top', description='Топ игроков'),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"Не удалось настроить команды бота: {e}")
+
+
 # ==================== Запуск ====================
 
 async def main():
     logger.info("🐻 Обкуренный Валера v3.0 запускается...")
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
+    await setup_bot_commands()
     asyncio.create_task(check_mutes())
     asyncio.create_task(auto_save_task())
+    asyncio.create_task(cleanup_games())
     await dp.start_polling(bot)
 
 
