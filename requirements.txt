@@ -9,3 +9,7 @@ matplotlib==3.8.2
 
 # Асинхронные HTTP запросы (для погоды, шуток)
 aiohttp==3.9.1
+
+rlottie-python[full]>=0.3.2
+
+imageio-ffmpeg>=0.5.1
