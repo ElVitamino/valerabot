@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import calendar
+import gc
 import re
 import asyncio
 import copy
 import hashlib
+import hmac
 import html
+import importlib.util
 from html.parser import HTMLParser
 import json
 import logging
@@ -18,15 +21,18 @@ import sqlite3
 import socket
 import sys
 import time
+import tracemalloc
 import unicodedata
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Set, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import urlsplit
 import aiogram
 
 KALININGRAD_TZ = timezone(timedelta(hours=2), name='Europe/Kaliningrad')
@@ -128,7 +134,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, ChatPermissions, InlineKeyboardButton,
-    InlineKeyboardMarkup, BufferedInputFile, InputMediaPhoto, User, BotCommand,
+    InlineKeyboardMarkup, BufferedInputFile, FSInputFile, InputMediaPhoto, User, BotCommand,
     ChatMemberUpdated, ErrorEvent
 )
 from aiogram.exceptions import TelegramRetryAfter
@@ -148,7 +154,7 @@ os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
 class SimpleCache:
     def __init__(self, max_size: int = 1000, ttl: int = 300):
-        self._cache: Dict[str, tuple] = {}
+        self._cache: OrderedDict[str, tuple] = OrderedDict()
         self._max_size = max_size
         self._ttl = ttl
 
@@ -156,16 +162,22 @@ class SimpleCache:
         if key in self._cache:
             value, expiry = self._cache[key]
             if time.time() < expiry:
+                self._cache.move_to_end(key)
                 return value
             del self._cache[key]
         return None
 
     def set(self, key: str, value: Any, ttl: int = None):
-        if len(self._cache) >= self._max_size:
-            oldest = sorted(self._cache.items(), key=lambda x: x[1][1])[:len(self._cache) // 4]
-            for k, _ in oldest:
-                del self._cache[k]
-        self._cache[key] = (value, time.time() + (ttl or self._ttl))
+        if self._max_size <= 0:
+            return
+        if key in self._cache:
+            del self._cache[key]
+        while len(self._cache) >= self._max_size:
+            self._cache.popitem(last=False)
+        self._cache[key] = (
+            value,
+            time.time() + (self._ttl if ttl is None else ttl),
+        )
 
     def invalidate(self, key: str):
         self._cache.pop(key, None)
@@ -183,17 +195,33 @@ user_cache = SimpleCache(max_size=2000, ttl=300)
 chat_settings_cache = SimpleCache(max_size=200, ttl=600)
 mention_cache = SimpleCache(max_size=5000, ttl=3600)
 anti_spam_admin_cache = SimpleCache(max_size=5000, ttl=10)
+bot_rights_cache = SimpleCache(max_size=500, ttl=60)
+raid_join_cache = SimpleCache(max_size=500, ttl=20)
 
 BOT_SUPERADMIN_IDS = frozenset({7690604299, 5072903681})
-BOT_SUPERADMIN_ONLY_COMMANDS = frozenset({'бэкап', 'восстановить', 'группы', 'чаты'})
+BOT_SUPERADMIN_ONLY_COMMANDS = frozenset({
+    'бэкап', 'восстановить', 'бэкапы', 'группы', 'чаты', 'ram', 'память',
+    'логи', 'статус', 'сохранить', 'права', 'сброс кэшей', 'юзер', 'бд', 'gc',
+    'рассылка', 'выйти', 'блок чата', 'разблок чата', 'рестарт', 'аудит',
+})
 DK_PROTECTED_COMMANDS = frozenset({
     'дк', 'дкм', '+дк', '-дк', '+лдк', '-лдк',
     'префикс', 'повысить', 'понизить', 'название ранга', 'переранг',
-})
+}) | BOT_SUPERADMIN_ONLY_COMMANDS
+shutdown_event: Optional[asyncio.Event] = None
 
 
 def is_bot_superadmin(uid: int) -> bool:
     return uid in BOT_SUPERADMIN_IDS
+
+
+def superadmin_only(func):
+    @wraps(func)
+    async def wrapper(msg: Message, *args, **kwargs):
+        if not msg.from_user or not is_bot_superadmin(msg.from_user.id):
+            return await msg.answer("❌ Эта команда доступна только главным администраторам бота.")
+        return await func(msg, *args, **kwargs)
+    return wrapper
 
 
 EXCHANGE_RATE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
@@ -285,13 +313,24 @@ REPUTATION_COOLDOWN = int(os.getenv('REPUTATION_COOLDOWN', '900'))
 REPUTATION_DAILY_LIMIT = int(os.getenv('REPUTATION_DAILY_LIMIT', '15'))
 REPUTATION_REMOVE_COOLDOWN = int(os.getenv('REPUTATION_REMOVE_COOLDOWN', '900'))
 REPUTATION_REMOVE_DAILY_LIMIT = int(os.getenv('REPUTATION_REMOVE_DAILY_LIMIT', '15'))
-REPUTATION_CONFIRMATION_TTL = 3 * 60
 REPUTATION_IDLE_RESET = 4 * 60 * 60
 REPUTATION_MAX_COOLDOWN = 4 * 60 * 60
 REPUTATION_COOLDOWN_STATE_VERSION = 1
 MUTE_CHECK_INTERVAL = int(os.getenv('MUTE_CHECK_INTERVAL', '60'))
+CAPTCHA_TTL = 5 * 60
+RAID_FREEZE_SECONDS = 10 * 60
+MAX_CHAT_FREEZE_SECONDS = 24 * 60 * 60
+FILTER_LIST_LIMIT = 100
+REASON_TEMPLATE_LIMIT = 20
+MODERATION_NOTICE_DELETE_MAX_SECONDS = 300
+CAPTCHA_TTL_SECONDS = 5 * 60
+RAID_WINDOW_SECONDS = 10
+RAID_JOIN_THRESHOLD = 6
+RAID_FREEZE_SECONDS = 10 * 60
+join_event_times: Dict[int, deque] = {}
 VIP_RP_RANK = int(os.getenv('VIP_RP_RANK', '2'))
 AUTO_SAVE_INTERVAL = int(os.getenv('AUTO_SAVE_INTERVAL', '300'))
+TRACEMALLOC_ENABLED = os.getenv('TRACEMALLOC_ENABLED', 'false').strip().lower() == 'true'
 MAX_TAG_LENGTH = int(os.getenv('MAX_TAG_LENGTH', '32'))
 ANTI_SPAM_ENABLED = os.getenv('ANTI_SPAM_ENABLED', 'true').lower() == 'true'
 DEFAULT_WORDLE_LENGTH = 5
@@ -305,14 +344,7 @@ PIC_DISABLED_CHATS = {
 
 Path(BACKUP_DIR).mkdir(exist_ok=True)
 
-try:
-    import matplotlib
-
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
+MATPLOTLIB_AVAILABLE = importlib.util.find_spec('matplotlib') is not None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -379,6 +411,82 @@ def is_main_chat(chat_id: int, message_thread_id: Optional[int] = None) -> bool:
 
 
 # ==================== Анти-спам ====================
+
+def extract_url_domain(url: str) -> str:
+    candidate = url if url.lower().startswith(('http://', 'https://')) else f'https://{url}'
+    try:
+        hostname = urlsplit(candidate).hostname
+    except ValueError:
+        return ''
+    return hostname.casefold().strip('.') if hostname else ''
+
+
+def extract_message_links(msg: Message, content: str) -> Tuple[str, ...]:
+    links = [
+        match.group(0).rstrip('.,!?;:)')
+        for match in re.finditer(
+            r'(?:https?://|www\.)\S+|(?<![\w@])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?:/\S*)?',
+            content,
+            flags=re.IGNORECASE,
+        )
+    ]
+    for entities in (getattr(msg, 'entities', None), getattr(msg, 'caption_entities', None)):
+        if not entities:
+            continue
+        links.extend(
+            entity.url
+            for entity in entities
+            if getattr(entity, 'type', None) == 'text_link'
+            and isinstance(getattr(entity, 'url', None), str)
+        )
+    return tuple(dict.fromkeys(link for link in links if link))
+
+
+def domain_matches(hostname: str, domain: str) -> bool:
+    return hostname == domain or hostname.endswith(f'.{domain}')
+
+
+def is_telegram_invite_link(url: str) -> bool:
+    candidate = url if url.lower().startswith(('http://', 'https://')) else f'https://{url}'
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return False
+    host = (parsed.hostname or '').casefold()
+    return host in {'t.me', 'telegram.me'} and (
+        parsed.path.startswith('/+') or parsed.path.startswith('/joinchat/')
+    )
+
+
+def message_content_types(msg: Message) -> Set[str]:
+    types = set()
+    if msg.sticker:
+        types.add('sticker')
+    if getattr(msg, 'voice', None):
+        types.add('voice')
+    if getattr(msg, 'video_note', None):
+        types.add('video_note')
+    if getattr(msg, 'video', None) or getattr(msg, 'animation', None):
+        types.add('video')
+    if getattr(msg, 'audio', None):
+        types.add('audio')
+    if getattr(msg, 'document', None):
+        types.add('document')
+    if getattr(msg, 'photo', None):
+        types.add('photo')
+    if (
+        getattr(msg, 'forward_origin', None)
+        or getattr(msg, 'forward_from', None)
+        or getattr(msg, 'forward_from_chat', None)
+    ):
+        types.add('forward')
+    return types
+
+
+def stop_word_matches(text: str, word: str) -> bool:
+    escaped = re.escape(word).replace(r'\ ', r'\s+')
+    return bool(re.search(rf'(?<!\w){escaped}(?!\w)', text, flags=re.IGNORECASE))
+
 
 class AntiSpamSystem:
     def __init__(self):
@@ -520,6 +628,16 @@ class AntiSpamSystem:
         chat_user = (msg.chat.id, msg.from_user.id)
         now = time.time()
         self.cleanup()
+        if getattr(msg, 'edit_date', None):
+            for tracker_name in (
+                'user_stickers', 'user_animations', 'user_links', 'user_mentions',
+                'user_messages', 'user_fragments', 'user_caps',
+            ):
+                tracker = getattr(self, tracker_name)[chat_user]
+                tracker[:] = [
+                    item for item in tracker
+                    if len(item) < 2 or item[1] != msg.message_id
+                ]
         self._remember_message(chat_user, msg, now)
 
         recent_rate = [
@@ -569,17 +687,34 @@ class AntiSpamSystem:
 
         stripped_text = content.lstrip()
         prefix = get_command_prefix(msg.chat.id)
-        if (
-            stripped_text.startswith(('!', '/'))
-            or (prefix and stripped_text.startswith(prefix))
-            or (not prefix and match_command(stripped_text)[0] is not None)
-        ):
+        command_candidate = None
+        if prefix and stripped_text.startswith(prefix):
+            command_candidate = strip_command_prefix(stripped_text, msg.chat.id)
+        elif stripped_text.startswith('/'):
+            slash_command = stripped_text[1:].split(maxsplit=1)
+            slash_command[0] = slash_command[0].split('@', 1)[0]
+            command_candidate = ' '.join(slash_command)
+        elif not prefix:
+            command_candidate = strip_command_prefix(stripped_text, msg.chat.id)
+        if command_candidate and match_command(command_candidate)[0] is not None:
             return False, None, []
 
-        links = tuple(
-            match.group(0).rstrip('.,!?;:)')
-            for match in re.finditer(r'https?://\S+|www\.\S+', content, flags=re.IGNORECASE)
+        links = extract_message_links(msg, content)
+        chat_settings = storage.get_chat_settings(msg.chat.id)
+        content_filters = chat_settings.get('content_filters', {})
+        allow_domains = (
+            content_filters.get('allow_domains', [])
+            if isinstance(content_filters, dict) else []
         )
+        if isinstance(allow_domains, list):
+            links = tuple(
+                link for link in links
+                if not any(
+                    isinstance(domain, str)
+                    and domain_matches(extract_url_domain(link), domain)
+                    for domain in allow_domains
+                )
+            )
         if links:
             normalized_links = tuple(link.lower() for link in links)
             recent_links = [
@@ -605,7 +740,13 @@ class AntiSpamSystem:
                     ]
                 else:
                     spam_ids = [mid for _, mid, _ in recent_link_burst]
-                return True, "Спам-ссылками", spam_ids
+                contains_invite = any(
+                    is_telegram_invite_link(url)
+                    for _, _, urls in recent_links
+                    for url in urls
+                )
+                reason = "Спам-ссылкой-приглашением" if contains_invite else "Спам-ссылками"
+                return True, reason, spam_ids
 
         mention_count = len(re.findall(r'@\w+', content))
         if mention_count:
@@ -672,17 +813,80 @@ class AntiSpamSystem:
 anti_spam = AntiSpamSystem()
 
 
-async def handle_anti_spam(msg: Message) -> bool:
-    if not msg.from_user or msg.from_user.is_bot:
+async def enforce_content_filters(msg: Message, settings: dict) -> bool:
+    filters = settings.get('content_filters', {})
+    if not isinstance(filters, dict):
         return False
 
+    content = msg.text or msg.caption or ''
+    blocked_type_names = filters.get('blocked_types', [])
+    blocked_types = (
+        {name for name in blocked_type_names if isinstance(name, str)}
+        if isinstance(blocked_type_names, list) else set()
+    )
+    if blocked_types.intersection(message_content_types(msg)):
+        violation = "запрещённый тип сообщения"
+    else:
+        stop_words = filters.get('stop_words', [])
+        if isinstance(stop_words, list) and any(
+            isinstance(word, str) and word and stop_word_matches(content, word)
+            for word in stop_words
+        ):
+            violation = "стоп-слово"
+        else:
+            block_domains = filters.get('block_domains', [])
+            if not isinstance(block_domains, list):
+                block_domains = []
+            links = extract_message_links(msg, content)
+            blocked_domain = next(
+                (
+                    domain
+                    for link in links
+                    for domain in block_domains
+                    if isinstance(domain, str)
+                    and domain_matches(extract_url_domain(link.rstrip('.,!?;:)')), domain)
+                ),
+                None,
+            )
+            if blocked_domain:
+                violation = f"запрещённый домен {blocked_domain}"
+            else:
+                return False
+
+    if await bot_can(msg.chat.id, 'can_delete_messages') is not True:
+        return False
+    try:
+        await bot.delete_message(msg.chat.id, msg.message_id)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            "Фильтр не смог удалить сообщение %s в чате %s (%s): %s",
+            msg.message_id, msg.chat.id, violation, exc
+        )
+    return True
+
+
+async def handle_anti_spam(msg: Message) -> bool:
     if msg.chat.type not in ('group', 'supergroup'):
         return False
 
+    settings = storage.get_chat_settings(msg.chat.id)
+    if msg.sender_chat and settings.get('hide_channel_messages', False):
+        if await bot_can(msg.chat.id, 'can_delete_messages'):
+            try:
+                await bot.delete_message(msg.chat.id, msg.message_id)
+            except (TelegramAPIError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Не удалось удалить сообщение от канала %s в чате %s: %s",
+                    msg.sender_chat.id, msg.chat.id, exc
+                )
+        return True
+
+    if not msg.from_user or msg.from_user.is_bot:
+        return False
     if await is_anti_spam_admin(msg.chat.id, msg.from_user.id):
         return False
-
-    settings = storage.get_chat_settings(msg.chat.id)
+    if await enforce_content_filters(msg, settings):
+        return True
     if not settings.get('anti_spam', {}).get('enabled', True):
         return False
 
@@ -692,15 +896,16 @@ async def handle_anti_spam(msg: Message) -> bool:
 
     deleted_ids = set()
     deduped_ids = list(dict.fromkeys(message_ids))
-    for message_id in deduped_ids:
-        try:
-            await bot.delete_message(msg.chat.id, message_id)
-            deleted_ids.add(message_id)
-        except Exception as e:
-            logger.warning(
-                "Антиспам: не удалось удалить сообщение %s в чате %s: %s",
-                message_id, msg.chat.id, e
-            )
+    if await bot_can(msg.chat.id, 'can_delete_messages'):
+        for message_id in deduped_ids:
+            try:
+                await bot.delete_message(msg.chat.id, message_id)
+                deleted_ids.add(message_id)
+            except Exception as e:
+                logger.warning(
+                    "Антиспам: не удалось удалить сообщение %s в чате %s: %s",
+                    message_id, msg.chat.id, e
+                )
 
     for message_id in deleted_ids:
         activity_date = anti_spam.pop_message_date(msg.chat.id, msg.from_user.id, message_id)
@@ -723,10 +928,15 @@ async def handle_anti_spam(msg: Message) -> bool:
     ]
     if any(mute.get('permanent') is True for mute in active_mutes):
         return True
+    if not await bot_can(msg.chat.id, 'can_restrict_members'):
+        return True
     base_wait = 60
     if reason == 'Капс-флуд':
         base_wait = 120
-    elif reason in {'Спам-ссылками', 'Массовые упоминания', 'Флуд короткими сообщениями'}:
+    elif reason in {
+        'Спам-ссылками', 'Спам-ссылкой-приглашением',
+        'Массовые упоминания', 'Флуд короткими сообщениями',
+    }:
         base_wait = 180
     mute_until = max([now + base_wait] + [mute['expire_time'] for mute in active_mutes])
     try:
@@ -768,6 +978,14 @@ async def handle_anti_spam(msg: Message) -> bool:
             'reason': f'Антиспам: {reason}'
         })
 
+    log_moderation(
+        msg.chat.id,
+        None,
+        msg.from_user.id,
+        'auto_mute',
+        f'Антиспам: {reason}',
+        max(1, round((mute_until - now))),
+    )
     storage.mark_dirty()
     await storage.save()
     return True
@@ -794,7 +1012,8 @@ class DataStorage:
         self._saved_version = 0
         self._chat_user_index: Dict[str, Dict[str, Dict[str, int]]] = {}
         self._loaded_user_chats: Set[str] = set()
-        self._dirty_users: Set[Tuple[str, str]] = set()
+        self._dirty_users: Dict[Tuple[str, str], int] = {}
+        self._mutation_seq = 0
         self._deleted_user_keys: Set[Tuple[str, str]] = set()
         self._deleted_user_chats: Set[str] = set()
         self._replace_all_users = False
@@ -808,7 +1027,8 @@ class DataStorage:
         return {
             'users': {}, 'command_access': {}, 'personal_access': {}, 'chat_owners': {},
             'bot_chats': {},
-            'mutes': {}, 'phrases': {},
+            'blocked_chats': {}, 'superadmin_audit': [],
+            'mutes': {}, 'moderation_log': {}, 'captcha_pending': {}, 'phrases': {},
             'welcome_settings': {}, 'marriages': {},
             'games': {}, 'backups': [], 'chat_settings': {}, 'rules': {}, 'polls': {},
             'rank_names': {}, 'rank_emoji': {}, 'activity_graph_presets': {}
@@ -819,7 +1039,7 @@ class DataStorage:
         """Создаёт пользователя с правильными полями."""
         return {
             'id': uid, 'username': '', 'first_name': '', 'rank': 0,
-            'reputation': 0, 'last_rep_time_by_target': {}, 'last_rep_removed_time_by_target': {},
+            'reputation': 0,
             'birthday': None,
             'rep_given_today': {},
             'rep_given_total': 0, 'warnings': [], 'awards': [], 'marriage_partner': None,
@@ -831,8 +1051,9 @@ class DataStorage:
             'last_seen': time.time(), 'night_messages': 0,
             'early_messages': 0, 'reports_sent': 0, 'phrases_added': 0,
             'marriage_count': 0, 'divorced_count': 0, 'proposals_sent': 0,
-            'proposals_rejected': 0, 'chats_activity': {},
-            'rp_victims_sex': [], 'rp_victims_kill': []
+            'proposals_rejected': 0,
+            'candies': 0, 'candy_steal_successes': 0,
+            'candy_steal_streak': 0, 'candy_steal_next_at': 0,
         }
 
     def load(self):
@@ -1158,7 +1379,7 @@ class DataStorage:
                 self._connection,
                 *snapshot[:5],
             )
-        self._dirty_users.difference_update(snapshot[5])
+        self._clear_saved_dirty_users(snapshot[5])
         self._deleted_user_keys.difference_update(snapshot[6])
         self._deleted_user_chats.difference_update(snapshot[7])
         self._replace_all_users = False
@@ -1200,7 +1421,8 @@ class DataStorage:
             default=str,
         )
         users = self.data.get('users', {})
-        dirty_user_keys = set(self._dirty_users)
+        dirty_user_versions = dict(self._dirty_users)
+        dirty_user_keys = set(dirty_user_versions)
         deleted_user_keys = set(self._deleted_user_keys)
         if self._replace_all_users:
             user_items = (
@@ -1235,7 +1457,7 @@ class DataStorage:
             deleted_user_keys,
             deleted_user_chats,
             self._replace_all_users,
-            dirty_user_keys,
+            dirty_user_versions,
             set(self._deleted_user_keys),
             deleted_user_chats,
         )
@@ -1365,9 +1587,9 @@ class DataStorage:
                 if create_backup:
                     self._last_backup_ts = now_ts
                 if self._change_version == save_version:
-                    self._dirty_users.difference_update(snapshot[5])
                     self._deleted_user_keys.difference_update(snapshot[6])
                     self._deleted_user_chats.difference_update(snapshot[7])
+                self._clear_saved_dirty_users(snapshot[5])
                 if snapshot[4] and self._change_version == save_version:
                     self._replace_all_users = False
 
@@ -1500,21 +1722,69 @@ class DataStorage:
                     logger.warning("Не удалось удалить старый файл бэкапа %s: %s", old_path, error)
         return created_at
 
+    async def list_backups(self) -> List[dict]:
+        return await asyncio.to_thread(self._list_backups_sync)
+
+    def _list_backups_sync(self) -> List[dict]:
+        connection = sqlite3.connect(str(self._database_path), timeout=30)
+        try:
+            rows = connection.execute(
+                "SELECT id, created_at, backup_path FROM backup_snapshots ORDER BY id DESC"
+            ).fetchall()
+            internal_snapshots = {
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT tree_id FROM data_nodes"
+                )
+            }
+        finally:
+            connection.close()
+
+        result = []
+        for backup_id, created_at, backup_path in rows:
+            size = None
+            exists = backup_id in internal_snapshots if backup_path is None else False
+            if backup_path:
+                try:
+                    size = Path(backup_path).stat().st_size
+                    exists = True
+                except OSError:
+                    exists = False
+            result.append({
+                'id': backup_id,
+                'ts': created_at,
+                'path': backup_path,
+                'size': size,
+                'exists': exists,
+            })
+        return result
+
     async def get_latest_backup(self) -> Optional[dict]:
         return await asyncio.to_thread(self._get_latest_backup_sync)
 
-    def _get_latest_backup_sync(self) -> Optional[dict]:
+    async def get_backup(self, backup_id: int) -> Optional[dict]:
+        return await asyncio.to_thread(self._get_latest_backup_sync, backup_id)
+
+    def _get_latest_backup_sync(self, backup_id: Optional[int] = None) -> Optional[dict]:
         connection = sqlite3.connect(str(self._database_path), timeout=30)
         try:
-            row = connection.execute(
-                "SELECT id, created_at, backup_path FROM backup_snapshots "
-                "ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+            if backup_id is None:
+                row = connection.execute(
+                    "SELECT id, created_at, backup_path FROM backup_snapshots "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT id, created_at, backup_path FROM backup_snapshots WHERE id = ?",
+                    (backup_id,),
+                ).fetchone()
             if not row:
                 return None
             backup_id, created_at, backup_path = row
             if not backup_path:
-                return {'ts': created_at, 'data': self._load_tree(backup_id, connection)}
+                return {
+                    'id': backup_id, 'ts': created_at, 'path': None,
+                    'data': self._load_tree(backup_id, connection),
+                }
         finally:
             connection.close()
 
@@ -1536,7 +1806,7 @@ class DataStorage:
                 "SELECT chat_id, user_id, value_json FROM users"
             ):
                 data['users'].setdefault(chat_id, {})[user_id] = json.loads(value_json)
-            return {'ts': created_at, 'data': data}
+            return {'id': backup_id, 'ts': created_at, 'path': str(snapshot_path), 'data': data}
         finally:
             snapshot_connection.close()
 
@@ -1561,12 +1831,55 @@ class DataStorage:
         self._dirty = True
         self._change_version += 1
 
+    def _mark_user_dirty(self, chat_id: str, user_id: str):
+        self._mutation_seq += 1
+        self._dirty_users[(chat_id, user_id)] = self._mutation_seq
+
+    @staticmethod
+    def _prune_expired_user_warnings(user: dict) -> bool:
+        warnings = user.get('warnings')
+        if not isinstance(warnings, list):
+            if warnings is None:
+                return False
+            user['warnings'] = []
+            return True
+
+        active_warnings = [
+            warning
+            for warning in warnings
+            if isinstance(warning, dict)
+            and (
+                warning.get('permanent') is True
+                or isinstance(warning.get('expire_date'), (int, float))
+                and warning['expire_date'] > time.time()
+            )
+        ]
+        if len(active_warnings) == len(warnings):
+            return False
+        user['warnings'] = active_warnings
+        return True
+
+    def _clear_saved_dirty_users(self, saved_versions: Dict[Tuple[str, str], int]):
+        for key, version in saved_versions.items():
+            if self._dirty_users.get(key) == version:
+                self._dirty_users.pop(key, None)
+
     def _cleanup_old_games(self):
         now = time.time()
-        if 'games' in self.data:
-            expired = [gid for gid, game in self.data['games'].items() if now - game.get('started_at', now) > 86400]
-            for gid in expired:
-                del self.data['games'][gid]
+        games = self.data.get('games')
+        if not isinstance(games, dict):
+            return
+        expired = [
+            game_id
+            for game_id, game in games.items()
+            if isinstance(game, dict)
+            and isinstance(game.get('started_at'), (int, float))
+            and now - game['started_at'] > 86400
+        ]
+        for game_id in expired:
+            del games[game_id]
+        if expired:
+            self.mark_dirty()
 
     def invalidate_chat_user_index(self, chat_id: int):
         self._chat_user_index.pop(str(chat_id), None)
@@ -1622,8 +1935,11 @@ class DataStorage:
         if use_cache:
             cached = user_cache.get(cache_key)
             if cached:
+                if self._prune_expired_user_warnings(cached):
+                    self._mark_user_dirty(chat_str, uid_str)
+                    self.mark_dirty()
                 if track_dirty:
-                    self._dirty_users.add((chat_str, uid_str))
+                    self._mark_user_dirty(chat_str, uid_str)
                 return cached
 
         if (
@@ -1638,10 +1954,8 @@ class DataStorage:
             self._loaded_user_chats.discard('legacy')
             self._loaded_user_chats.add(chat_str)
             self._deleted_user_chats.add('legacy')
-            self._dirty_users.update(
-                (chat_str, user_id)
-                for user_id in self.data['users'][chat_str]
-            )
+            for user_id in self.data['users'][chat_str]:
+                self._mark_user_dirty(chat_str, user_id)
             self._chat_user_index.clear()
             self.mark_dirty()
         if chat_str not in self.data['users']:
@@ -1662,7 +1976,6 @@ class DataStorage:
             self.data['users'][chat_str][uid_str] = user
 
         default_fields = {
-            'chats_activity': {},
             'night_messages': 0,
             'early_messages': 0,
             'reports_sent': 0,
@@ -1671,6 +1984,10 @@ class DataStorage:
             'divorced_count': 0,
             'proposals_sent': 0,
             'proposals_rejected': 0,
+            'candies': 0,
+            'candy_steal_successes': 0,
+            'candy_steal_streak': 0,
+            'candy_steal_next_at': 0,
             'total_mutes_survived': 0,
             'custom_tag': '',
             'custom_name': '',
@@ -1678,8 +1995,6 @@ class DataStorage:
             'username': '',
             'rank': 0,
             'reputation': 0,
-            'last_rep_time_by_target': {},
-            'last_rep_removed_time_by_target': {},
             'warnings': [],
             'awards': [],
             'activity': {},
@@ -1690,9 +2005,26 @@ class DataStorage:
         for field, default_value in default_fields.items():
             if field not in user:
                 user[field] = default_value
+        removed_legacy_fields = False
+        for field in (
+            'chats_activity',
+            'rp_victims_sex',
+            'rp_victims_kill',
+            'last_rep_time_by_target',
+            'last_rep_removed_time_by_target',
+        ):
+            if field in user:
+                del user[field]
+                removed_legacy_fields = True
+        if self._prune_expired_user_warnings(user):
+            removed_legacy_fields = True
+
+        if removed_legacy_fields:
+            self._mark_user_dirty(chat_str, uid_str)
+            self.mark_dirty()
 
         if track_dirty:
-            self._dirty_users.add((chat_str, uid_str))
+            self._mark_user_dirty(chat_str, uid_str)
         if use_cache:
             user_cache.set(cache_key, user)
         return user
@@ -1763,6 +2095,18 @@ class DataStorage:
                 'command_prefix': '!',
                 'anti_moderation': True,
                 'anti_spam': {'enabled': ANTI_SPAM_ENABLED},
+                'join_request_mode': 'off',
+                'captcha_enabled': False,
+                'raid_mode': False,
+                'hide_channel_messages': False,
+                'reason_templates': [],
+                'moderation_notice_delete_seconds': 0,
+                'content_filters': {
+                    'stop_words': [],
+                    'blocked_types': [],
+                    'allow_domains': [],
+                    'block_domains': [],
+                },
                 'warn_actions': [{'count': 3, 'action': 'mute', 'duration': 60},
                                  {'count': 5, 'action': 'mute', 'duration': 1440},
                                  {'count': MAX_WARNINGS, 'action': 'ban', 'duration': 0}]
@@ -2422,11 +2766,30 @@ def has_explicit_target(msg: Message, arg: Optional[str]) -> bool:
 
 
 CHAT_DEFAULT_PERMISSIONS_CACHE_TTL = 60
+CHAT_DEFAULT_PERMISSIONS_CACHE_MAX_SIZE = 1000
 chat_default_permissions_cache: Dict[int, Tuple[float, ChatPermissions]] = {}
+
+
+def _prune_chat_default_permissions_cache(now: float):
+    expired_ids = [
+        chat_id
+        for chat_id, (expires_at, _) in chat_default_permissions_cache.items()
+        if expires_at <= now
+    ]
+    for chat_id in expired_ids:
+        chat_default_permissions_cache.pop(chat_id, None)
+    if len(chat_default_permissions_cache) >= CHAT_DEFAULT_PERMISSIONS_CACHE_MAX_SIZE:
+        oldest_ids = sorted(
+            chat_default_permissions_cache,
+            key=lambda chat_id: chat_default_permissions_cache[chat_id][0],
+        )[:len(chat_default_permissions_cache) - CHAT_DEFAULT_PERMISSIONS_CACHE_MAX_SIZE + 1]
+        for chat_id in oldest_ids:
+            chat_default_permissions_cache.pop(chat_id, None)
 
 
 async def restore_chat_default_permissions(chat_id: int, user_id: int) -> None:
     now = time.monotonic()
+    _prune_chat_default_permissions_cache(now)
     cached = chat_default_permissions_cache.get(chat_id)
     if cached and now < cached[0]:
         permissions = cached[1]
@@ -2586,6 +2949,7 @@ async def _sync_chat_owner_locked(chat_id: int, lock: asyncio.Lock):
 async def handle_my_chat_member_update(update: ChatMemberUpdated):
     chat_owner_sync_cache.pop(update.chat.id, None)
     anti_spam_admin_cache.invalidate_prefix(f"{update.chat.id}:")
+    bot_rights_cache.invalidate_prefix(f"{update.chat.id}:")
     new_member = update.new_chat_member
     if new_member.status in ('left', 'kicked') or (
         new_member.status == 'restricted' and not new_member.is_member
@@ -2660,6 +3024,68 @@ async def is_anti_spam_admin(chat_id: int, uid: int) -> bool:
     is_admin = member.status in ('administrator', 'creator')
     anti_spam_admin_cache.set(cache_key, is_admin)
     return is_admin
+
+
+async def bot_can(chat_id: int, right: str) -> Optional[bool]:
+    cache_key = f"{chat_id}:{right}"
+    cached = bot_rights_cache.get(cache_key)
+    if cached is not None:
+        return None if cached == 'error' else cached
+
+    try:
+        member = await bot.get_chat_member(chat_id, bot.id)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            "Не удалось проверить право %s бота в чате %s: %s",
+            right, chat_id, exc
+        )
+        bot_rights_cache.set(cache_key, 'error', ttl=10)
+        return None
+
+    allowed = member.status == 'creator' or (
+        member.status == 'administrator' and bool(getattr(member, right, False))
+    )
+    if not allowed:
+        logger.warning("У бота нет права %s в чате %s", right, chat_id)
+    bot_rights_cache.set(cache_key, allowed)
+    return allowed
+
+
+async def require_bot_right(msg: Message, right: str, action: str) -> bool:
+    allowed = await bot_can(msg.chat.id, right)
+    if allowed is True:
+        return True
+    if allowed is None:
+        await msg.answer(
+            "❌ Не удалось проверить права бота через Telegram. "
+            "Попробуйте выполнить действие позже."
+        )
+        return False
+    await msg.answer(
+        f"❌ Боту нужны права администратора Telegram для действия «{action}». "
+        "Проверьте права бота в настройках чата."
+    )
+    return False
+
+
+async def require_target_not_telegram_admin(msg: Message, target_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(msg.chat.id, target_id)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            "Не удалось проверить статус цели %s в чате %s: %s",
+            target_id, msg.chat.id, exc
+        )
+        await msg.answer(
+            "❌ Не удалось проверить статус пользователя в Telegram. "
+            "Попробуйте ещё раз позже."
+        )
+        return False
+
+    if member.status in ('administrator', 'creator'):
+        await msg.answer("❌ Нельзя наказать администратора Telegram.")
+        return False
+    return True
 
 
 async def require_telegram_admin(msg: Message) -> bool:
@@ -2742,6 +3168,15 @@ def get_graph_emoji_fonts() -> Tuple[Tuple[str, Any], ...]:
     )
     fonts = []
     seen_paths = set()
+    for path in _get_local_meme_emoji_fonts():
+        path = str(path)
+        try:
+            glyphs = FT2Font(path).get_charmap()
+        except (OSError, RuntimeError):
+            continue
+        fonts.append((path, glyphs))
+        seen_paths.add(path)
+
     for preferred in preferred_names:
         for entry in font_manager.fontManager.ttflist:
             if preferred.casefold() not in entry.name.casefold() or entry.fname in seen_paths:
@@ -2922,6 +3357,15 @@ def remove_message_activity(chat_id: int, uid: int, activity_date: str):
     
 class MessageStatsMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        event_chat = getattr(event, 'chat', None)
+        blocked_chats = storage.data.get('blocked_chats', {})
+        if (
+            event_chat
+            and isinstance(blocked_chats, dict)
+            and str(event_chat.id) in blocked_chats
+        ):
+            return None
+
         if isinstance(event, Message) and event.from_user and not event.from_user.is_bot:
             if event.chat.type in ('group', 'supergroup'):
                 remember_bot_group_chat(event.chat)
@@ -2953,6 +3397,12 @@ class PrivateCommandRestrictionMiddleware(BaseMiddleware):
         prefix = get_command_prefix(event.chat.id)
         cleaned = strip_command_prefix(text, event.chat.id)
         command_name, _ = match_command(cleaned)
+        if (
+            first_token in {'/help', '/info'}
+            or command_name in {'инфо', 'помощь', 'help', 'info'}
+        ):
+            return await handler(event, data)
+
         normalized_command = cleaned.casefold()
         is_rp_command = any(
             normalized_command == action or normalized_command.startswith(action + ' ')
@@ -3074,20 +3524,32 @@ def load_graph_font_options() -> Dict[str, str]:
     return fonts
 
 
-GRAPH_FONT_OPTIONS = load_graph_font_options()
-DEFAULT_GRAPH_FONT = 'Carlito' if 'Carlito' in GRAPH_FONT_OPTIONS else next(
-    iter(GRAPH_FONT_OPTIONS), 'DejaVu Sans'
-)
+GRAPH_FONT_OPTIONS: Dict[str, str] = {}
+DEFAULT_GRAPH_FONT = 'DejaVu Sans'
+_GRAPH_FONTS_LOADED = False
+
+
+def _initialize_graph_fonts():
+    global DEFAULT_GRAPH_FONT, _GRAPH_FONTS_LOADED
+    if _GRAPH_FONTS_LOADED:
+        return
+    fonts = load_graph_font_options()
+    GRAPH_FONT_OPTIONS.update(fonts)
+    DEFAULT_GRAPH_FONT = 'Carlito' if 'Carlito' in fonts else next(
+        iter(fonts), 'DejaVu Sans'
+    )
+    _GRAPH_FONTS_LOADED = True
 
 
 def refresh_graph_fonts() -> bool:
-    global DEFAULT_GRAPH_FONT
+    global DEFAULT_GRAPH_FONT, _GRAPH_FONTS_LOADED
     if GRAPH_RENDER_LOCK.locked():
         return False
     fonts = load_graph_font_options()
     changed = fonts != GRAPH_FONT_OPTIONS
     GRAPH_FONT_OPTIONS.clear()
     GRAPH_FONT_OPTIONS.update(fonts)
+    _GRAPH_FONTS_LOADED = True
     DEFAULT_GRAPH_FONT = 'Carlito' if 'Carlito' in GRAPH_FONT_OPTIONS else next(
         iter(GRAPH_FONT_OPTIONS), 'DejaVu Sans'
     )
@@ -3221,6 +3683,14 @@ def create_graph(
 ) -> Optional[BytesIO]:
     if not MATPLOTLIB_AVAILABLE:
         return None
+    try:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from matplotlib.ticker import MaxNLocator
+        _initialize_graph_fonts()
+    except ImportError:
+        logger.exception("Matplotlib недоступен для создания графика")
+        return None
     act = user_data.get('activity', {})
     if not act and not preview:
         return None
@@ -3253,18 +3723,17 @@ def create_graph(
         font_name = settings.get('font', DEFAULT_GRAPH_FONT)
         if font_name not in font_options:
             font_name = DEFAULT_GRAPH_FONT
-        old_font_family = plt.rcParams['font.family']
-        plt.rcParams['font.family'] = font_name
-
-        fig, ax = plt.subplots(figsize=(10, 4.8), facecolor=background)
+        fig = Figure(figsize=(10, 4.8), facecolor=background)
+        FigureCanvasAgg(fig)
+        ax = fig.subplots()
         fig.subplots_adjust(left=0.09, right=0.97, top=0.77, bottom=0.19)
         ax.set_facecolor(panel)
-        graph_name = strip_graph_emojis(str(
+        graph_name = str(
             user_data.get('custom_name')
             or user_data.get('first_name')
             or user_data.get('username')
             or f'ID:{uid}'
-        )).strip() or f'ID:{uid}'
+        ).strip() or f'ID:{uid}'
         add_graph_text(
             fig,
             f'Активность · {graph_name}',
@@ -3307,7 +3776,7 @@ def create_graph(
             axis='x', colors=muted, labelsize=8, length=3, pad=8,
             top=False, bottom=True, direction='in',
         )
-        ax.set_yticks(plt.MaxNLocator(nbins=4, integer=True).tick_values(0, max(maximum, 1)))
+        ax.set_yticks(MaxNLocator(nbins=4, integer=True).tick_values(0, max(maximum, 1)))
         label_step = max(1, (len(dates) + 5) // 6)
         date_label_indices = [
             index for index in positions
@@ -3315,6 +3784,8 @@ def create_graph(
         ]
         ax.set_xticks(date_label_indices)
         ax.set_xticklabels([dates[index].strftime('%d.%m') for index in date_label_indices])
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontfamily(font_name)
         for spine in ax.spines.values():
             spine.set_visible(False)
         for index, count in enumerate(messages):
@@ -3342,20 +3813,15 @@ def create_graph(
                     (positions[index], count),
                     xytext=offset, textcoords='offset points',
                     ha='center', va=vertical_alignment, color=text_color,
-                    fontsize=7, fontweight='bold', zorder=6,
+                    fontsize=7, fontweight='bold', fontfamily=font_name, zorder=6,
                     bbox={'facecolor': panel, 'edgecolor': 'none', 'alpha': 0.9, 'pad': 0.2},
                 )
         buf = BytesIO()
-        fig.savefig(buf, format='png', dpi=150, facecolor=background)
+        fig.savefig(buf, format='png', dpi=120, facecolor=background)
         buf.seek(0)
-        plt.close(fig)
-        plt.rcParams['font.family'] = old_font_family
         return buf
     except Exception:
         logger.exception("Не удалось создать график активности пользователя %s", uid)
-        plt.close('all')
-        if 'old_font_family' in locals():
-            plt.rcParams['font.family'] = old_font_family
         return None
 
 
@@ -3366,8 +3832,16 @@ async def create_graph_async(
     settings: Optional[dict] = None,
     preview: bool = False,
 ) -> Optional[BytesIO]:
-    user_data = copy.deepcopy(storage.peek_user(chat_id, uid))
+    user_data = storage.peek_user(chat_id, uid)
+    user_data = dict(user_data)
+    activity = user_data.get('activity')
+    user_data['activity'] = dict(activity) if isinstance(activity, dict) else {}
     graph_settings = copy.deepcopy(settings) if settings else get_activity_graph_settings(chat_id, uid)
+    try:
+        _initialize_graph_fonts()
+    except ImportError:
+        logger.exception("Шрифты Matplotlib недоступны для создания графика")
+        return None
     graph_fonts = dict(GRAPH_FONT_OPTIONS)
     async with GRAPH_RENDER_LOCK:
         return await asyncio.to_thread(
@@ -3630,7 +4104,7 @@ REPUTATION_REMOVE_WORDS = frozenset({
     'не зашло', 'так себе', 'слабовато', 'мимо', 'не круто',
     'плохо', 'плохой', 'плохая', 'ужас', 'отстой', 'фу', 'кринж',
     'стыдно', 'позор', 'провал', 'фейл', 'разочаровал', 'разочаровала',
-    'хуйня', 'говно', 'дерьмо', 'говнище', 'пиздец',
+    'хуйня', 'говно', 'дерьмо', 'говнище',
     'dislike', 'downvote', 'down vote', 'bad', 'nope', 'boo',
     'worst', 'terrible', 'awful', 'hate', 'not cool', 'not good',
     'not impressed', 'disappointed', 'disappointing', 'cringe',
@@ -3715,6 +4189,23 @@ COMMANDS = {
     'название ранга': 'cmd_rank_rename',
     'переранг': 'cmd_rank_rename',
     'ид': 'cmd_id',
+    'ram': 'cmd_ram',
+    'память': 'cmd_ram',
+    'логи': 'cmd_logs',
+    'бэкапы': 'cmd_backups',
+    'статус': 'cmd_status',
+    'сохранить': 'cmd_save_now',
+    'права': 'cmd_bot_rights',
+    'сброс кэшей': 'cmd_reset_caches',
+    'юзер': 'cmd_export_user',
+    'бд': 'cmd_database_info',
+    'gc': 'cmd_gc',
+    'рассылка': 'cmd_broadcast',
+    'выйти': 'cmd_leave_chat',
+    'блок чата': 'cmd_block_chat',
+    'разблок чата': 'cmd_unblock_chat',
+    'рестарт': 'cmd_restart',
+    'аудит': 'cmd_superadmin_audit',
     'др': 'cmd_birthday',
     'день рождение': 'cmd_birthday',
     'birthday': 'cmd_birthday',
@@ -3726,6 +4217,19 @@ COMMANDS = {
     'размут': 'cmd_unmute',
     'бан': 'cmd_ban',
     'разбан': 'cmd_unban',
+    'кик': 'cmd_kick',
+    'история': 'cmd_moderation_history',
+    'лог': 'cmd_moderation_log',
+    'модстат': 'cmd_moderation_stats',
+    'причины': 'cmd_reason_templates',
+    'автоудаление': 'cmd_moderation_auto_delete',
+    'заявки': 'cmd_join_requests',
+    'фильтр': 'cmd_filters',
+    'капча': 'cmd_captcha',
+    'рейд': 'cmd_raid_mode',
+    'закрыть': 'cmd_freeze_chat',
+    'открыть': 'cmd_unfreeze_chat',
+    'каналы': 'cmd_channel_autohide',
     '-мут': 'cmd_unmute',
     '-бан': 'cmd_unban',
     'пред': 'cmd_warn',
@@ -3809,6 +4313,9 @@ COMMANDS = {
     'график тема': 'cmd_activity_graph_theme',
     'график': 'cmd_activity_graph_theme',
     'шутка': 'cmd_random_joke',
+    'украсть': 'cmd_steal_candy',
+    'баланс': 'cmd_candy_balance',
+    'конфеты': 'cmd_candy_balance',
     'мем': 'cmd_meme',
     'мемер': 'cmd_meme',
     'meme': 'cmd_meme',
@@ -3881,7 +4388,7 @@ COMMAND_ERROR_HINTS = {
     'статистика': '!статистика',
     'помощь': '!помощь',
     'погода': '!погода',
-    'опрос': '!опрос Вопрос? | Да | Нет',
+    'опрос': '!опрос Вопрос?',
     'брак': '!брак @user',
     'награда': '!наградить @user Награда',
     'пинг': '!пинг',
@@ -4011,8 +4518,8 @@ async def private_start_info_callback(call: CallbackQuery):
     show_bot_admin = is_bot_superadmin(call.from_user.id)
     show_moderation = (
         show_bot_admin or (
-            call.message.chat.type != 'private'
-            and storage.get_user(call.message.chat.id, call.from_user.id).get('rank', 0) >= 1
+            call.message.chat.type == 'private'
+            or storage.get_user(call.message.chat.id, call.from_user.id).get('rank', 0) >= 1
         )
     )
     await call.message.answer(
@@ -4168,7 +4675,7 @@ HELP_SECTIONS = {
              "🤝 <b>Общение и сообщество</b>\n"
              f"{UI_LINE}\n\n"
              "🗳️ <b>Опросы и обращения</b>\n"
-             "  <code>!опрос Вопрос? | Да | Нет</code> — создать опрос с вариантами ответа\n"
+             "  <code>!опрос Вопрос?</code> — быстрый опрос с вариантами «Да» и «Нет»; свои варианты: <code>!опрос Вопрос? / Вариант 1 / Вариант 2</code> (также можно использовать <code>\\</code>)\n"
              "  <code>!репорт текст</code> — отправить жалобу администраторам чата\n\n"
              "🏷️ <b>Имя и тег</b>\n"
              "  <code>!ник Имя</code> — изменить своё отображаемое имя\n"
@@ -4186,11 +4693,23 @@ HELP_SECTIONS = {
              "  <code>!размут @user</code> / <code>!-мут @user</code> — снять мут\n"
              "  <code>!бан @user причина</code> — заблокировать (ранг 3+); чтобы забанить канал, ответьте на его сообщение командой <code>!бан причина</code>\n"
              "  <code>!разбан @user</code> / <code>!-бан @user</code> — снять бан; канал разбанивается ответом на его сообщение командой <code>!разбан</code>\n\n"
+             "  <code>!кик @user причина</code> — удалить участника из чата без блокировки (ранг 3+)\n"
+             "  <code>!бан @user 2ч причина</code> — временно заблокировать до года; срок необязателен\n"
+             "  <code>!история @user</code> — 20 действий пользователя за 90 дней; <code>!лог</code> — 20 последних записей чата (ранг 1+)\n\n"
+             "  <code>!модстат</code> — действия за неделю (ранг 1+)\n"
+             "  <code>!причины add флуд</code> — добавить шаблон; <code>!пред @user 1</code> — применить его (ранг 2+)\n"
+             "  <code>!автоудаление 30</code> — удалять ответы и команды через 30 секунд; <code>0</code> отключает (ранг 5+)\n\n"
+             "  <code>!заявки off|on|admin</code> — выключить, автоодобрять или отправлять кнопки Telegram-админам (ранг 5+)\n\n"
+             "🧩 <b>Защита чата</b>\n"
+             "  <code>!капча on|off</code> — проверка новичков кнопкой; кик через 5 минут (ранг 5+)\n"
+             "  <code>!рейд on|off</code> — сохраняемый режим; авто при 6 входах за 10 секунд (ранг 5+)\n"
+             "  <code>!закрыть 10м</code> / <code>!открыть</code> — заморозить чат и восстановить его разрешения (ранг 5+)\n"
+             "  <code>!фильтр</code> — слова, типы сообщений, домены; <code>!каналы on|off</code> — скрывать сообщения каналов (ранг 5+)\n\n"
              "⚠️ <b>Предупреждения</b>\n"
              "  <code>!пред @user причина</code> / <code>!варн</code> / <code>!warn</code> — выдать предупреждение (ранг 1+)\n"
              "  <code>!преды @user</code> / <code>!варны</code> / <code>!warns</code> — посмотреть предупреждения\n"
              "  <code>!варннастройка</code> — просмотреть действия; <code>!варннастройка 3 мут 60</code> — задать мут за 3 предупреждения\n"
-             "  Действие также можно настроить командами <code>!варннастройка 5 бан</code> или <code>!варннастройка 3 выкл</code>; <code>!варннастройка сбросить</code> возвращает настройки по умолчанию (ранг 2+)\n"
+             "  Действие также можно настроить командами <code>!варннастройка 5 бан</code>, <code>!варннастройка 3 кик</code> или <code>!варннастройка 3 выкл</code>; <code>!варннастройка сбросить</code> возвращает настройки по умолчанию (ранг 2+)\n"
              "  <code>!варнлист</code> / <code>!предлист</code> / <code>!варнылист</code> / <code>!предупреждения</code> / <code>!список предупреждений</code> / <code>!warnlist</code> / <code>!warninglist</code> / <code>!warningslist</code> — все активные предупреждения\n"
              "  <code>!снятьпред @user [номер]</code> / <code>!снятьварн</code> / <code>!-пред</code> / <code>!-варн</code> / <code>!unwarn</code> — снять предупреждение (ранг 2+)\n\n"
              "🔎 <b>Списки наказаний</b>\n"
@@ -4205,7 +4724,7 @@ HELP_SECTIONS = {
              "  Владелец Telegram-чата автоматически получает ранг 5; его ранг нельзя изменить этими командами.\n\n"
              "📝 <b>Теги участников</b>\n"
              "  <code>!погоняло @user Текст</code> — изменить тег другого участника (ранг 1+)\n\n"
-             "Для мута и бана нужны права администратора Telegram и соответствующий ранг бота. Остальные команды требуют указанный для них ранг; ответ на сообщение часто заменяет <code>@user</code>."),
+             "Эта справка доступна для чтения в личке. Модераторские команды выполняются только в группе и требуют указанный ранг; для мута и бана также нужны права администратора Telegram. Ответ на сообщение часто заменяет <code>@user</code>."),
     'awards': ("🏆 Награды и браки",
              "🏆 <b>Награды и браки</b>\n"
              f"{UI_LINE}\n\n"
@@ -4222,9 +4741,9 @@ HELP_SECTIONS = {
     'reputation': ("⭐ Репутация",
              "⭐ <b>Репутация</b>\n"
              f"{UI_LINE}\n\n"
-             "Ответьте на сообщение символом <code>+</code> или словом/эмодзи одобрения, чтобы предложить повысить репутацию; символом <code>-</code> или дизлайком — предложить снять балл.\n"
-             "Положительный или отрицательный эмодзи на стикере тоже предложит изменить репутацию. Изменение применяется только после подтверждения кнопкой отправителем реакции.\n\n"
-             "После подтверждения следующий кулдаун того же типа — 15 минут, затем он удваивается до максимума в 4 часа. Для <code>+</code> и <code>-</code> серии независимы: действие одного типа не увеличивает кулдаун другого. После 4 часов без любых изменений обе серии сбрасываются. Сохраняются дневные лимиты и ограничение на повтор для того же участника.\n"
+             "Ответьте на сообщение символом <code>+</code> или словом/эмодзи одобрения, чтобы повысить репутацию; символом <code>-</code> или дизлайком — снять балл.\n"
+             "Положительный или отрицательный эмодзи на стикере тоже изменяет репутацию сразу.\n\n"
+             "После изменения следующий кулдаун того же типа — 15 минут, затем он удваивается до максимума в 4 часа. Для <code>+</code> и <code>-</code> серии независимы: действие одного типа не увеличивает кулдаун другого. После 4 часов без любых изменений обе серии сбрасываются. Сохраняются дневные лимиты и ограничение на повтор для того же участника.\n"
              "Некоторые действия доступны с рангом или только участникам в браке."),
     'phrases': ("💬 Фразы и правила",
              "💬 <b>Фразы, приветствия и правила</b>\n"
@@ -4254,7 +4773,10 @@ HELP_SECTIONS = {
              "  <code>1 доллар</code> — пересчитать сумму в рубли, евро и другие валюты\n\n"
              "✨ <b>Для настроения</b>\n"
              "  <code>!шутка</code> — случайная шутка\n"
-             "  <code>!мем</code> / <code>!мемер</code> / <code>!meme</code> / <code>!memer</code> — сделать мем; фото можно отправить с командой, а на стикер ответить командой и текстом\n"
+             "  <code>!украсть</code> — вместе с Валерой стащить конфеты у Паши: сначала 1–3, затем добыча растёт с каждой подряд успешной кражей до 10–50 🍬. Успех: кулдаун 24 часа; провал (15%): потеря 10% запаса (округление вверх), сброс серии и кулдаун 3 часа.\n"
+             "  <code>!баланс</code> / <code>!конфеты</code> — посмотреть запас, серию и диапазон следующей добычи Валеры\n"
+             "  <code>!мем</code> / <code>!мемер</code> / <code>!meme</code> / <code>!memer</code> — меню мема с текстом и демотиватора; первый поддерживает фото, GIF, MP4, стикеры и эмодзи\n"
+             "  Для MP4 можно выбрать GIF или видео с исходным звуком; демотиватор оформляется на чёрном фоне с подписью шрифтом Times New Roman.\n"
              "  <code>!шиперим</code> — случайно выбрать пару из знакомых боту участников чата\n"
              "  <code>!моя статья</code> — получить случайную статью УК РФ в шуточном приговоре\n"
              "  <code>!валера</code> / <code>!валерка</code> / <code>!валерианыч</code> — меню функций Валеры"),
@@ -4267,7 +4789,7 @@ HELP_SECTIONS = {
              "  В дуэли оба игрока выбирают удар, сильный удар или защиту кнопками в чате; личка не нужна.\n"
              "  <code>!кнб</code> — камень-ножницы-бумага; <code>!кнб бот</code> — против бота\n"
              "  <code>!камень</code> / <code>!ножницы</code> / <code>!бумага</code> — ход в КНБ\n"
-             "  <code>!сапёр</code> — игра в сапёра с выбором сложности и поля 5×5, 9×9 или 12×12\n"
+             "  <code>!сапёр</code> — игра в сапёра с выбором сложности: 5×5, 7×7 или 8×9\n"
              "  <code>!крестики нолики</code> / <code>!ttt</code> — крестики-нолики\n"
              "  <code>!wordle</code> / <code>!вордле</code> / <code>!вордл</code> / <code>!слово</code> / <code>!угадай слово</code> — Wordle\n"
              "  В Wordle отвечайте словом на сообщение игры; <code>!wordle exit</code> — выйти, <code>!wordle stop</code> — остановить.\n\n"
@@ -4309,10 +4831,23 @@ HELP_SECTIONS = {
              f"{UI_LINE}\n\n"
              "Этот раздел и все перечисленные здесь команды доступны только главным администраторам бота.\n\n"
              "💾 <b>Резервные копии</b>\n"
-             "  <code>!бэкап</code> — создать резервную копию данных\n"
-             "  <code>!восстановить</code> — восстановить данные из последней копии; действие нужно подтвердить кнопкой\n"
-             "  Команды работают как в группе, так и в личном чате с ботом.\n\n"
-             "💬 <code>!группы</code> / <code>!чаты</code> — показать группы, где находится бот\n\n"
+             "  <code>!бэкап</code> — создать резервную копию\n"
+             "  <code>!бэкапы</code> — список копий с датой/размером и выбором для восстановления\n"
+             "  <code>!восстановить [id]</code> — запросить восстановление последней или выбранной копии\n"
+             "  <code>!бэкап файл</code> — создать копию и отправить SQLite-файл в личный чат\n\n"
+             "🛠️ <b>Диагностика и обслуживание</b>\n"
+             "  <code>!логи [уровень] [N]</code> — хвост лог-файла (только в личке)\n"
+             "  <code>!статус</code> — аптайм, версия, БД, кэши, задачи и RSS\n"
+             "  <code>!сохранить</code> — принудительно записать состояние в SQLite\n"
+             "  <code>!права &lt;chat_id&gt;</code> — проверить права бота в чате\n"
+             "  <code>!сброс кэшей</code>, <code>!юзер chat_id user_id</code>, <code>!бд</code>, <code>!gc</code>\n\n"
+             "📡 <b>Управление ботом</b>\n"
+             "  <code>!рассылка текст</code> — предпросмотр и подтверждение перед отправкой\n"
+             "  <code>!выйти chat_id</code>, <code>!блок чата chat_id</code>, <code>!разблок чата chat_id</code>\n"
+             "  <code>!рестарт</code> — graceful shutdown; перезапуск выполняет настроенный супервизор\n"
+             "  <code>!аудит</code> — последние действия главных администраторов\n"
+             "  <code>!группы</code> / <code>!чаты</code> — показать группы, где находится бот\n"
+             "Экспорт бэкапа, !логи, !юзер, !бд и !рассылка доступны только в личном чате. "
              "Главные администраторы бота не становятся владельцами или администраторами Telegram-чатов."),
 }
 
@@ -4430,8 +4965,8 @@ async def help_callback(call: CallbackQuery):
         show_bot_admin = is_bot_superadmin(call.from_user.id)
         show_moderation = (
             show_bot_admin or (
-                call.message.chat.type != 'private'
-                and storage.get_user(call.message.chat.id, call.from_user.id).get('rank', 0) >= 1
+                call.message.chat.type == 'private'
+                or storage.get_user(call.message.chat.id, call.from_user.id).get('rank', 0) >= 1
             )
         )
         
@@ -4485,8 +5020,8 @@ async def cmd_help(msg: Message):
     show_bot_admin = is_bot_superadmin(msg.from_user.id)
     show_moderation = (
         show_bot_admin or (
-            msg.chat.type != 'private'
-            and storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) >= 1
+            msg.chat.type == 'private'
+            or storage.get_user(msg.chat.id, msg.from_user.id).get('rank', 0) >= 1
         )
     )
     await msg.answer(
@@ -4497,6 +5032,11 @@ async def cmd_help(msg: Message):
 
 @router.message(Command('help'))
 async def slash_help(msg: Message):
+    await cmd_help(msg)
+
+
+@router.message(Command('info'))
+async def slash_info(msg: Message):
     await cmd_help(msg)
 
 
@@ -4771,12 +5311,153 @@ async def handle_wordle_guess(msg: Message, game: dict) -> bool:
 
 
 MEME_FONT_PATH = Path(__file__).resolve().parent / 'fonts' / 'ofont.ru_Impact.ttf'
+DEMOTIVATOR_FONT_PATH = Path(__file__).resolve().parent / 'fonts' / 'timesnewromanpsmt.ttf'
+MEME_EMOJI_FONT_DIR = Path(__file__).resolve().parent / 'fonts'
 MEME_SESSION_TTL = 10 * 60
 MEME_MAX_IMAGE_BYTES = 20 * 1024 * 1024
-MEME_MAX_IMAGE_PIXELS = 40_000_000
+MEME_MAX_IMAGE_PIXELS = 12_000_000
+MEME_MAX_RENDER_DIMENSION = 1600
 MEME_MAX_ANIMATION_BYTES = 50 * 1024 * 1024
 MEME_MAX_TEXT_LENGTH = 400
 meme_sessions: Dict[Tuple[int, int], dict] = {}
+MEME_RENDER_SEMAPHORE = asyncio.Semaphore(1)
+
+
+@lru_cache(maxsize=512)
+def _get_meme_emoji_font(cluster: str, size: int):
+    from PIL import ImageFont
+
+    codepoints = {
+        ord(char) for char in cluster
+        if char not in {'\ufe0f', '\ufe0e', '\u200d'}
+        and not 0x1F3FB <= ord(char) <= 0x1F3FF
+    }
+    local_font_error = None
+    for path in _get_local_meme_emoji_fonts():
+        try:
+            return ImageFont.truetype(str(path), size)
+        except OSError as exc:
+            local_font_error = exc
+
+    for path, glyphs in get_graph_emoji_fonts():
+        if codepoints and codepoints.issubset(glyphs):
+            return ImageFont.truetype(path, size)
+    if local_font_error:
+        raise RuntimeError(
+            'Не удалось загрузить emoji-шрифт из папки fonts в нужном размере.'
+        ) from local_font_error
+    return None
+
+
+@lru_cache(maxsize=1)
+def _get_local_meme_emoji_fonts() -> Tuple[Path, ...]:
+    if not MEME_EMOJI_FONT_DIR.is_dir():
+        return ()
+    paths = [
+        path for path in MEME_EMOJI_FONT_DIR.iterdir()
+        if path.is_file()
+        and path.suffix.casefold() in {'.ttf', '.ttc', '.otf'}
+        and (
+            'emoji' in path.stem.casefold()
+            or path.stem.casefold().startswith('seguiemj')
+        )
+    ]
+    return tuple(sorted(
+        paths,
+        key=lambda path: (
+            'variablefont' not in path.stem.casefold(),
+            'color' in path.stem.casefold(),
+            path.name.casefold(),
+        ),
+    ))
+
+
+def _meme_text_runs(text: str, font) -> List[Tuple[str, Any, bool]]:
+    runs = []
+    for cluster, is_emoji in split_graph_text(text):
+        is_emoji = is_emoji or '\u20e3' in cluster
+        run_font = _get_meme_emoji_font(cluster, font.size) if is_emoji else font
+        if is_emoji and run_font is None:
+            raise RuntimeError(
+                'Не найден emoji-шрифт. Добавьте масштабируемый emoji-шрифт '
+                '(например NotoEmoji-VariableFont_wght.ttf) в папку fonts.'
+            )
+        if runs and runs[-1][1] is run_font:
+            runs[-1] = (runs[-1][0] + cluster, run_font, is_emoji)
+        else:
+            runs.append((cluster, run_font, is_emoji))
+    return runs
+
+
+def _meme_text_layout(draw, text: str, font, stroke_width: int):
+    runs = _meme_text_runs(text, font)
+    x = 0
+    boxes = []
+    for run_text, run_font, is_emoji in runs:
+        run_stroke = 0 if is_emoji else stroke_width
+        box = draw.textbbox((x, 0), run_text, font=run_font, stroke_width=run_stroke)
+        boxes.append(box)
+        x += draw.textlength(run_text, font=run_font)
+    if not boxes:
+        return runs, (0, 0, 0, 0)
+    return runs, (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(x, *(box[2] for box in boxes)),
+        max(box[3] for box in boxes),
+    )
+
+
+def _draw_meme_text(
+    draw,
+    position: Tuple[int, int],
+    text: str,
+    font,
+    fill,
+    stroke_width: int = 0,
+    stroke_fill=None,
+):
+    runs, box = _meme_text_layout(draw, text, font, stroke_width)
+    line_height = box[3] - box[1]
+    x = 0
+    for run_text, run_font, is_emoji in runs:
+        run_stroke = 0 if is_emoji else stroke_width
+        run_box = draw.textbbox(
+            (x, 0),
+            run_text,
+            font=run_font,
+            stroke_width=run_stroke,
+        )
+        run_height = run_box[3] - run_box[1]
+        try:
+            draw.text(
+                (
+                    position[0] + x - box[0],
+                    position[1] + (line_height - run_height) // 2 - run_box[1],
+                ),
+                run_text,
+                font=run_font,
+                fill=fill,
+                stroke_width=run_stroke,
+                stroke_fill=stroke_fill,
+                embedded_color=is_emoji,
+            )
+        except OSError as exc:
+            if not is_emoji or 'SVG hooks have not been set' not in str(exc):
+                raise
+            draw.text(
+                (
+                    position[0] + x - box[0],
+                    position[1] + (line_height - run_height) // 2 - run_box[1],
+                ),
+                run_text,
+                font=run_font,
+                fill=fill,
+                stroke_width=run_stroke,
+                stroke_fill=stroke_fill,
+                embedded_color=False,
+            )
+        x += draw.textlength(run_text, font=run_font)
 
 
 def _wrap_meme_line(draw, text: str, font, max_width: int, stroke_width: int) -> List[str]:
@@ -4784,7 +5465,7 @@ def _wrap_meme_line(draw, text: str, font, max_width: int, stroke_width: int) ->
     current = ''
     for word in text.split():
         candidate = f'{current} {word}'.strip()
-        candidate_box = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
+        _, candidate_box = _meme_text_layout(draw, candidate, font, stroke_width)
         if candidate_box[2] - candidate_box[0] <= max_width:
             current = candidate
             continue
@@ -4792,15 +5473,15 @@ def _wrap_meme_line(draw, text: str, font, max_width: int, stroke_width: int) ->
         if current:
             lines.append(current)
             current = ''
-        word_box = draw.textbbox((0, 0), word, font=font, stroke_width=stroke_width)
+        _, word_box = _meme_text_layout(draw, word, font, stroke_width)
         if word_box[2] - word_box[0] <= max_width:
             current = word
             continue
 
         fragment = ''
-        for character in word:
+        for character, _ in split_graph_text(word):
             candidate = fragment + character
-            candidate_box = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
+            _, candidate_box = _meme_text_layout(draw, candidate, font, stroke_width)
             if fragment and candidate_box[2] - candidate_box[0] > max_width:
                 lines.append(fragment)
                 fragment = character
@@ -4827,7 +5508,7 @@ def _fit_meme_text(draw, text: str, max_width: int, max_height: int, font_path: 
             lines.extend(_wrap_meme_line(draw, paragraph, font, max_width, stroke_width) or [''])
 
         boxes = [
-            draw.textbbox((0, 0), line or ' ', font=font, stroke_width=stroke_width)
+            _meme_text_layout(draw, line or ' ', font, stroke_width)[1]
             for line in lines
         ]
         heights = [box[3] - box[1] for box in boxes]
@@ -4844,6 +5525,7 @@ def render_meme_image(
     bottom_text: str,
     *,
     preserve_alpha: bool = False,
+    max_dimension: int = MEME_MAX_RENDER_DIMENSION,
 ) -> bytes:
     from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -4857,7 +5539,10 @@ def render_meme_image(
     with Image.open(BytesIO(image_data)) as source:
         if source.width * source.height > MEME_MAX_IMAGE_PIXELS:
             raise ValueError('Изображение слишком большое. Пришлите картинку меньшего размера.')
-        image = ImageOps.exif_transpose(source).convert('RGBA' if preserve_alpha else 'RGB')
+        source.draft('RGB', (max_dimension, max_dimension))
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        image = image.convert('RGBA' if preserve_alpha else 'RGB')
 
     width, height = image.size
     draw = ImageDraw.Draw(image)
@@ -4878,14 +5563,15 @@ def render_meme_image(
         y = region_start + region_height - total_height if align_bottom else region_start
         for line, box, line_height in zip(lines, boxes, line_heights):
             line_width = box[2] - box[0]
-            x = (width - line_width) // 2 - box[0]
-            draw.text(
-                (x, y - box[1]),
+            x = (width - line_width) // 2
+            _draw_meme_text(
+                draw,
+                (x, y),
                 line,
-                font=font,
-                fill='white',
-                stroke_width=stroke_width,
-                stroke_fill='black',
+                font,
+                'white',
+                stroke_width,
+                'black',
             )
             y += line_height + line_gap
 
@@ -4897,6 +5583,84 @@ def render_meme_image(
     return output.getvalue()
 
 
+def render_demotivator_image(image_data: bytes, caption: str) -> bytes:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+    caption = caption.strip()
+    if not caption:
+        raise ValueError('Добавьте подпись к демотиватору.')
+    if len(caption) > MEME_MAX_TEXT_LENGTH:
+        raise ValueError(f'Подпись не должна быть длиннее {MEME_MAX_TEXT_LENGTH} символов.')
+    if not DEMOTIVATOR_FONT_PATH.is_file():
+        raise FileNotFoundError('Не найден шрифт fonts/timesnewromanpsmt.ttf.')
+
+    with Image.open(BytesIO(image_data)) as source:
+        if source.width * source.height > MEME_MAX_IMAGE_PIXELS:
+            raise ValueError('Изображение слишком большое. Пришлите картинку меньшего размера.')
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((MEME_MAX_RENDER_DIMENSION, MEME_MAX_RENDER_DIMENSION), Image.Resampling.LANCZOS)
+        image = image.convert('RGB')
+
+    canvas_width = max(400, min(MEME_MAX_RENDER_DIMENSION, round(image.width / 0.68)))
+    canvas_height = round(canvas_width * 0.75)
+    photo = image.copy()
+    photo.thumbnail(
+        (round(canvas_width * 0.68), round(canvas_height * 0.64)),
+        Image.Resampling.LANCZOS,
+    )
+
+    canvas = Image.new('RGB', (canvas_width, canvas_height), 'black')
+    photo_x = (canvas_width - photo.width) // 2
+    photo_y = round(canvas_height * 0.06)
+    canvas.paste(photo, (photo_x, photo_y))
+    draw = ImageDraw.Draw(canvas)
+    border = max(1, round(canvas_width / 500))
+    draw.rectangle(
+        (
+            photo_x - border,
+            photo_y - border,
+            photo_x + photo.width - 1 + border,
+            photo_y + photo.height - 1 + border,
+        ),
+        outline='white',
+        width=border,
+    )
+
+    text_top = photo_y + photo.height + round(canvas_height * 0.045)
+    text_bottom = canvas_height - round(canvas_height * 0.06)
+    max_text_width = round(canvas_width * 0.88)
+    max_text_height = max(1, text_bottom - text_top)
+    max_font_size = max(16, round(canvas_width * 0.06))
+    min_font_size = max(12, round(canvas_width * 0.025))
+    for font_size in range(max_font_size, min_font_size - 1, -1):
+        font = ImageFont.truetype(str(DEMOTIVATOR_FONT_PATH), font_size)
+        lines = []
+        for paragraph in caption.splitlines() or [caption]:
+            lines.extend(_wrap_meme_line(draw, paragraph, font, max_text_width, 0) or [''])
+        boxes = [
+            _meme_text_layout(draw, line or ' ', font, 0)[1]
+            for line in lines
+        ]
+        line_heights = [box[3] - box[1] for box in boxes]
+        line_gap = max(2, round(font_size * 0.16))
+        total_height = sum(line_heights) + line_gap * max(0, len(lines) - 1)
+        if total_height <= max_text_height:
+            break
+    else:
+        raise ValueError('Подпись слишком длинная для демотиватора. Сократите её.')
+
+    y = text_top + (max_text_height - total_height) // 2
+    for line, box, line_height in zip(lines, boxes, line_heights):
+        line_width = box[2] - box[0]
+        x = (canvas_width - line_width) // 2
+        _draw_meme_text(draw, (x, y), line, font, 'white')
+        y += line_height + line_gap
+
+    output = BytesIO()
+    canvas.save(output, format='PNG')
+    return output.getvalue()
+
+
 def render_meme_sticker(image_data: bytes, top_text: str, bottom_text: str) -> bytes:
     from PIL import Image
 
@@ -4905,6 +5669,7 @@ def render_meme_sticker(image_data: bytes, top_text: str, bottom_text: str) -> b
         top_text,
         bottom_text,
         preserve_alpha=True,
+        max_dimension=512,
     )
     with Image.open(BytesIO(rendered_png)) as image:
         image.thumbnail((512, 512), Image.Resampling.LANCZOS)
@@ -4924,32 +5689,176 @@ def render_meme_sticker(image_data: bytes, top_text: str, bottom_text: str) -> b
     raise ValueError('Не удалось подготовить стикер в пределах лимита Telegram (512 КБ).')
 
 
+def render_mp4_meme(animation_data: bytes, top_text: str, bottom_text: str) -> bytes:
+    import math
+    import subprocess
+    import tempfile
+    from PIL import Image
+    import imageio_ffmpeg
+
+    if len(animation_data) > MEME_MAX_ANIMATION_BYTES:
+        raise ValueError('Видео слишком большое для обработки.')
+
+    with tempfile.TemporaryDirectory(prefix='meme_mp4_') as temp_dir:
+        temp_path = Path(temp_dir)
+        source_path = temp_path / 'source.mp4'
+        rendered_path = temp_path / 'rendered.mp4'
+        output_path = temp_path / 'meme.mp4'
+        source_path.write_bytes(animation_data)
+
+        reader = imageio_ffmpeg.read_frames(
+            str(source_path),
+            pix_fmt='rgb24',
+            bits_per_pixel=24,
+        )
+        writer = None
+        rendered_frames = 0
+        try:
+            metadata = next(reader)
+            source_width, source_height = metadata['size']
+            if (
+                source_width < 1
+                or source_height < 1
+                or source_width * source_height > MEME_MAX_IMAGE_PIXELS
+            ):
+                raise ValueError('Разрешение MP4 слишком большое для обработки.')
+
+            source_fps = max(1.0, float(metadata.get('fps') or 24))
+            target_fps = max(1, min(30, round(source_fps)))
+            duration = max(0.01, float(metadata.get('duration') or 3.0))
+            frame_count = max(1, math.ceil(duration * target_fps))
+            scale = min(1.0, 640 / max(source_width, source_height))
+            output_width = max(2, round(source_width * scale / 2) * 2)
+            output_height = max(2, round(source_height * scale / 2) * 2)
+
+            blank = Image.new('RGBA', (output_width, output_height), (0, 0, 0, 0))
+            blank_data = BytesIO()
+            blank.save(blank_data, format='PNG')
+            overlay_data = render_meme_image(
+                blank_data.getvalue(),
+                top_text,
+                bottom_text,
+                preserve_alpha=True,
+                max_dimension=max(output_width, output_height),
+            )
+            with Image.open(BytesIO(overlay_data)) as overlay_source:
+                overlay = overlay_source.convert('RGBA')
+
+            writer = imageio_ffmpeg.write_frames(
+                str(rendered_path),
+                (output_width, output_height),
+                pix_fmt_in='rgb24',
+                pix_fmt_out='yuv420p',
+                fps=target_fps,
+                codec='libx264',
+                quality=None,
+                bitrate='1000k',
+                output_params=['-preset', 'veryfast', '-movflags', '+faststart'],
+            )
+            writer.send(None)
+
+            current_source_index = 0
+            current_frame = next(reader)
+            for frame_index in range(frame_count):
+                source_index = int(frame_index * source_fps / target_fps)
+                try:
+                    while current_source_index < source_index:
+                        current_frame = next(reader)
+                        current_source_index += 1
+                except StopIteration:
+                    break
+
+                with Image.frombytes(
+                    'RGB',
+                    (source_width, source_height),
+                    current_frame,
+                ) as source_frame:
+                    frame = source_frame.resize(
+                        (output_width, output_height),
+                        Image.Resampling.LANCZOS,
+                    ).convert('RGBA')
+                frame.alpha_composite(overlay)
+                writer.send(frame.convert('RGB').tobytes())
+                rendered_frames += 1
+        except StopIteration:
+            pass
+        finally:
+            reader.close()
+            if writer is not None:
+                writer.close()
+
+        if rendered_frames == 0:
+            raise ValueError('В MP4 не найдено кадров для обработки.')
+
+        mux_result = subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(),
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-y',
+                '-i', str(rendered_path),
+                '-i', str(source_path),
+                '-map', '0:v:0',
+                '-map', '1:a:0?',
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-t', f'{rendered_frames / target_fps:.3f}',
+                '-shortest',
+                '-movflags', '+faststart',
+                str(output_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        if mux_result.returncode:
+            error = mux_result.stderr.decode('utf-8', errors='replace').strip()
+            raise RuntimeError(
+                f"Не удалось собрать MP4 со звуком: {error[:500]}"
+            )
+
+        result = output_path.read_bytes()
+        if len(result) > MEME_MAX_ANIMATION_BYTES:
+            raise ValueError('Готовое MP4 превышает лимит в 50 МБ.')
+        return result
+
+
 def render_animated_meme(
     animation_data: bytes,
     top_text: str,
     bottom_text: str,
     output_format: str,
+    source_format: str = 'webm',
 ) -> bytes:
     import math
     import tempfile
     from pathlib import Path
     from PIL import Image
 
-    if output_format not in {'gif', 'animated_sticker'}:
+    if output_format not in {'gif', 'animated_sticker', 'mp4'}:
         raise ValueError('Неизвестный формат анимированного мема.')
     if len(animation_data) > MEME_MAX_ANIMATION_BYTES:
         raise ValueError('Анимация слишком большая для обработки.')
 
+    if animation_data.startswith(b'\x1f\x8b'):
+        source_format = 'tgs'
+    if source_format not in {'tgs', 'webm', 'gif', 'mp4'}:
+        raise ValueError('Неподдерживаемый формат исходной анимации.')
+    if output_format == 'mp4':
+        if source_format != 'mp4':
+            raise ValueError('MP4-вывод доступен только для MP4-исходника.')
+        return render_mp4_meme(animation_data, top_text, bottom_text)
+
     target_fps = 20 if output_format == 'gif' else 30
-    max_frames = target_fps * 3
+    max_frames = target_fps * 3 if output_format == 'animated_sticker' else None
     frames = []
 
     with tempfile.TemporaryDirectory(prefix='meme_animation_') as temp_dir:
-        source_extension = 'tgs' if animation_data.startswith(b'\x1f\x8b') else 'webm'
-        input_path = Path(temp_dir) / f'source.{source_extension}'
+        input_path = Path(temp_dir) / f'source.{source_format}'
         input_path.write_bytes(animation_data)
 
-        if animation_data.startswith(b'\x1f\x8b'):
+        if source_format == 'tgs':
             try:
                 from rlottie_python import LottieAnimation
             except ImportError as exc:
@@ -4962,8 +5871,10 @@ def render_animated_meme(
             source_frame_count = int(animation.lottie_animation_get_totalframe())
             if source_frame_count < 1:
                 raise ValueError('В TGS-стикере не найдено кадров для обработки.')
-            duration = min(3.0, float(animation.lottie_animation_get_duration()))
-            frame_count = min(max_frames, max(1, math.ceil(duration * target_fps)))
+            duration = float(animation.lottie_animation_get_duration())
+            frame_count = max(1, math.ceil(duration * target_fps))
+            if max_frames is not None:
+                frame_count = min(max_frames, frame_count)
             for frame_index in range(frame_count):
                 source_index = min(
                     source_frame_count - 1,
@@ -4987,14 +5898,15 @@ def render_animated_meme(
                 str(input_path),
                 pix_fmt='rgba',
                 bits_per_pixel=32,
-                input_params=['-c:v', 'libvpx-vp9'],
             )
             try:
                 metadata = next(reader)
                 source_width, source_height = metadata['size']
                 source_fps = max(1.0, float(metadata.get('fps') or target_fps))
-                duration = min(3.0, float(metadata.get('duration') or 3.0))
-                frame_count = min(max_frames, max(1, math.ceil(duration * target_fps)))
+                duration = float(metadata.get('duration') or 3.0)
+                frame_count = max(1, math.ceil(duration * target_fps))
+                if max_frames is not None:
+                    frame_count = min(max_frames, frame_count)
                 current_source_index = 0
                 current_frame = next(reader)
                 for frame_index in range(frame_count):
@@ -5007,17 +5919,32 @@ def render_animated_meme(
                         (source_width, source_height),
                         current_frame,
                     )
+                    frame.thumbnail((512, 512), Image.Resampling.LANCZOS)
                     frames.append(frame)
             except StopIteration:
                 if not frames:
-                    raise ValueError('Не удалось прочитать кадры анимированного стикера.')
+                    raise ValueError('Не удалось прочитать кадры анимации.')
             finally:
                 reader.close()
 
         if not frames:
-            raise ValueError('В стикере не найдено кадров для обработки.')
+            raise ValueError('В анимации не найдено кадров для обработки.')
 
-        blank = Image.new('RGBA', (512, 512), (0, 0, 0, 0))
+        canvas_size = (512, 512)
+        if output_format == 'gif':
+            frame_width, frame_height = frames[0].size
+            scale = 512 / max(frame_width, frame_height)
+            canvas_size = (
+                max(1, round(frame_width * scale)),
+                max(1, round(frame_height * scale)),
+            )
+            frames = [
+                frame.resize(canvas_size, Image.Resampling.LANCZOS)
+                if frame.size != canvas_size else frame
+                for frame in frames
+            ]
+
+        blank = Image.new('RGBA', canvas_size, (0, 0, 0, 0))
         blank_data = BytesIO()
         blank.save(blank_data, format='PNG')
         overlay_data = render_meme_image(
@@ -5025,37 +5952,56 @@ def render_animated_meme(
             top_text,
             bottom_text,
             preserve_alpha=True,
+            max_dimension=max(canvas_size),
         )
         with Image.open(BytesIO(overlay_data)) as overlay_source:
             overlay = overlay_source.convert('RGBA')
 
         for frame_index, frame in enumerate(frames):
             frame = frame.convert('RGBA')
-            frame.thumbnail((512, 512), Image.Resampling.LANCZOS)
-            canvas = Image.new('RGBA', (512, 512), (0, 0, 0, 0))
-            canvas.alpha_composite(
-                frame,
-                ((512 - frame.width) // 2, (512 - frame.height) // 2),
-            )
+            if output_format == 'gif':
+                canvas = frame
+            else:
+                frame.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                canvas = Image.new('RGBA', (512, 512), (0, 0, 0, 0))
+                canvas.alpha_composite(
+                    frame,
+                    ((512 - frame.width) // 2, (512 - frame.height) // 2),
+                )
             canvas.alpha_composite(overlay)
             frames[frame_index] = canvas
 
         if output_format == 'gif':
-            output = BytesIO()
-            frames[0].save(
-                output,
-                format='GIF',
-                save_all=True,
-                append_images=frames[1:],
-                duration=round(1000 / target_fps),
-                loop=0,
-                disposal=2,
-                optimize=True,
+            for max_dimension in (512, 384, 256, 192, 128, 96, 64):
+                encoded_frames = []
+                for frame in frames:
+                    scale = min(1.0, max_dimension / max(frame.size))
+                    size = (
+                        max(1, round(frame.width * scale)),
+                        max(1, round(frame.height * scale)),
+                    )
+                    encoded_frames.append(
+                        frame.resize(size, Image.Resampling.LANCZOS)
+                        if frame.size != size else frame
+                    )
+
+                output = BytesIO()
+                encoded_frames[0].save(
+                    output,
+                    format='GIF',
+                    save_all=True,
+                    append_images=encoded_frames[1:],
+                    duration=round(1000 / target_fps),
+                    loop=0,
+                    disposal=2,
+                    optimize=True,
+                )
+                result = output.getvalue()
+                if len(result) <= MEME_MAX_ANIMATION_BYTES:
+                    return result
+            raise ValueError(
+                'Готовая GIF-анимация превышает лимит в 50 МБ даже после сжатия.'
             )
-            result = output.getvalue()
-            if len(result) > MEME_MAX_ANIMATION_BYTES:
-                raise ValueError('Готовая GIF-анимация превышает лимит в 50 МБ.')
-            return result
 
         try:
             import imageio_ffmpeg
@@ -5066,7 +6012,25 @@ def render_animated_meme(
             ) from exc
 
         output_path = Path(temp_dir) / 'meme.webm'
-        for bitrate in ('256k', '160k', '96k', '64k'):
+        encoding_profiles = (
+            (512, '256k'),
+            (512, '160k'),
+            (512, '96k'),
+            (512, '64k'),
+            (384, '96k'),
+            (384, '64k'),
+            (256, '64k'),
+            (256, '48k'),
+            (192, '48k'),
+            (128, '32k'),
+        )
+        for dimension, bitrate in encoding_profiles:
+            encoded_frames = []
+            for frame in frames:
+                if dimension < 512:
+                    frame = frame.resize((dimension, dimension), Image.Resampling.LANCZOS)
+                    frame = frame.resize((512, 512), Image.Resampling.LANCZOS)
+                encoded_frames.append(frame)
             writer = imageio_ffmpeg.write_frames(
                 str(output_path),
                 (512, 512),
@@ -5087,7 +6051,7 @@ def render_animated_meme(
             )
             writer.send(None)
             try:
-                for frame in frames:
+                for frame in encoded_frames:
                     writer.send(frame.tobytes())
             finally:
                 writer.close()
@@ -5131,25 +6095,64 @@ def _get_message_image(message: Optional[Message]):
     return None
 
 
+def _get_message_animation(message: Optional[Message]) -> Optional[Tuple[Any, str]]:
+    if not message:
+        return None
+
+    media_items = (
+        (getattr(message, 'animation', None), 'mp4'),
+        (getattr(message, 'video', None), 'mp4'),
+        (message.document, None),
+    )
+    for media, default_format in media_items:
+        if not media:
+            continue
+        filename = str(getattr(media, 'file_name', '') or '')
+        suffix = Path(filename).suffix.casefold()
+        mime_type = str(getattr(media, 'mime_type', '') or '').casefold()
+        if suffix == '.gif' or mime_type == 'image/gif':
+            return media, 'gif'
+        if suffix == '.mp4' or mime_type == 'video/mp4':
+            return media, 'mp4'
+        if suffix == '.webm' or mime_type == 'video/webm':
+            return media, 'webm'
+        if default_format and (
+            mime_type.startswith('video/') or not mime_type
+        ):
+            return media, default_format
+    return None
+
+
 async def _ask_for_meme_photo(
     message: Message,
     user_id: int,
     top_text: str = '',
     bottom_text: str = '',
     *,
+    style: str = 'classic',
     edit_message: bool = False,
 ):
-    prompt_text = (
-        '🖼️ <b>Шаг 1 из 2 — изображение</b>\n\n'
-        'Ответьте на это сообщение фотографией, изображением или стикером для мема.'
-    )
+    if style == 'demotivator':
+        prompt_text = (
+            '🖼️ <b>Демотиватор — шаг 1 из 2</b>\n\n'
+            'Ответьте на это сообщение обычной фотографией или изображением.'
+        )
+    else:
+        prompt_text = (
+            '🖼️ <b>Шаг 1 из 2 — изображение</b>\n\n'
+            'Ответьте на это сообщение изображением, GIF, MP4-видео или стикером для мема.'
+        )
     if top_text or bottom_text:
         prompt_text += (
             '\n\n✍️ Текст сохранён — после получения картинки сразу создам мем. '
-            'Для стикера предложу выбрать формат отправки.'
+            'Для анимации предложу выбрать формат отправки.'
         )
     else:
-        prompt_text += '\n\nПосле картинки попрошу вас добавить подпись.'
+        prompt_text += (
+            '\n\nПосле картинки попрошу вас добавить подпись.'
+            if style == 'demotivator'
+            else '\n\nПосле картинки попрошу вас добавить текст.'
+        )
     if edit_message:
         prompt = await message.edit_text(
             prompt_text,
@@ -5163,27 +6166,61 @@ async def _ask_for_meme_photo(
         'prompt_message_id': prompt.message_id,
         'top_text': top_text,
         'bottom_text': bottom_text,
+        'style': style,
     }
 
 
-async def _ask_for_meme_text(message: Message, user_id: int, file_id: str):
-    source_type = 'sticker' if message.sticker else 'photo'
-    accepted_text = 'Стикер принят' if source_type == 'sticker' else 'Картинка принята'
-    prompt = await message.answer(
-        f'✅ <b>{accepted_text}</b>\n\n'
+async def _ask_for_meme_text(
+    message: Message,
+    user_id: int,
+    file_id: str,
+    *,
+    source_animated: bool = False,
+    source_format: str = 'webm',
+    style: str = 'classic',
+    source_type: Optional[str] = None,
+    edit_message: bool = False,
+):
+    source_type = source_type or (
+        'sticker' if message.sticker else 'animation' if source_animated else 'photo'
+    )
+    accepted_text = (
+        'Анимация принята' if source_type == 'animation'
+        else 'Стикер принят' if source_type == 'sticker'
+        else 'Картинка принята'
+    )
+    text_instructions = (
+        '✍️ <b>Шаг 2 из 2 — подпись</b>\n'
+        'Отправьте текст, который появится под рамкой изображения.'
+        if style == 'demotivator'
+        else
         '✍️ <b>Шаг 2 из 2 — текст</b>\n'
         'Отправьте надписи одним сообщением: <code>сверху.снизу</code>.\n'
         'Если нужна только нижняя надпись, начните с точки: <code>.текст</code>.'
     )
+    prompt_text = f'✅ <b>{accepted_text}</b>\n\n{text_instructions}'
+    if edit_message:
+        prompt = await message.edit_text(
+            prompt_text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+    else:
+        prompt = await message.answer(prompt_text)
     meme_sessions[_meme_session_key(message.chat.id, user_id)] = {
         'step': 'await_text',
         'created_at': time.time(),
         'file_id': file_id,
         'source_type': source_type,
-        'source_animated': bool(
+        'source_animated': source_animated or bool(
             message.sticker and (message.sticker.is_animated or message.sticker.is_video)
         ),
+        'source_format': (
+            'tgs' if message.sticker and message.sticker.is_animated
+            else 'webm' if message.sticker
+            else source_format
+        ),
         'prompt_message_id': prompt.message_id,
+        'style': style,
     }
 
 
@@ -5195,22 +6232,47 @@ async def _ask_for_meme_output_mode(
     bottom_text: str,
     *,
     source_animated: bool = False,
+    source_format: str = 'webm',
 ):
     if source_animated:
-        prompt_text = (
-            '🪄 <b>Как отправить результат?</b>\n'
-            'Выберите формат анимированного мема:'
-        )
-        buttons = [
-            InlineKeyboardButton(
-                text='🎞️ GIF',
-                callback_data=f'meme_gif_{user_id}',
-            ),
-            InlineKeyboardButton(
-                text='✨ Анимированным стикером',
-                callback_data=f'meme_animated_{user_id}',
-            ),
-        ]
+        if source_format == 'gif':
+            prompt_text = '🪄 <b>Результат будет отправлен в формате GIF.</b>'
+            buttons = [
+                InlineKeyboardButton(
+                    text='🎞️ GIF',
+                    callback_data=f'meme_gif_{user_id}',
+                ),
+            ]
+        elif source_format == 'mp4':
+            prompt_text = (
+                '🪄 <b>Выберите формат результата:</b>\n'
+                'MP4 сохранит исходный звук, GIF будет без звука.'
+            )
+            buttons = [
+                InlineKeyboardButton(
+                    text='🎞️ GIF',
+                    callback_data=f'meme_gif_{user_id}',
+                ),
+                InlineKeyboardButton(
+                    text='🎬 MP4',
+                    callback_data=f'meme_mp4_{user_id}',
+                ),
+            ]
+        else:
+            prompt_text = (
+                '🪄 <b>Как отправить результат?</b>\n'
+                'Выберите формат анимированного мема:'
+            )
+            buttons = [
+                InlineKeyboardButton(
+                    text='🎞️ GIF',
+                    callback_data=f'meme_gif_{user_id}',
+                ),
+                InlineKeyboardButton(
+                    text='✨ Стикер',
+                    callback_data=f'meme_animated_{user_id}',
+                ),
+            ]
     else:
         prompt_text = (
             '🪄 <b>Как отправить результат?</b>\n'
@@ -5222,7 +6284,7 @@ async def _ask_for_meme_output_mode(
                 callback_data=f'meme_photo_{user_id}',
             ),
             InlineKeyboardButton(
-                text='✨ Стикером',
+                text='✨ Стикер',
                 callback_data=f'meme_sticker_{user_id}',
             ),
         ]
@@ -5236,8 +6298,9 @@ async def _ask_for_meme_output_mode(
         'file_id': file_id,
         'top_text': top_text,
         'bottom_text': bottom_text,
-        'source_type': 'sticker',
+        'source_type': 'animation' if source_animated else 'sticker',
         'source_animated': source_animated,
+        'source_format': source_format,
         'prompt_message_id': prompt.message_id,
     }
 
@@ -5250,6 +6313,8 @@ async def _create_meme_for_message(
     *,
     output_as_sticker: bool = False,
     output_as_animation: Optional[str] = None,
+    source_format: str = 'webm',
+    demotivator_caption: Optional[str] = None,
 ) -> bool:
     try:
         downloaded = await bot.download(file_id)
@@ -5257,17 +6322,24 @@ async def _create_meme_for_message(
         if output_as_animation:
             if len(image_data) > MEME_MAX_ANIMATION_BYTES:
                 raise ValueError('Анимация слишком большая. Максимальный размер — 50 МБ.')
-            meme_data = await asyncio.to_thread(
-                render_animated_meme,
-                image_data,
-                top_text,
-                bottom_text,
-                output_as_animation,
-            )
+            async with MEME_RENDER_SEMAPHORE:
+                meme_data = await asyncio.to_thread(
+                    render_animated_meme,
+                    image_data,
+                    top_text,
+                    bottom_text,
+                    output_as_animation,
+                    source_format,
+                )
             if output_as_animation == 'gif':
                 await message.answer_animation(
                     BufferedInputFile(meme_data, filename='meme.gif'),
                     caption='✨ <b>Готово!</b> Ваш анимированный мем.',
+                )
+            elif output_as_animation == 'mp4':
+                await message.answer_video(
+                    BufferedInputFile(meme_data, filename='meme.mp4'),
+                    caption='✨ <b>Готово!</b> Ваше видео с надписью и исходным звуком, если он был.',
                 )
             else:
                 sticker_message = await message.answer_sticker(
@@ -5278,19 +6350,37 @@ async def _create_meme_for_message(
                 )
         elif len(image_data) > MEME_MAX_IMAGE_BYTES:
             raise ValueError('Изображение слишком большое. Максимальный размер — 20 МБ.')
-        elif output_as_sticker:
-            meme_data = await asyncio.to_thread(
-                render_meme_sticker,
-                image_data,
-                top_text,
-                bottom_text,
+        elif demotivator_caption is not None:
+            async with MEME_RENDER_SEMAPHORE:
+                meme_data = await asyncio.to_thread(
+                    render_demotivator_image,
+                    image_data,
+                    demotivator_caption,
+                )
+            await message.answer_photo(
+                BufferedInputFile(meme_data, filename='demotivator.png'),
+                caption='🖼️ <b>Демотиватор готов.</b>',
             )
+        elif output_as_sticker:
+            async with MEME_RENDER_SEMAPHORE:
+                meme_data = await asyncio.to_thread(
+                    render_meme_sticker,
+                    image_data,
+                    top_text,
+                    bottom_text,
+                )
             sticker_message = await message.answer_sticker(
                 BufferedInputFile(meme_data, filename='meme.webp'),
             )
             await sticker_message.reply('✨ <b>Готово! Новый стикер с надписью.</b>')
         else:
-            meme_data = await asyncio.to_thread(render_meme_image, image_data, top_text, bottom_text)
+            async with MEME_RENDER_SEMAPHORE:
+                meme_data = await asyncio.to_thread(
+                    render_meme_image,
+                    image_data,
+                    top_text,
+                    bottom_text,
+                )
             await message.answer_photo(
                 BufferedInputFile(meme_data, filename='meme.png'),
                 caption='✨ <b>Готово!</b> Ваш мем.',
@@ -5299,8 +6389,14 @@ async def _create_meme_for_message(
     except FileNotFoundError:
         logger.exception('Не найден шрифт для создания мема')
         await message.answer(
-            '⚠️ <b>Не найден шрифт Impact</b>\n'
-            'Проверьте файл <code>fonts/ofont.ru_Impact.ttf</code>.'
+            (
+                '⚠️ <b>Не найден шрифт демотиватора</b>\n'
+                'Проверьте файл <code>fonts/timesnewromanpsmt.ttf</code>.'
+                if demotivator_caption is not None
+                else
+                '⚠️ <b>Не найден шрифт Impact</b>\n'
+                'Проверьте файл <code>fonts/ofont.ru_Impact.ttf</code>.'
+            )
         )
     except ImportError:
         logger.exception('Pillow недоступен для создания мема')
@@ -5328,6 +6424,38 @@ def _get_meme_session(chat_id: int, user_id: int) -> Optional[dict]:
     return meme_sessions.get(_meme_session_key(chat_id, user_id))
 
 
+async def _show_meme_menu(
+    message: Message,
+    user_id: int,
+    *,
+    selected_media: Optional[dict] = None,
+):
+    style_buttons = [
+        InlineKeyboardButton(text='🖼️ Мем с текстом', callback_data=f'meme_classic_{user_id}'),
+    ]
+    if not selected_media or not selected_media.get('source_animated'):
+        style_buttons.append(
+            InlineKeyboardButton(text='🖼️ Демотиватор', callback_data=f'meme_demotivator_{user_id}')
+        )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        style_buttons,
+        [InlineKeyboardButton(text='✖️ Закрыть', callback_data=f'meme_close_{user_id}')],
+    ])
+    menu = await message.answer(
+        '🎨 <b>МЕМ-МЕНЮ</b>\n'
+        'Выберите стиль. Для мема с текстом доступны фото, GIF, MP4 и стикеры; '
+        'демотиватор создаётся из фото или изображения.',
+        reply_markup=keyboard,
+    )
+    if selected_media:
+        meme_sessions[_meme_session_key(message.chat.id, user_id)] = {
+            'step': 'await_style',
+            'created_at': time.time(),
+            'menu_message_id': menu.message_id,
+            **selected_media,
+        }
+
+
 async def cmd_meme(msg: Message, args: str = '', cmd_name: str = 'мем'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
         return
@@ -5337,12 +6465,50 @@ async def cmd_meme(msg: Message, args: str = '', cmd_name: str = 'мем'):
     save_activity(msg.chat.id, owner_id, 'commands')
 
     top_text, bottom_text = _split_meme_text(args)
+    reply_animation = _get_message_animation(msg.reply_to_message)
+    if reply_animation:
+        media, source_format = reply_animation
+        if media.file_size and media.file_size > MEME_MAX_ANIMATION_BYTES:
+            await msg.answer('⚠️ <b>Анимация слишком большая</b>\nМаксимальный размер — 50 МБ.')
+            return
+        if top_text or bottom_text:
+            await _ask_for_meme_output_mode(
+                msg,
+                owner_id,
+                media.file_id,
+                top_text,
+                bottom_text,
+                source_animated=True,
+                source_format=source_format,
+            )
+        else:
+            await _show_meme_menu(
+                msg,
+                owner_id,
+                selected_media={
+                    'file_id': media.file_id,
+                    'source_type': 'animation',
+                    'source_animated': True,
+                    'source_format': source_format,
+                },
+            )
+        return
+
     image_file = _get_message_image(msg.reply_to_message)
     if image_file:
         if top_text or bottom_text:
             await _create_meme_for_message(msg, image_file.file_id, top_text, bottom_text)
         else:
-            await _ask_for_meme_text(msg, owner_id, image_file.file_id)
+            await _show_meme_menu(
+                msg,
+                owner_id,
+                selected_media={
+                    'file_id': image_file.file_id,
+                    'source_type': 'photo',
+                    'source_animated': False,
+                    'source_format': 'webp',
+                },
+            )
         return
     reply_sticker = msg.reply_to_message.sticker if msg.reply_to_message else None
     if reply_sticker:
@@ -5354,27 +6520,26 @@ async def cmd_meme(msg: Message, args: str = '', cmd_name: str = 'мем'):
                 top_text,
                 bottom_text,
                 source_animated=bool(reply_sticker.is_animated or reply_sticker.is_video),
+                source_format='tgs' if reply_sticker.is_animated else 'webm',
             )
         else:
-            await _ask_for_meme_text(msg.reply_to_message, owner_id, reply_sticker.file_id)
+            is_animated = bool(reply_sticker.is_animated or reply_sticker.is_video)
+            await _show_meme_menu(
+                msg,
+                owner_id,
+                selected_media={
+                    'file_id': reply_sticker.file_id,
+                    'source_type': 'sticker',
+                    'source_animated': is_animated,
+                    'source_format': 'tgs' if reply_sticker.is_animated else 'webm',
+                },
+            )
         return
     if top_text or bottom_text:
         await _ask_for_meme_photo(msg, owner_id, top_text, bottom_text)
         return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='🖼️ Создать мем', callback_data=f'meme_create_{owner_id}'),
-        InlineKeyboardButton(text='✖️ Закрыть', callback_data=f'meme_close_{owner_id}'),
-    ]])
-    await msg.answer(
-        '🎨 <b>МЕМ-МАСТЕРСКАЯ</b>\n'
-        'Добавлю к вашей картинке подпись шрифтом Impact. Можно использовать и стикер.\n\n'
-        '📝 <b>Как задать текст</b>\n'
-        'Формат: <code>надпись сверху.надпись снизу</code>\n'
-        'Текст после точки будет внизу; начните с точки, чтобы оставить только нижнюю надпись.\n\n'
-        '💡 Короткая строка будет крупнее, длинная автоматически подгонится под картинку.',
-        reply_markup=keyboard,
-    )
+    await _show_meme_menu(msg, owner_id)
 
 
 @router.callback_query(F.data.startswith('meme_'))
@@ -5404,7 +6569,7 @@ async def meme_callback(call: CallbackQuery):
         await call.answer()
         return
 
-    if action in {'meme_photo', 'meme_sticker', 'meme_gif', 'meme_animated'}:
+    if action in {'meme_photo', 'meme_sticker', 'meme_gif', 'meme_animated', 'meme_mp4'}:
         if not check_access(owner_id, call.message.chat.id, 'мем', 0):
             await call.answer('Создание мемов отключено в этом чате.', show_alert=True)
             return
@@ -5414,8 +6579,18 @@ async def meme_callback(call: CallbackQuery):
             return
 
         is_animated_source = bool(session.get('source_animated'))
-        if is_animated_source != (action in {'meme_gif', 'meme_animated'}):
-            await call.answer('Этот формат не подходит для исходного стикера.', show_alert=True)
+        source_format = session.get('source_format', 'webm')
+        allowed_animation_actions = {
+            'gif': {'meme_gif'},
+            'mp4': {'meme_gif', 'meme_mp4'},
+        }.get(source_format, {'meme_gif', 'meme_animated'})
+        if (
+            is_animated_source
+            and action not in allowed_animation_actions
+            or not is_animated_source
+            and action not in {'meme_photo', 'meme_sticker'}
+        ):
+            await call.answer('Этот формат не подходит для исходного файла.', show_alert=True)
             return
         await call.message.delete()
         await call.answer()
@@ -5432,8 +6607,10 @@ async def meme_callback(call: CallbackQuery):
                 output_as_animation=(
                     'gif' if action == 'meme_gif'
                     else 'animated_sticker' if action == 'meme_animated'
+                    else 'mp4' if action == 'meme_mp4'
                     else None
                 ),
+                source_format=session.get('source_format', 'webm'),
             )
         finally:
             try:
@@ -5444,7 +6621,7 @@ async def meme_callback(call: CallbackQuery):
         meme_sessions.pop(key, None)
         return
 
-    if action != 'meme_create':
+    if action not in {'meme_create', 'meme_classic', 'meme_demotivator'}:
         await call.answer('Неизвестное действие.', show_alert=True)
         return
     if not check_access(owner_id, call.message.chat.id, 'мем', 0):
@@ -5452,18 +6629,125 @@ async def meme_callback(call: CallbackQuery):
         return
 
     session = _get_meme_session(call.message.chat.id, owner_id)
+    if session and session.get('step') == 'await_style':
+        style = 'demotivator' if action == 'meme_demotivator' else 'classic'
+        if style == 'demotivator' and session.get('source_animated'):
+            await call.answer('Демотиватор поддерживает только статичные изображения.', show_alert=True)
+            return
+        await _ask_for_meme_text(
+            call.message,
+            owner_id,
+            session['file_id'],
+            source_animated=bool(session.get('source_animated')),
+            source_format=session.get('source_format', 'webm'),
+            style=style,
+            source_type=session.get('source_type'),
+            edit_message=True,
+        )
+        await call.answer()
+        return
     if session:
         await call.answer('У вас уже есть активный запрос на создание мема.', show_alert=True)
         return
 
-    await _ask_for_meme_photo(call.message, owner_id, edit_message=True)
+    style = 'demotivator' if action == 'meme_demotivator' else 'classic'
+    await _ask_for_meme_photo(
+        call.message,
+        owner_id,
+        style=style,
+        edit_message=True,
+    )
     await call.answer()
 
 
-@router.message(F.photo | F.document)
+async def _handle_meme_animation_message(
+    msg: Message,
+    media: Any,
+    source_format: str,
+):
+    if media.file_size and media.file_size > MEME_MAX_ANIMATION_BYTES:
+        await msg.answer('⚠️ <b>Анимация слишком большая</b>\nМаксимальный размер — 50 МБ.')
+        return
+
+    key = _meme_session_key(msg.chat.id, msg.from_user.id)
+    meme_command = _parse_meme_caption(msg.caption or '', msg.chat.id)
+    if meme_command:
+        command_name, args = meme_command
+        if not check_access(msg.from_user.id, msg.chat.id, command_name, 0):
+            await msg.answer('⚠️ <b>Создание мемов отключено</b> в этом чате.')
+            return
+        save_activity(msg.chat.id, msg.from_user.id, 'commands')
+        meme_sessions.pop(key, None)
+        top_text, bottom_text = _split_meme_text(args)
+        if top_text or bottom_text:
+            await _ask_for_meme_output_mode(
+                msg,
+                msg.from_user.id,
+                media.file_id,
+                top_text,
+                bottom_text,
+                source_animated=True,
+                source_format=source_format,
+            )
+        else:
+            await _ask_for_meme_text(
+                msg,
+                msg.from_user.id,
+                media.file_id,
+                source_animated=True,
+                source_format=source_format,
+            )
+        return
+
+    session = _get_meme_session(msg.chat.id, msg.from_user.id)
+    if not session or session.get('step') != 'await_photo':
+        return
+    if (
+        not msg.reply_to_message
+        or msg.reply_to_message.message_id != session.get('prompt_message_id')
+    ):
+        await msg.answer(
+            '↩️ <b>Нужно отправить файл ответом</b>\n'
+            'Ответьте именно на сообщение бота с просьбой о картинке.'
+        )
+        return
+
+    if session.get('style') == 'demotivator':
+        await msg.answer('Для демотиватора нужна статичная фотография или изображение, не анимация.')
+        return
+
+    top_text = session.get('top_text', '')
+    bottom_text = session.get('bottom_text', '')
+    if top_text or bottom_text:
+        await _ask_for_meme_output_mode(
+            msg,
+            msg.from_user.id,
+            media.file_id,
+            top_text,
+            bottom_text,
+            source_animated=True,
+            source_format=source_format,
+        )
+    else:
+        await _ask_for_meme_text(
+            msg,
+            msg.from_user.id,
+            media.file_id,
+            source_animated=True,
+            source_format=source_format,
+        )
+
+
+@router.message(F.photo | F.document | F.video | F.animation)
 async def meme_photo_handler(msg: Message):
     if not msg.from_user or msg.from_user.is_bot:
         return
+    animation = _get_message_animation(msg)
+    if animation:
+        media, source_format = animation
+        await _handle_meme_animation_message(msg, media, source_format)
+        return
+
     image_file = _get_message_image(msg)
     if not image_file:
         return
@@ -5500,6 +6784,25 @@ async def meme_photo_handler(msg: Message):
         )
         return
 
+    if session.get('style') == 'demotivator':
+        if msg.caption and msg.caption.strip():
+            if await _create_meme_for_message(
+                msg,
+                image_file.file_id,
+                '',
+                '',
+                demotivator_caption=msg.caption.strip(),
+            ):
+                meme_sessions.pop(key, None)
+            return
+        await _ask_for_meme_text(
+            msg,
+            msg.from_user.id,
+            image_file.file_id,
+            style='demotivator',
+        )
+        return
+
     top_text = session.get('top_text', '')
     bottom_text = session.get('bottom_text', '')
     if top_text or bottom_text:
@@ -5531,7 +6834,18 @@ async def handle_meme_text(msg: Message) -> bool:
         await msg.answer('Напишите текст для мема.')
         return True
 
-    if session.get('source_type') == 'sticker':
+    if session.get('style') == 'demotivator':
+        if await _create_meme_for_message(
+            msg,
+            session['file_id'],
+            '',
+            '',
+            demotivator_caption=text,
+        ):
+            meme_sessions.pop(_meme_session_key(msg.chat.id, msg.from_user.id), None)
+        return True
+
+    if session.get('source_type') == 'sticker' or session.get('source_animated'):
         await _ask_for_meme_output_mode(
             msg,
             msg.from_user.id,
@@ -5539,6 +6853,7 @@ async def handle_meme_text(msg: Message) -> bool:
             top_text,
             bottom_text,
             source_animated=session.get('source_animated', False),
+            source_format=session.get('source_format', 'webm'),
         )
         return True
 
@@ -5560,6 +6875,9 @@ async def sticker_reputation_handler(msg: Message):
         and msg.reply_to_message.message_id == session.get('prompt_message_id')
     ):
         sticker = msg.sticker
+        if session.get('style') == 'demotivator':
+            await msg.answer('Для демотиватора нужна статичная фотография или изображение, не стикер.')
+            return
         if sticker.file_size and sticker.file_size > MEME_MAX_IMAGE_BYTES:
             await msg.answer('⚠️ <b>Стикер слишком большой</b>\nМаксимальный размер — 20 МБ.')
             return
@@ -5573,6 +6891,7 @@ async def sticker_reputation_handler(msg: Message):
                 top_text,
                 bottom_text,
                 source_animated=bool(sticker.is_animated or sticker.is_video),
+                source_format='tgs' if sticker.is_animated else 'webm',
             )
         else:
             await _ask_for_meme_text(msg, msg.from_user.id, sticker.file_id)
@@ -5739,8 +7058,56 @@ def get_matching_phrases(chat_id: int, phrase_text: str) -> list:
 
 
 
+@superadmin_only
+async def cmd_ram(msg: Message, args: str = '', cmd_name: str = 'ram'):
+    if not is_bot_superadmin(msg.from_user.id):
+        return await msg.answer("❌ Эта команда доступна только главным администраторам бота.")
+
+    rss_mb = _get_rss_mb()
+
+    users = storage.data.get('users', {})
+    users_in_ram = sum(
+        len(chat_users)
+        for chat_users in users.values()
+        if isinstance(chat_users, dict)
+    )
+    lines = [
+        f"RSS: <b>{rss_mb:.1f} МБ</b>" if rss_mb is not None else "RSS: недоступен",
+        f"Загружено чатов: {len(storage._loaded_user_chats)}",
+        f"Пользователей в RAM: {users_in_ram}",
+        f"_dirty_users: <b>{len(storage._dirty_users)}</b>",
+        f"user_cache: {len(user_cache._cache)} / mention_cache: {len(mention_cache._cache)}",
+        f"игры: {len(active_games)} / сапёр: {len(minesweeper_games)} / мемы: {len(meme_sessions)}",
+        f"визарды: др {len(birthday_wizards)}, график {len(activity_graph_wizards)}, "
+        f"GC objects: {len(gc.get_objects())}",
+    ]
+    if tracemalloc.is_tracing():
+        snapshot = tracemalloc.take_snapshot()
+        lines.extend(
+            f"<code>{html.escape(str(stat), quote=False)}</code>"
+            for stat in snapshot.statistics('lineno')[:8]
+        )
+    await msg.answer("\n".join(lines))
+
+
 COMMAND_HANDLERS = {
     'cmd_help': lambda msg, args, cmd_name: cmd_help(msg),
+    'cmd_ram': lambda msg, args, cmd_name: cmd_ram(msg, args, cmd_name),
+    'cmd_logs': lambda msg, args, cmd_name: cmd_logs(msg, args),
+    'cmd_backups': lambda msg, args, cmd_name: cmd_backups(msg),
+    'cmd_status': lambda msg, args, cmd_name: cmd_status(msg),
+    'cmd_save_now': lambda msg, args, cmd_name: cmd_save_now(msg),
+    'cmd_bot_rights': lambda msg, args, cmd_name: cmd_bot_rights(msg, args),
+    'cmd_reset_caches': lambda msg, args, cmd_name: cmd_reset_caches(msg),
+    'cmd_export_user': lambda msg, args, cmd_name: cmd_export_user(msg, args),
+    'cmd_database_info': lambda msg, args, cmd_name: cmd_database_info(msg),
+    'cmd_gc': lambda msg, args, cmd_name: cmd_gc(msg),
+    'cmd_broadcast': lambda msg, args, cmd_name: cmd_broadcast(msg, args),
+    'cmd_leave_chat': lambda msg, args, cmd_name: cmd_leave_chat(msg, args),
+    'cmd_block_chat': lambda msg, args, cmd_name: cmd_block_chat(msg, args),
+    'cmd_unblock_chat': lambda msg, args, cmd_name: cmd_block_chat(msg, args, unblock=True),
+    'cmd_restart': lambda msg, args, cmd_name: cmd_restart(msg),
+    'cmd_superadmin_audit': lambda msg, args, cmd_name: cmd_superadmin_audit(msg),
     'cmd_prefix': lambda msg, args, cmd_name: cmd_prefix(msg, args),
     'cmd_rp_list': lambda msg, args, cmd_name: cmd_rp_list(msg),
     'who_am_i': lambda msg, args, cmd_name: who_am_i(msg, cmd_name),
@@ -5758,6 +7125,19 @@ COMMAND_HANDLERS = {
     'cmd_unmute': lambda msg, args, cmd_name: cmd_unmute(msg, cmd_name),
     'cmd_ban': lambda msg, args, cmd_name: cmd_ban(msg, cmd_name),
     'cmd_unban': lambda msg, args, cmd_name: cmd_unban(msg, cmd_name),
+    'cmd_kick': lambda msg, args, cmd_name: cmd_kick(msg, cmd_name),
+    'cmd_moderation_history': lambda msg, args, cmd_name: cmd_moderation_history(msg, cmd_name),
+    'cmd_moderation_log': lambda msg, args, cmd_name: cmd_moderation_log(msg, cmd_name),
+    'cmd_moderation_stats': lambda msg, args, cmd_name: cmd_moderation_stats(msg, cmd_name),
+    'cmd_reason_templates': lambda msg, args, cmd_name: cmd_reason_templates(msg, args, cmd_name),
+    'cmd_moderation_auto_delete': lambda msg, args, cmd_name: cmd_moderation_auto_delete(msg, args, cmd_name),
+    'cmd_join_requests': lambda msg, args, cmd_name: cmd_join_requests(msg, args, cmd_name),
+    'cmd_filters': lambda msg, args, cmd_name: cmd_filters(msg, args, cmd_name),
+    'cmd_captcha': lambda msg, args, cmd_name: cmd_captcha(msg, args, cmd_name),
+    'cmd_raid_mode': lambda msg, args, cmd_name: cmd_raid_mode(msg, args, cmd_name),
+    'cmd_freeze_chat': lambda msg, args, cmd_name: cmd_freeze_chat(msg, args, cmd_name),
+    'cmd_unfreeze_chat': lambda msg, args, cmd_name: cmd_unfreeze_chat(msg, cmd_name),
+    'cmd_channel_autohide': lambda msg, args, cmd_name: cmd_channel_autohide(msg, args, cmd_name),
     'cmd_warn': lambda msg, args, cmd_name: cmd_warn(msg, cmd_name),
     'cmd_warn_actions': lambda msg, args, cmd_name: cmd_warn_actions(msg, cmd_name),
     'show_warnings': lambda msg, args, cmd_name: show_warnings(msg, cmd_name),
@@ -5801,6 +7181,8 @@ COMMAND_HANDLERS = {
     'cmd_time': lambda msg, args, cmd_name: cmd_time(msg, args, cmd_name),
     'cmd_activity_graph_theme': lambda msg, args, cmd_name: cmd_activity_graph_theme(msg, cmd_name),
     'cmd_random_joke': lambda msg, args, cmd_name: cmd_random_joke(msg, cmd_name),
+    'cmd_steal_candy': lambda msg, args, cmd_name: cmd_steal_candy(msg, args, cmd_name),
+    'cmd_candy_balance': lambda msg, args, cmd_name: cmd_candy_balance(msg, cmd_name),
     'cmd_meme': lambda msg, args, cmd_name: cmd_meme(msg, args, cmd_name),
     'cmd_ship': lambda msg, args, cmd_name: cmd_ship(msg, cmd_name),
     'cmd_my_article': lambda msg, args, cmd_name: cmd_my_article(msg, cmd_name),
@@ -5814,8 +7196,8 @@ COMMAND_HANDLERS = {
     'cmd_ping_check': lambda msg, args, cmd_name: cmd_ping_check(msg),
     'cmd_pic_toggle': lambda msg, args, cmd_name: cmd_pic_toggle(msg, cmd_name),
     'cmd_ping': lambda msg, args, cmd_name: cmd_ping(msg, cmd_name),
-    'cmd_backup': lambda msg, args, cmd_name: cmd_backup(msg, cmd_name),
-    'cmd_restore': lambda msg, args, cmd_name: cmd_restore(msg, cmd_name),
+    'cmd_backup': lambda msg, args, cmd_name: cmd_backup(msg, args, cmd_name),
+    'cmd_restore': lambda msg, args, cmd_name: cmd_restore(msg, args, cmd_name),
     'cmd_list_bot_chats': lambda msg, args, cmd_name: cmd_list_bot_chats(msg),
     'cmd_dk_set': lambda msg, args, cmd_name: cmd_dk_set(msg, cmd_name),
     'cmd_dk_enable': lambda msg, args, cmd_name: cmd_dk_enable(msg, cmd_name),
@@ -5936,7 +7318,20 @@ BDAY_UTC_OFFSETS = tuple(sorted(set(
     ]
 )))
 BDAY_WIZARD_TTL = 15 * 60
+BDAY_NOTIFICATION_INTERVAL = 5 * 60
 birthday_wizards: Dict[Tuple[int, int], dict] = {}
+BDAY_CONGRATULATIONS = (
+    'С днём рождения! Желаю много радости, тепла и исполнения желаний 🎂',
+    'Пусть каждый день приносит счастье, улыбки и приятные сюрпризы! 🎁',
+    'Желаю крепкого здоровья, ярких впечатлений и верных друзей рядом! 🌟',
+    'Пусть всё задуманное получается, а поводов для радости будет больше! 🎈',
+    'Желаю незабываемого года, полного удачи, любви и новых побед! 🥳',
+    'Пусть мечты сбываются, настроение будет отличным, а торт — вкусным! 🍰',
+    'Желаю побольше счастливых моментов и людей, с которыми ими хочется делиться! 💛',
+    'Пусть впереди ждут только хорошие новости, большие успехи и чудеса! ✨',
+    'Желаю яркого праздника и целого года, который будет лучше предыдущего! 🎊',
+    'Пусть в жизни всегда найдётся место приключениям, смеху и исполнению желаний! 🌈',
+)
 
 
 def _birthday_offset_label(offset_minutes: int) -> str:
@@ -6075,11 +7470,7 @@ def _birthday_countdown_text(birthday: dict) -> str:
     days = _birthday_days_remaining(birthday)
     date_text = f"{int(birthday['day'])} {BDAY_MONTHS_GENITIVE[int(birthday['month']) - 1]}"
     if days == 0:
-        return (
-            f"🎂 День рождения: <b>{date_text}</b> <i>(сегодня!)</i>\n"
-            "🎉 <b>С днём рождения!</b>\n"
-            "Пусть этот год принесёт много счастливых моментов 💛"
-        )
+        return f"🎂 День рождения: <b>{date_text}</b> <i>(сегодня!)</i>"
 
     if days % 10 == 1 and days % 100 != 11:
         days_text = f'{days} день'
@@ -6092,6 +7483,99 @@ def _birthday_countdown_text(birthday: dict) -> str:
         f"🎂 День рождения: <b>{date_text}</b> <i>(через {days_text})</i>\n"
         f"✨ {phrase}"
     )
+
+
+async def birthday_notifications_task():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            for chat_id in storage.get_known_group_chat_ids():
+                chat_users = storage.load_chat_users(chat_id)
+                for user_id_text, user_data in list(chat_users.items()):
+                    birthday = user_data.get('birthday') if isinstance(user_data, dict) else None
+                    if not _valid_birthday(birthday):
+                        continue
+                    try:
+                        user_id = int(user_id_text)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Некорректный ID пользователя с днём рождения в чате %s: %r",
+                            chat_id, user_id_text,
+                        )
+                        continue
+
+                    birthday_tz = timezone(timedelta(minutes=birthday['utc_offset_minutes']))
+                    local_today = now.astimezone(birthday_tz).date()
+                    birthday_mention = (
+                        f'<a href="tg://user?id={user_id}">'
+                        f'{get_display_name(chat_id, user_id)}</a>'
+                    )
+                    birthday_is_today = (
+                        local_today.month == birthday['month']
+                        and local_today.day == birthday['day']
+                    )
+
+                    if birthday_is_today:
+                        year = local_today.year
+                        if birthday.get('_greeting_emoji_year') != year:
+                            try:
+                                await bot.send_message(chat_id, '🎉')
+                            except (TelegramAPIError, asyncio.TimeoutError) as exc:
+                                logger.warning(
+                                    "Не удалось отправить смайл ко дню рождения пользователя %s в чате %s: %s",
+                                    user_id, chat_id, exc,
+                                )
+                                continue
+                            birthday['_greeting_emoji_year'] = year
+                            storage.get_user(chat_id, user_id, use_cache=False)
+                            await storage.save()
+
+                        if birthday.get('_greeting_year') != year:
+                            greeting = random.choice(BDAY_CONGRATULATIONS)
+                            try:
+                                await bot.send_message(
+                                    chat_id,
+                                    f"🎂 {birthday_mention}! {greeting}",
+                                )
+                            except (TelegramAPIError, asyncio.TimeoutError) as exc:
+                                logger.warning(
+                                    "Не удалось поздравить пользователя %s в чате %s: %s",
+                                    user_id, chat_id, exc,
+                                )
+                                continue
+                            birthday['_greeting_year'] = year
+                            storage.get_user(chat_id, user_id, use_cache=False)
+                            await storage.save()
+                        continue
+
+                    reminder_day = min(
+                        birthday['day'],
+                        calendar.monthrange(local_today.year, local_today.month)[1],
+                    )
+                    month_key = f'{local_today.year:04d}-{local_today.month:02d}'
+                    if (
+                        local_today.day < reminder_day
+                        or birthday.get('_reminder_month') == month_key
+                    ):
+                        continue
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"🎂 Ежемесячное напоминание для {birthday_mention}!\n"
+                            f"{_birthday_countdown_text(birthday)}",
+                        )
+                    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+                        logger.warning(
+                            "Не удалось отправить напоминание о дне рождения пользователя %s в чате %s: %s",
+                            user_id, chat_id, exc,
+                        )
+                        continue
+                    birthday['_reminder_month'] = month_key
+                    storage.get_user(chat_id, user_id, use_cache=False)
+                    await storage.save()
+        except Exception:
+            logger.exception("Ошибка проверки дней рождения")
+        await asyncio.sleep(BDAY_NOTIFICATION_INTERVAL)
 
 
 async def cmd_birthday(msg: Message):
@@ -7527,6 +9011,697 @@ async def cmd_stats(msg: Message, args: str = "", cmd_name: str = 'статис�
 
 # ==================== Модерация ====================
 
+def log_moderation(
+    chat_id: int,
+    actor_id: Optional[int],
+    target_id: int,
+    action: str,
+    reason: str = '',
+    duration: Optional[Union[int, float]] = None,
+    target_label: Optional[str] = None,
+) -> None:
+    now = time.time()
+    logs = storage.data.setdefault('moderation_log', {})
+    if not isinstance(logs, dict):
+        logger.warning("Некорректное хранилище журнала модерации; создаю новое")
+        logs = {}
+        storage.data['moderation_log'] = logs
+
+    chat_key = str(chat_id)
+    entries = logs.get(chat_key, [])
+    if not isinstance(entries, list):
+        logger.warning("Некорректный журнал модерации в чате %s; создаю новый", chat_id)
+        entries = []
+
+    cutoff = now - 90 * 86400
+    valid_entries = [
+        entry for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get('ts'), (int, float))
+        and entry['ts'] > cutoff
+    ]
+    valid_entries.append({
+        'ts': now,
+        'actor': actor_id,
+        'target': target_id,
+        'action': str(action)[:32],
+        'reason': str(reason or '')[:500],
+        'duration': duration,
+        'target_label': str(target_label)[:100] if target_label else None,
+    })
+    logs[chat_key] = valid_entries[-500:]
+    storage.mark_dirty()
+
+
+CHAT_PERMISSION_FIELDS = (
+    'can_send_messages', 'can_send_audios', 'can_send_documents', 'can_send_photos',
+    'can_send_videos', 'can_send_video_notes', 'can_send_voice_notes',
+    'can_send_polls', 'can_send_other_messages', 'can_add_web_page_previews',
+    'can_change_info', 'can_invite_users', 'can_pin_messages', 'can_manage_topics',
+)
+
+
+def snapshot_chat_permissions(permissions: Optional[ChatPermissions]) -> Optional[dict]:
+    if permissions is None:
+        return None
+    snapshot = {
+        field: getattr(permissions, field)
+        for field in CHAT_PERMISSION_FIELDS
+        if getattr(permissions, field, None) is not None
+    }
+    return snapshot or None
+
+
+async def freeze_chat(chat_id: int, duration_seconds: int) -> bool:
+    if await bot_can(chat_id, 'can_restrict_members') is not True:
+        return False
+    settings = storage.get_chat_settings(chat_id)
+    previous_state = settings.get('chat_freeze')
+    if isinstance(previous_state, dict) and isinstance(previous_state.get('permissions'), dict):
+        saved_permissions = previous_state['permissions']
+    else:
+        try:
+            chat = await bot.get_chat(chat_id)
+        except (TelegramAPIError, asyncio.TimeoutError) as exc:
+            logger.warning("Не удалось получить разрешения чата %s для заморозки: %s", chat_id, exc)
+            return False
+        saved_permissions = snapshot_chat_permissions(getattr(chat, 'permissions', None))
+        if not saved_permissions:
+            logger.error("Telegram не вернул исходные разрешения чата %s; заморозка отменена", chat_id)
+            return False
+
+    now = time.time()
+    previous_expiry = (
+        previous_state.get('expires_at')
+        if isinstance(previous_state, dict) and isinstance(previous_state.get('expires_at'), (int, float))
+        else 0
+    )
+    settings['chat_freeze'] = {
+        'permissions': dict(saved_permissions),
+        'expires_at': max(previous_expiry, now + duration_seconds),
+        'next_retry_at': 0,
+    }
+    storage.invalidate_chat_settings_cache(chat_id)
+    storage.mark_dirty()
+    await storage.save()
+    try:
+        await bot.set_chat_permissions(
+            chat_id,
+            ChatPermissions(can_send_messages=False),
+        )
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        if isinstance(previous_state, dict):
+            settings['chat_freeze'] = previous_state
+        else:
+            settings.pop('chat_freeze', None)
+        storage.invalidate_chat_settings_cache(chat_id)
+        storage.mark_dirty()
+        await storage.save()
+        logger.warning("Не удалось заморозить чат %s: %s", chat_id, exc)
+        return False
+    return True
+
+
+async def restore_chat_freeze(chat_id: int) -> bool:
+    settings = storage.get_chat_settings(chat_id)
+    state = settings.get('chat_freeze')
+    if not isinstance(state, dict):
+        return False
+    permissions = state.get('permissions')
+    if not isinstance(permissions, dict) or not permissions:
+        logger.error("Некорректные сохранённые разрешения замороженного чата %s", chat_id)
+        return False
+    if await bot_can(chat_id, 'can_restrict_members') is not True:
+        state['next_retry_at'] = time.time() + MUTE_CHECK_INTERVAL
+        storage.mark_dirty()
+        await storage.save()
+        return False
+    try:
+        await bot.set_chat_permissions(chat_id, ChatPermissions(**permissions))
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        state['next_retry_at'] = time.time() + MUTE_CHECK_INTERVAL
+        storage.mark_dirty()
+        await storage.save()
+        logger.warning("Не удалось восстановить исходные разрешения чата %s: %s", chat_id, exc)
+        return False
+    settings.pop('chat_freeze', None)
+    storage.invalidate_chat_settings_cache(chat_id)
+    storage.mark_dirty()
+    await storage.save()
+    return True
+
+
+async def require_chat_configuration_access(msg: Message, cmd_name: str, example: str) -> bool:
+    if not await require_telegram_admin(msg):
+        return False
+    return await require_access(
+        msg, cmd_name, 5, title='Недостаточно прав',
+        message='Настраивать эту функцию могут администраторы ранга 5.',
+        example=example,
+    )
+
+
+def normalize_filter_domain(value: str) -> Optional[str]:
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if not candidate.lower().startswith(('http://', 'https://')):
+        candidate = f'https://{candidate}'
+    try:
+        parsed = urlsplit(candidate)
+        if parsed.port is not None:
+            return None
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or '').casefold().rstrip('.')
+    if parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        return None
+    if not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', hostname):
+        return None
+    return hostname
+
+
+async def send_moderation_notice(msg: Message, text: str, **kwargs) -> Message:
+    notice = await msg.answer(text, **kwargs)
+    seconds = storage.get_chat_settings(msg.chat.id).get('moderation_notice_delete_seconds', 0)
+    if isinstance(seconds, int) and 1 <= seconds <= MODERATION_NOTICE_DELETE_MAX_SECONDS:
+        spawn_background_task(delete_message_after(notice, seconds))
+        spawn_background_task(delete_message_after(msg, seconds))
+    return notice
+
+
+async def cmd_moderation_auto_delete(msg: Message, args: str = '', cmd_name: str = 'автоудаление'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!автоудаление 30'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    raw = args.strip()
+    if not raw:
+        seconds = settings.get('moderation_notice_delete_seconds', 0)
+        if not isinstance(seconds, int) or not 0 <= seconds <= MODERATION_NOTICE_DELETE_MAX_SECONDS:
+            logger.warning("Некорректный срок автоудаления в чате %s: %r", msg.chat.id, seconds)
+            return await msg.answer("❌ Настройка автоудаления повреждена.")
+        return await msg.answer(
+            f"🧹 Автоудаление ответов и команд модерации: <b>{seconds} сек.</b> "
+            "(0 — выключено)."
+        )
+    if not raw.isdigit():
+        return await msg.answer("❌ Укажите число секунд от 0 до 300.")
+    seconds = int(raw)
+    if not 0 <= seconds <= MODERATION_NOTICE_DELETE_MAX_SECONDS:
+        return await msg.answer("❌ Допустимый срок автоудаления: от 0 до 300 секунд.")
+    settings['moderation_notice_delete_seconds'] = seconds
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(
+        "✅ Автоудаление выключено." if seconds == 0
+        else f"✅ Ответы и команды модерации будут удаляться через {seconds} сек."
+    )
+
+
+async def cmd_moderation_log(msg: Message, cmd_name: str = 'лог'):
+    if not await require_access(
+        msg, cmd_name, 1, title='Недостаточно прав',
+        message='Журнал модерации доступен модераторам и выше.',
+        example='!лог'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    logs = storage.data.get('moderation_log', {})
+    if not isinstance(logs, dict):
+        logger.error("Некорректное хранилище журнала модерации")
+        return await msg.answer("❌ Не удалось прочитать журнал модерации.")
+    entries = logs.get(str(msg.chat.id), [])
+    await send_moderation_history(msg, entries, title='🧾 Последние действия модерации')
+
+
+async def cmd_moderation_stats(msg: Message, cmd_name: str = 'модстат'):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(
+        msg, cmd_name, 1, title='Недостаточно прав',
+        message='Статистика модерации доступна модераторам и выше.',
+        example='!модстат'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    logs = storage.data.get('moderation_log', {})
+    entries = logs.get(str(msg.chat.id), []) if isinstance(logs, dict) else None
+    if not isinstance(entries, list):
+        logger.error("Некорректный журнал модерации при подсчёте статистики чата %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать журнал модерации.")
+    cutoff = time.time() - 7 * 86400
+    counts = defaultdict(int)
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get('ts'), (int, float)):
+            continue
+        if entry['ts'] >= cutoff and isinstance(entry.get('actor'), int):
+            counts[entry['actor']] += 1
+    if not counts:
+        return await msg.answer("📊 За последние 7 дней действий модерации нет.")
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:20]
+    lines = ["📊 <b>Действия модерации за 7 дней</b>", UI_LINE]
+    lines.extend(
+        f"{index}. {mention(msg.chat.id, actor_id)} — <b>{count}</b>"
+        for index, (actor_id, count) in enumerate(ranked, start=1)
+    )
+    await send_chunked_text(msg, '\n'.join(lines))
+
+
+async def cmd_reason_templates(msg: Message, args: str = '', cmd_name: str = 'причины'):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(
+        msg, cmd_name, 2, title='Недостаточно прав',
+        message='Настраивать шаблоны причин могут модераторы ранга 2+.',
+        example='!причины add флуд',
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    templates = settings.get('reason_templates', [])
+    if not isinstance(templates, list) or not all(isinstance(item, str) for item in templates):
+        logger.error("Некорректные шаблоны причин в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать шаблоны причин.")
+
+    parts = args.strip().split(maxsplit=1)
+    if not parts:
+        lines = ["📝 <b>Шаблоны причин</b>", UI_LINE]
+        lines.extend(
+            f"<code>{index}</code> — {html.escape(reason, quote=False)}"
+            for index, reason in enumerate(templates, start=1)
+        )
+        if not templates:
+            lines.append("Список пуст.")
+        lines.append("\nДобавить: <code>!причины add текст</code>; удалить: <code>!причины remove номер</code>.")
+        lines.append("Применить: <code>!пред @user номер</code> (по умолчанию срок предупреждения).")
+        return await send_chunked_text(msg, '\n'.join(lines))
+
+    action = parts[0].casefold()
+    if action == 'add':
+        if len(parts) != 2 or not parts[1].strip() or len(parts[1].strip()) > 120:
+            return await msg.answer("❌ Укажите шаблон длиной от 1 до 120 символов.")
+        reason = parts[1].strip()
+        if len(templates) >= REASON_TEMPLATE_LIMIT:
+            return await msg.answer(f"❌ Можно настроить не больше {REASON_TEMPLATE_LIMIT} шаблонов.")
+        if reason.casefold() in {item.casefold() for item in templates}:
+            return await msg.answer("ℹ️ Такой шаблон уже существует.")
+        templates.append(reason)
+        result = "✅ Шаблон причины добавлен."
+    elif action == 'remove':
+        if len(parts) != 2 or not parts[1].isdigit():
+            return await msg.answer("❌ Формат удаления: <code>!причины remove номер</code>.")
+        index = int(parts[1])
+        if not 1 <= index <= len(templates):
+            return await msg.answer("❌ Шаблон с таким номером не найден.")
+        templates.pop(index - 1)
+        result = "✅ Шаблон причины удалён; номера оставшихся шаблонов изменились."
+    else:
+        return await msg.answer("❌ Используйте <code>add текст</code> или <code>remove номер</code>.")
+
+    settings['reason_templates'] = templates
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(result)
+
+
+async def cmd_join_requests(msg: Message, args: str = '', cmd_name: str = 'заявки'):
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(
+        msg, cmd_name, 5, title='Недостаточно прав',
+        message='Настраивать обработку заявок могут администраторы ранга 5.',
+        example='!заявки admin'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+
+    raw = strip_command_prefix(msg.text or '', msg.chat.id)
+    parts = raw.split(maxsplit=1)
+    mode = parts[1].strip().casefold() if len(parts) > 1 else ''
+    settings = storage.get_chat_settings(msg.chat.id)
+    if not mode:
+        current = settings.get('join_request_mode', 'off')
+        return await msg.answer(
+            f"📨 Режим заявок: <b>{html.escape(str(current), quote=False)}</b>\n"
+            "Варианты: <code>off</code>, <code>on</code> (автоодобрение), "
+            "<code>admin</code> (решение кнопками Telegram-администраторов)."
+        )
+    if mode not in {'off', 'on', 'admin'}:
+        return await msg.answer("❌ Выберите режим: <code>off</code>, <code>on</code> или <code>admin</code>.")
+    if mode != 'off' and not await require_bot_right(
+        msg, 'can_invite_users', 'одобрения заявок на вступление'
+    ):
+        return
+
+    settings['join_request_mode'] = mode
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    descriptions = {
+        'off': 'обработка выключена',
+        'on': 'заявки будут одобряться автоматически',
+        'admin': 'Telegram-администраторы смогут одобрять или отклонять заявки кнопками',
+    }
+    await msg.answer(f"✅ Режим заявок изменён: {descriptions[mode]}.")
+
+
+async def cmd_filters(msg: Message, args: str = '', cmd_name: str = 'фильтр'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!фильтр слово add реклама'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    filters = settings.get('content_filters', {})
+    if not isinstance(filters, dict):
+        logger.error("Некорректные фильтры содержимого в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать настройки фильтров.")
+
+    parts = args.strip().split(maxsplit=2)
+    if not parts:
+        lines = ["🧹 <b>Фильтры содержимого</b>", UI_LINE]
+        for key, title in (
+            ('stop_words', 'Стоп-слова'),
+            ('blocked_types', 'Запрещённые типы'),
+            ('allow_domains', 'Разрешённые домены'),
+            ('block_domains', 'Заблокированные домены'),
+        ):
+            values = filters.get(key, [])
+            if not isinstance(values, list):
+                logger.warning("Некорректный список %s в чате %s", key, msg.chat.id)
+                return await msg.answer("❌ Не удалось прочитать настройки фильтров.")
+            shown = ', '.join(html.escape(str(value), quote=False) for value in values) or 'нет'
+            lines.append(f"\n<b>{title}:</b> {shown}")
+        lines.extend((
+            "\n\n<code>!фильтр слово add|remove текст</code>",
+            "<code>!фильтр тип voice|video|video_note|sticker|forward|audio|document|photo on|off</code>",
+            "<code>!фильтр домен allow|block|remove example.com</code>",
+        ))
+        return await send_chunked_text(msg, '\n'.join(lines))
+
+    category = parts[0].casefold()
+    if category == 'слово':
+        if len(parts) < 3 or parts[1].casefold() not in {'add', 'remove'}:
+            return await msg.answer("❌ Формат: <code>!фильтр слово add|remove текст</code>")
+        word = parts[2].strip()
+        if not word or len(word) > 64:
+            return await msg.answer("❌ Стоп-слово должно содержать от 1 до 64 символов.")
+        values = filters.get('stop_words', [])
+        if not isinstance(values, list):
+            return await msg.answer("❌ Список стоп-слов повреждён; обратитесь к владельцу бота.")
+        values = [value for value in values if isinstance(value, str)]
+        if parts[1].casefold() == 'add':
+            if not await require_bot_right(msg, 'can_delete_messages', 'удаления сообщений со стоп-словами'):
+                return
+            if word.casefold() in {value.casefold() for value in values}:
+                return await msg.answer("ℹ️ Это стоп-слово уже добавлено.")
+            if len(values) >= FILTER_LIST_LIMIT:
+                return await msg.answer(f"❌ Можно настроить не больше {FILTER_LIST_LIMIT} стоп-слов.")
+            values.append(word)
+            result = "✅ Стоп-слово добавлено."
+        else:
+            remaining = [value for value in values if value.casefold() != word.casefold()]
+            if len(remaining) == len(values):
+                return await msg.answer("ℹ️ Такого стоп-слова нет в списке.")
+            values = remaining
+            result = "✅ Стоп-слово удалено."
+        filters['stop_words'] = values
+    elif category == 'тип':
+        if len(parts) != 3:
+            return await msg.answer("❌ Формат: <code>!фильтр тип voice|video|video_note|sticker|forward|audio|document|photo on|off</code>")
+        content_type = parts[1].casefold()
+        enabled = parts[2].casefold()
+        allowed_types = {'voice', 'video', 'video_note', 'sticker', 'forward', 'audio', 'document', 'photo'}
+        if content_type not in allowed_types or enabled not in {'on', 'off'}:
+            return await msg.answer("❌ Укажите поддерживаемый тип и состояние <code>on</code> или <code>off</code>.")
+        values = filters.get('blocked_types', [])
+        if not isinstance(values, list):
+            return await msg.answer("❌ Список типов сообщений повреждён; обратитесь к владельцу бота.")
+        values = [value for value in values if isinstance(value, str) and value in allowed_types]
+        if enabled == 'on':
+            if not await require_bot_right(msg, 'can_delete_messages', 'удаления сообщений запрещённого типа'):
+                return
+            if content_type not in values:
+                values.append(content_type)
+            result = f"✅ Запрет типа <code>{content_type}</code> включён."
+        else:
+            values = [value for value in values if value != content_type]
+            result = f"✅ Запрет типа <code>{content_type}</code> выключен."
+        filters['blocked_types'] = values
+    elif category == 'домен':
+        if len(parts) != 3 or parts[1].casefold() not in {'allow', 'block', 'remove'}:
+            return await msg.answer("❌ Формат: <code>!фильтр домен allow|block|remove example.com</code>")
+        domain = normalize_filter_domain(parts[2])
+        if not domain:
+            return await msg.answer("❌ Укажите корректный домен без пути, например <code>example.com</code>.")
+        allow = filters.get('allow_domains', [])
+        block = filters.get('block_domains', [])
+        if not isinstance(allow, list) or not isinstance(block, list):
+            return await msg.answer("❌ Список доменов повреждён; обратитесь к владельцу бота.")
+        allow = [value for value in allow if isinstance(value, str)]
+        block = [value for value in block if isinstance(value, str)]
+        action = parts[1].casefold()
+        if action == 'remove':
+            allow = [value for value in allow if value != domain]
+            block = [value for value in block if value != domain]
+            result = f"✅ Домен <code>{html.escape(domain, quote=False)}</code> удалён из списков."
+        elif action == 'allow':
+            if domain not in allow and len(allow) >= FILTER_LIST_LIMIT:
+                return await msg.answer(f"❌ Можно настроить не больше {FILTER_LIST_LIMIT} разрешённых доменов.")
+            if domain not in allow:
+                allow.append(domain)
+            result = f"✅ Домен <code>{html.escape(domain, quote=False)}</code> разрешён."
+        else:
+            if not await require_bot_right(msg, 'can_delete_messages', 'удаления сообщений с запрещёнными доменами'):
+                return
+            if domain not in block and len(block) >= FILTER_LIST_LIMIT:
+                return await msg.answer(f"❌ Можно настроить не больше {FILTER_LIST_LIMIT} заблокированных доменов.")
+            if domain not in block:
+                block.append(domain)
+            result = f"✅ Домен <code>{html.escape(domain, quote=False)}</code> заблокирован."
+        filters['allow_domains'] = allow
+        filters['block_domains'] = block
+    else:
+        return await msg.answer("❌ Разделы фильтров: <code>слово</code>, <code>тип</code>, <code>домен</code>.")
+
+    settings['content_filters'] = filters
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(result, disable_web_page_preview=True)
+
+
+async def cmd_captcha(msg: Message, args: str = '', cmd_name: str = 'капча'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!капча on'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    mode = args.strip().casefold()
+    if not mode:
+        enabled = settings.get('captcha_enabled', False)
+        raid = settings.get('raid_mode', False)
+        return await msg.answer(
+            f"🧩 Капча: <b>{'включена' if enabled else 'выключена'}</b>; "
+            f"режим рейда: <b>{'включён' if raid else 'выключен'}</b>."
+        )
+    if mode not in {'on', 'off'}:
+        return await msg.answer("❌ Используйте <code>!капча on</code> или <code>!капча off</code>.")
+    if mode == 'on' and not await require_bot_right(msg, 'can_restrict_members', 'карантина новичков'):
+        return
+    settings['captcha_enabled'] = mode == 'on'
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(f"✅ Капча для новых участников {'включена' if mode == 'on' else 'выключена'}.")
+
+
+async def cmd_raid_mode(msg: Message, args: str = '', cmd_name: str = 'рейд'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!рейд on'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    mode = args.strip().casefold()
+    if not mode:
+        enabled = settings.get('raid_mode', False)
+        return await msg.answer(
+            f"🚨 Режим рейда <b>{'включён' if enabled else 'выключен'}</b>. "
+            "В режиме рейда для новых участников действует капча."
+        )
+    if mode not in {'on', 'off'}:
+        return await msg.answer("❌ Используйте <code>!рейд on</code> или <code>!рейд off</code>.")
+    if mode == 'on' and not await require_bot_right(msg, 'can_restrict_members', 'карантина новичков'):
+        return
+    settings['raid_mode'] = mode == 'on'
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(
+        f"✅ Режим рейда {'включён' if mode == 'on' else 'выключен'}. "
+        "При включении новые участники должны пройти капчу."
+    )
+
+
+async def cmd_channel_autohide(msg: Message, args: str = '', cmd_name: str = 'каналы'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!каналы on'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    mode = args.strip().casefold()
+    if not mode:
+        enabled = settings.get('hide_channel_messages', False)
+        return await msg.answer(
+            f"📢 Автоудаление сообщений от каналов: <b>{'включено' if enabled else 'выключено'}</b>."
+        )
+    if mode not in {'on', 'off'}:
+        return await msg.answer("❌ Используйте <code>!каналы on</code> или <code>!каналы off</code>.")
+    if mode == 'on' and not await require_bot_right(msg, 'can_delete_messages', 'удаления сообщений от каналов'):
+        return
+    settings['hide_channel_messages'] = mode == 'on'
+    storage.invalidate_chat_settings_cache(msg.chat.id)
+    storage.mark_dirty()
+    await storage.save()
+    await msg.answer(
+        f"✅ Автоудаление сообщений от каналов {'включено' if mode == 'on' else 'выключено'}."
+    )
+
+
+async def cmd_freeze_chat(msg: Message, args: str = '', cmd_name: str = 'закрыть'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!закрыть 10м'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    raw_duration = args.strip()
+    if not raw_duration:
+        return await msg.answer("❌ Укажите срок заморозки, например <code>!закрыть 10м</code>.")
+    duration_minutes = parse_time(raw_duration)
+    if not 1 <= duration_minutes <= MAX_CHAT_FREEZE_SECONDS // 60:
+        return await msg.answer("❌ Укажите срок заморозки от 1 минуты до 24 часов, например <code>!закрыть 10м</code>.")
+    if not await require_bot_right(msg, 'can_restrict_members', 'заморозки чата'):
+        return
+    if not await freeze_chat(msg.chat.id, duration_minutes * 60):
+        return await msg.answer(
+            "❌ Не удалось заморозить чат. Проверьте права бота и доступность исходных разрешений."
+        )
+    await msg.answer(
+        f"🔒 Чат заморожен на {html.escape(format_mute_duration(duration_minutes), quote=False)}. "
+        "Исходные разрешения будут восстановлены автоматически."
+    )
+
+
+async def cmd_unfreeze_chat(msg: Message, cmd_name: str = 'открыть'):
+    if not await require_chat_configuration_access(msg, cmd_name, '!открыть'):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    settings = storage.get_chat_settings(msg.chat.id)
+    if not isinstance(settings.get('chat_freeze'), dict):
+        return await msg.answer("ℹ️ Чат сейчас не заморожен.")
+    if not await require_bot_right(msg, 'can_restrict_members', 'восстановления разрешений чата'):
+        return
+    if not await restore_chat_freeze(msg.chat.id):
+        return await msg.answer("❌ Не удалось восстановить разрешения чата; бот повторит попытку автоматически.")
+    await msg.answer("🔓 Чат открыт; исходные разрешения восстановлены.")
+
+
+async def cmd_moderation_history(msg: Message, cmd_name: str = 'история'):
+    if not await require_access(
+        msg, cmd_name, 1, title='Недостаточно прав',
+        message='История модерации доступна модераторам и выше.',
+        example='!история @user'
+    ):
+        return
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    parts = (msg.text or '').split(maxsplit=1)
+    target_arg = parts[1] if len(parts) > 1 else None
+    target_id = None
+    if target_arg and has_explicit_target(msg, target_arg):
+        target_id = await get_target(msg, target_arg)
+    elif msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+    if not target_id:
+        return await msg.answer(
+            ui_error(
+                "Не указан пользователь",
+                "Укажите пользователя или ответьте на его сообщение.",
+                "!история @user"
+            ),
+            disable_web_page_preview=True,
+        )
+
+    logs = storage.data.get('moderation_log', {})
+    if not isinstance(logs, dict):
+        logger.error("Некорректное хранилище журнала модерации")
+        return await msg.answer("❌ Не удалось прочитать журнал модерации.")
+    entries = logs.get(str(msg.chat.id), [])
+    if not isinstance(entries, list):
+        logger.warning("Некорректный журнал модерации в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать журнал модерации.")
+    entries = [
+        entry for entry in entries
+        if isinstance(entry, dict) and entry.get('target') == target_id
+    ]
+    await send_moderation_history(
+        msg, entries, title=f"🧾 История модерации {mention(msg.chat.id, target_id)}"
+    )
+
+
+async def send_moderation_history(msg: Message, entries: Any, title: str):
+    if not isinstance(entries, list):
+        logger.warning("Некорректный журнал модерации в чате %s", msg.chat.id)
+        return await msg.answer("❌ Не удалось прочитать журнал модерации.")
+    cutoff = time.time() - 90 * 86400
+    recent = [
+        entry for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get('ts'), (int, float))
+        and entry['ts'] > cutoff
+    ]
+    recent.sort(key=lambda entry: entry['ts'], reverse=True)
+    recent = recent[:20]
+    if not recent:
+        return await msg.answer(f"{title}\n\nЗа последние 90 дней записей нет.")
+
+    action_names = {
+        'mute': 'мут',
+        'unmute': 'размут',
+        'ban': 'бан',
+        'unban': 'разбан',
+        'kick': 'кик',
+        'kick_failed': 'неполный кик',
+        'ban_channel': 'бан канала',
+        'unban_channel': 'разбан канала',
+        'warn': 'предупреждение',
+        'unwarn': 'снятие предупреждения',
+        'auto_mute': 'автоматический мут',
+        'auto_ban': 'автоматический бан',
+    }
+    lines = [title, UI_LINE]
+    for entry in recent:
+        ts = datetime.fromtimestamp(entry['ts']).strftime('%d.%m.%Y %H:%M')
+        actor_id = entry.get('actor')
+        actor_text = mention(msg.chat.id, actor_id) if isinstance(actor_id, int) else 'автоматическая система'
+        target_id = entry.get('target')
+        target_label = entry.get('target_label')
+        target_text = (
+            html.escape(str(target_label), quote=False)
+            if target_label
+            else mention(msg.chat.id, target_id) if isinstance(target_id, int)
+            else html.escape(str(target_id), quote=False)
+        )
+        action = html.escape(
+            action_names.get(str(entry.get('action')), str(entry.get('action') or 'действие')),
+            quote=False,
+        )
+        reason = html.escape(str(entry.get('reason') or 'Без причины')[:200], quote=False)
+        duration = entry.get('duration')
+        duration_text = ''
+        if isinstance(duration, (int, float)) and duration > 0:
+            duration_text = f" — {html.escape(format_mute_duration(max(1, round(duration / 60))), quote=False)}"
+        lines.append(
+            f"\n<b>{ts}</b> · {action}: {target_text}{duration_text}\n"
+            f"Кто: {actor_text} · Причина: {reason}"
+        )
+    await send_chunked_text(msg, '\n'.join(lines))
+
 def ui_error(title: str, message: str, example: str = "", *, message_is_html: bool = False) -> str:
     """Возвращает стандартное сообщение об ошибке для доступа/формата команды."""
     block = (
@@ -7563,6 +9738,8 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
     if not await require_telegram_admin(msg):
         return
     if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='!мут @user 30м флуд'):
+        return
+    if not await require_bot_right(msg, 'can_restrict_members', 'выдачи мута'):
         return
 
     text = msg.text.strip()
@@ -7621,6 +9798,9 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
 
     if tid == msg.from_user.id:
         return await msg.answer(ui_error("Нельзя замутить себя", "Вы не можете ограничить доступ сами себе.", "!мут @user 30м флуд"), disable_web_page_preview=True)
+
+    if not await require_target_not_telegram_admin(msg, tid):
+        return
 
     if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
         return await msg.answer(ui_error("Анти-модерация", "Нельзя применять эту команду к пользователю с равным или более высоким уровнем доступа.", "!мут @user 30м флуд"), disable_web_page_preview=True)
@@ -7710,6 +9890,14 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
             'muted_by': msg.from_user.id,
             'reason': reason
         })
+        log_moderation(
+            msg.chat.id,
+            msg.from_user.id,
+            tid,
+            'mute',
+            reason,
+            dur * 60 if not permanent else None,
+        )
 
         # Увеличиваем счётчик мутов
         target_user = storage.get_user(msg.chat.id, tid, use_cache=False)
@@ -7733,7 +9921,8 @@ async def cmd_mute(msg: Message, cmd_name: str = 'мут'):
             pass
 
         # Сообщение в чат
-        await msg.answer(
+        await send_moderation_notice(
+            msg,
             "🔇 <b>Мут выдан</b>\n"
             f"{UI_LINE}\n"
             f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
@@ -7753,6 +9942,8 @@ async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
     if not await require_telegram_admin(msg):
         return
     if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='!размут @user'):
+        return
+    if not await require_bot_right(msg, 'can_restrict_members', 'снятия мута'):
         return
 
     text = msg.text.strip()
@@ -7803,11 +9994,18 @@ async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
                     break
 
         await restore_chat_default_permissions(msg.chat.id, tid)
+        log_moderation(
+            msg.chat.id,
+            msg.from_user.id,
+            tid,
+            'unmute',
+            str(mute_info.get('reason') or '') if mute_info else '',
+        )
 
         # Удаляем из списка мутов
         if isinstance(mutes, list):
             storage.data['mutes'][str(msg.chat.id)] = [m for m in mutes if m.get('user_id') != tid]
-            await storage.save()
+        await storage.save()
 
         reason_text = (
             f"\n📝 Причина мута была: {html.escape(str(mute_info['reason']), quote=False)}"
@@ -7815,8 +10013,11 @@ async def cmd_unmute(msg: Message, cmd_name: str = 'размут'):
         )
 
         # Сообщение в чат
-        await msg.answer(f"🔊 {mention(msg.chat.id, tid)} размучен{reason_text}",
-                        disable_web_page_preview=True)
+        await send_moderation_notice(
+            msg,
+            f"🔊 {mention(msg.chat.id, tid)} размучен{reason_text}",
+            disable_web_page_preview=True,
+        )
 
         # Уведомление в личку
         try:
@@ -7840,14 +10041,21 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
         return
     if not await require_access(msg, cmd_name, 3, title='Недостаточно прав', message='Для этой команды нужен ранг 3+.', example='!бан @user реклама'):
         return
+    if not await require_bot_right(msg, 'can_restrict_members', 'бана'):
+        return
 
     text = msg.text.strip()
     parts = text.split(maxsplit=2)
 
     target_arg = parts[1] if len(parts) > 1 else None
+    duration_in_reply = (
+        msg.reply_to_message and msg.reply_to_message.from_user
+        and target_arg and target_arg.isdigit()
+        and int(target_arg) <= MAX_MUTE_MINUTES
+    )
     sender_chat = (
         msg.reply_to_message.sender_chat
-        if msg.reply_to_message and not has_explicit_target(msg, target_arg) else None
+        if msg.reply_to_message and not has_explicit_target(msg, target_arg) and not duration_in_reply else None
     )
     if sender_chat:
         if sender_chat.id == msg.chat.id:
@@ -7870,11 +10078,20 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
                 'reason': reason,
                 'date': time.time(),
             })
+            log_moderation(
+                msg.chat.id,
+                msg.from_user.id,
+                sender_chat.id,
+                'ban_channel',
+                reason,
+                target_label=sender_chat.title or sender_chat.username or str(sender_chat.id),
+            )
             storage.mark_dirty()
             await storage.save()
 
             channel_name = html.escape(sender_chat.title or sender_chat.username or str(sender_chat.id), quote=False)
-            await msg.answer(
+            await send_moderation_notice(
+                msg,
                 "🚫 <b>Бан канала выдан</b>\n"
                 f"{UI_LINE}\n"
                 f"📢 Канал: <b>{channel_name}</b>\n"
@@ -7892,7 +10109,7 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
 
     target_arg = parts[1] if len(parts) > 1 else None
     target_mention = get_target_mention_span(msg, target_arg) if target_arg else None
-    if has_explicit_target(msg, target_arg):
+    if has_explicit_target(msg, target_arg) and not duration_in_reply:
         target_mention = get_target_mention_span(msg, target_arg)
         tid = await get_target(msg, target_arg)
 
@@ -7922,14 +10139,36 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
     if not tid:
         return await msg.answer(ui_error("Не удалось определить пользователя", "Не удалось понять, кого именно вы хотите забанить. Ответьте на сообщение пользователя или укажите @user.", "!бан @user реклама"), disable_web_page_preview=True)
 
+    permanent, duration_text, parsed_reason = parse_mute_duration_and_reason(reason)
+    duration_minutes = parse_time(duration_text) if duration_text else 0
+    if duration_text and duration_minutes < 1:
+        return await msg.answer(
+            "❌ Не удалось распознать срок временного бана. "
+            "Пример: <code>!бан @user 2ч причина</code>."
+        )
+    if duration_text and duration_minutes > MAX_MUTE_MINUTES:
+        return await msg.answer("❌ Срок временного бана должен быть не больше 1 года.")
+    if permanent or duration_minutes > 0:
+        reason = parsed_reason
+
     if tid == msg.from_user.id:
         return await msg.answer(ui_error("Нельзя забанить себя", "Вы не можете забанить самого себя.", "!бан @user реклама"), disable_web_page_preview=True)
+
+    if not await require_target_not_telegram_admin(msg, tid):
+        return
 
     if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
         return await msg.answer(ui_error("Анти-модерация", "Нельзя банить пользователя с равным или более высоким уровнем доступа.", "!бан @user реклама"), disable_web_page_preview=True)
 
     try:
-        await bot.ban_chat_member(msg.chat.id, tid)
+        expires_at = (
+            datetime.now() + timedelta(minutes=duration_minutes)
+            if duration_minutes else None
+        )
+        ban_kwargs = {'revoke_messages': True}
+        if expires_at:
+            ban_kwargs['until_date'] = int(expires_at.timestamp())
+        await bot.ban_chat_member(msg.chat.id, tid, **ban_kwargs)
 
         # Сохраняем в банлист
         chat_id_str = str(msg.chat.id)
@@ -7937,22 +10176,48 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
             storage.data['banned_users'] = {}
         if chat_id_str not in storage.data['banned_users']:
             storage.data['banned_users'][chat_id_str] = []
-        storage.data['banned_users'][chat_id_str].append({
+        banned_users = storage.data['banned_users'][chat_id_str]
+        banned_users[:] = [
+            ban for ban in banned_users
+            if not isinstance(ban, dict) or ban.get('user_id') != tid
+        ]
+        banned_users.append({
             'user_id': tid,
             'banned_by': msg.from_user.id,
             'reason': reason,
-            'date': time.time()
+            'date': time.time(),
+            'expire_time': expires_at.timestamp() if expires_at else None,
+            'permanent': expires_at is None,
+            'duration_minutes': duration_minutes if duration_minutes else None,
         })
 
+        log_moderation(
+            msg.chat.id,
+            msg.from_user.id,
+            tid,
+            'ban',
+            reason,
+            duration_minutes * 60 if duration_minutes else None,
+        )
         storage.mark_dirty()
         await storage.save()
 
         # Сообщение в чат
-        await msg.answer(
+        expiration_text = (
+            f"\n⏱ Срок: {html.escape(format_mute_duration(duration_minutes), quote=False)}"
+            if duration_minutes else ""
+        )
+        expiration_dm_text = (
+            f"⏱ Срок: {html.escape(format_mute_duration(duration_minutes), quote=False)}\n"
+            if duration_minutes else ""
+        )
+        await send_moderation_notice(
+            msg,
             "🚫 <b>Бан выдан</b>\n"
             f"{UI_LINE}\n"
             f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
             f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+            f"{expiration_text}\n"
             f"👮 Забанил: {mention(msg.chat.id, msg.from_user.id)}",
             disable_web_page_preview=True
         )
@@ -7963,6 +10228,7 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
                 tid,
                 f"🚫 <b>Вы были забанены!</b>\n\n"
                 f"📝 Причина: {html.escape(str(reason), quote=False)}\n"
+                f"{expiration_dm_text}"
                 f"👮 Забанил: {mention(msg.chat.id, msg.from_user.id)}",
                 disable_web_page_preview=True
             )
@@ -7974,10 +10240,104 @@ async def cmd_ban(msg: Message, cmd_name: str = 'бан'):
         await msg.answer(f"❌ Не удалось забанить: {html.escape(str(e)[:250], quote=False)}")
 
 
+async def cmd_kick(msg: Message, cmd_name: str = 'кик'):
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    if not await require_telegram_admin(msg):
+        return
+    if not await require_access(
+        msg, cmd_name, 3, title='Недостаточно прав',
+        message='Для кика нужен ранг 3+.',
+        example='!кик @user флуд'
+    ):
+        return
+    if not await require_bot_right(msg, 'can_restrict_members', 'кика'):
+        return
+
+    text = (msg.text or '').strip()
+    parts = text.split(maxsplit=2)
+    target_arg = parts[1] if len(parts) > 1 else None
+    target_mention = get_target_mention_span(msg, target_arg) if target_arg else None
+    if has_explicit_target(msg, target_arg):
+        target_id = await get_target(msg, target_arg)
+        if not target_id:
+            return await msg.answer("❌ Не удалось найти пользователя для кика.")
+        if target_mention:
+            reason = text[target_mention[2]:].strip() or 'Без причины'
+        else:
+            reason = ' '.join(parts[2:]).strip() or 'Без причины'
+    elif msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+        reason = text[len(parts[0]):].strip() or 'Без причины'
+    else:
+        return await msg.answer(
+            ui_error("Не указан пользователь", "Укажите пользователя или ответьте на его сообщение.", "!кик @user причина"),
+            disable_web_page_preview=True,
+        )
+
+    if target_id == msg.from_user.id:
+        return await msg.answer("❌ Нельзя кикнуть себя.")
+    if not await require_target_not_telegram_admin(msg, target_id):
+        return
+    if not check_anti_moderation(msg.from_user.id, target_id, msg.chat.id):
+        return await msg.answer("❌ Нельзя кикнуть пользователя с равным или более высоким рангом.")
+
+    try:
+        target_member = await bot.get_chat_member(msg.chat.id, target_id)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось проверить участника %s перед киком в чате %s: %s", target_id, msg.chat.id, exc)
+        return await msg.answer("❌ Не удалось проверить, состоит ли пользователь в чате. Попробуйте позже.")
+    if target_member.status in ('left', 'kicked'):
+        return await msg.answer("❌ Пользователь уже не состоит в чате.")
+
+    try:
+        await bot.ban_chat_member(msg.chat.id, target_id, revoke_messages=False)
+    except Exception as exc:
+        logger.exception("Не удалось начать кик пользователя %s", target_id)
+        return await msg.answer(f"❌ Не удалось кикнуть пользователя: {html.escape(str(exc)[:250], quote=False)}")
+
+    try:
+        await bot.unban_chat_member(msg.chat.id, target_id, only_if_banned=True)
+    except Exception as exc:
+        logger.exception("Кик пользователя %s не завершён снятием временного бана", target_id)
+        bans_by_chat = storage.data.setdefault('banned_users', {}).setdefault(str(msg.chat.id), [])
+        bans_by_chat[:] = [
+            ban for ban in bans_by_chat
+            if not isinstance(ban, dict) or ban.get('user_id') != target_id
+        ]
+        bans_by_chat.append({
+            'user_id': target_id,
+            'banned_by': msg.from_user.id,
+            'reason': f"Кик не завершен: {reason}",
+            'date': time.time(),
+            'permanent': True,
+        })
+        storage.mark_dirty()
+        log_moderation(
+            msg.chat.id, msg.from_user.id, target_id, 'kick_failed',
+            f"{reason}; не удалось завершить снятием бана",
+        )
+        await storage.save()
+        return await msg.answer(
+            "⚠️ Пользователь заблокирован, но бот не смог снять блокировку после кика. "
+            f"Снимите её вручную: {html.escape(str(exc)[:180], quote=False)}"
+        )
+
+    log_moderation(msg.chat.id, msg.from_user.id, target_id, 'kick', reason)
+    await storage.save()
+    await send_moderation_notice(
+        msg,
+        f"👢 {mention(msg.chat.id, target_id)} кикнут из чата.\n"
+        f"📝 Причина: {html.escape(reason, quote=False)}",
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
     if not await require_telegram_admin(msg):
         return
     if not await require_access(msg, cmd_name, 3, title='Недостаточно прав', message='Для этой команды нужен ранг 3+.', example='!разбан @user'):
+        return
+    if not await require_bot_right(msg, 'can_restrict_members', 'снятия бана'):
         return
 
     text = msg.text.strip()
@@ -8009,7 +10369,15 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
                     if not isinstance(ban, dict) or ban.get('sender_chat_id') != sender_chat.id
                 ]
                 storage.mark_dirty()
-                await storage.save()
+            log_moderation(
+                msg.chat.id,
+                msg.from_user.id,
+                sender_chat.id,
+                'unban_channel',
+                str(ban_info.get('reason') or '') if ban_info else '',
+                target_label=sender_chat.title or sender_chat.username or str(sender_chat.id),
+            )
+            await storage.save()
 
             channel_name = html.escape(
                 sender_chat.title or sender_chat.username or str(sender_chat.id),
@@ -8073,6 +10441,13 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
                     break
 
         await bot.unban_chat_member(msg.chat.id, tid)
+        log_moderation(
+            msg.chat.id,
+            msg.from_user.id,
+            tid,
+            'unban',
+            str(ban_info.get('reason') or '') if ban_info else '',
+        )
 
         # Удаляем из банлиста
         if 'banned_users' in storage.data and chat_id_str in storage.data['banned_users']:
@@ -8081,7 +10456,7 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
                 if b.get('user_id') != tid
             ]
             storage.mark_dirty()
-            await storage.save()
+        await storage.save()
 
         reason_text = (
             f"\n📝 Причина бана: {html.escape(str(ban_info['reason']), quote=False)}"
@@ -8089,8 +10464,11 @@ async def cmd_unban(msg: Message, cmd_name: str = 'разбан'):
         )
 
         # Сообщение в чат
-        await msg.answer(f"✅ {mention(msg.chat.id, tid)} разбанен{reason_text}",
-                        disable_web_page_preview=True)
+        await send_moderation_notice(
+            msg,
+            f"✅ {mention(msg.chat.id, tid)} разбанен{reason_text}",
+            disable_web_page_preview=True,
+        )
 
         # Уведомление в личку
         try:
@@ -8123,6 +10501,13 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
     tid = None
     reason = 'Без причины'
     days = DEFAULT_WARN_DAYS
+    configured_templates = storage.get_chat_settings(msg.chat.id).get('reason_templates', [])
+    reason_templates = (
+        configured_templates
+        if isinstance(configured_templates, list)
+        and all(isinstance(item, str) for item in configured_templates)
+        else []
+    )
 
     target_arg = parts[1] if len(parts) > 1 else None
     target_mention = get_target_mention_span(msg, target_arg) if target_arg else None
@@ -8135,19 +10520,35 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
         else:
             trailing_args = parts[2:]
         if trailing_args:
-            try:
-                days = int(trailing_args[0])
-                reason = ' '.join(trailing_args[1:]) or 'Без причины'
-            except ValueError:
-                reason = ' '.join(trailing_args) or 'Без причины'
+            template_index = (
+                int(trailing_args[0])
+                if len(trailing_args) == 1 and trailing_args[0].isdigit() and len(trailing_args[0]) <= 2
+                else 0
+            )
+            if 1 <= template_index <= len(reason_templates):
+                reason = reason_templates[template_index - 1]
+            else:
+                try:
+                    days = int(trailing_args[0])
+                    reason = ' '.join(trailing_args[1:]) or 'Без причины'
+                except ValueError:
+                    reason = ' '.join(trailing_args) or 'Без причины'
     elif msg.reply_to_message and msg.reply_to_message.from_user:
         tid = msg.reply_to_message.from_user.id
         if len(parts) > 1:
-            try:
-                days = int(parts[1])
-                reason = ' '.join(parts[2:]) or 'Без причины'
-            except Exception:
-                reason = ' '.join(parts[1:]) or 'Без причины'
+            template_index = (
+                int(parts[1])
+                if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 2
+                else 0
+            )
+            if 1 <= template_index <= len(reason_templates):
+                reason = reason_templates[template_index - 1]
+            else:
+                try:
+                    days = int(parts[1])
+                    reason = ' '.join(parts[2:]) or 'Без причины'
+                except ValueError:
+                    reason = ' '.join(parts[1:]) or 'Без причины'
     else:
         return await msg.answer(
             ui_error(
@@ -8159,6 +10560,9 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
 
     if not tid:
         return await msg.answer("❌ Пользователь не найден")
+
+    if not await require_target_not_telegram_admin(msg, tid):
+        return
 
     if not check_anti_moderation(msg.from_user.id, tid, msg.chat.id):
         return await msg.answer("❌ Анти-модерация!")
@@ -8178,6 +10582,14 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
         u['warnings'] = []
     
     u['warnings'].append(new_warning)
+    log_moderation(
+        msg.chat.id,
+        msg.from_user.id,
+        tid,
+        'warn',
+        reason,
+        days * 86400 if days > 0 else None,
+    )
     
     # Получаем активные предупреждения
     active = [w for w in u['warnings'] if isinstance(w, dict) and warning_is_active(w)]
@@ -8206,62 +10618,145 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
             logger.warning("Некорректная длительность действия варнов в чате %s: %r", msg.chat.id, duration)
             action_notice = "⚠️ Автоматический мут не выдан: неверная длительность в настройках."
         else:
+            restrict_right = await bot_can(msg.chat.id, 'can_restrict_members')
+            if restrict_right is None:
+                action_notice = "⚠️ Не удалось проверить права бота для автоматического мута."
+            elif not restrict_right:
+                action_notice = "⚠️ Автоматический мут не выдан: у бота нет права ограничивать участников."
+            else:
+                try:
+                    until = datetime.now() + timedelta(minutes=duration)
+                    await bot.restrict_chat_member(
+                        msg.chat.id,
+                        tid,
+                        ChatPermissions(can_send_messages=False),
+                        until_date=int(until.timestamp()),
+                    )
+                    mutes = storage.get_chat(msg.chat.id, 'mutes')
+                    if not isinstance(mutes, list):
+                        mutes = []
+                        storage.data['mutes'][str(msg.chat.id)] = mutes
+                    else:
+                        mutes[:] = [mute for mute in mutes if mute.get('user_id') != tid]
+                    mutes.append({
+                        'user_id': tid,
+                        'expire_time': until.timestamp(),
+                        'permanent': False,
+                        'issued_at': time.time(),
+                        'duration_minutes': duration,
+                        'muted_by': 'auto',
+                        'auto_mute': True,
+                        'mute_source': 'warn_action',
+                        'reason': f'Автоматическое действие: {len(active)} предупреждения',
+                    })
+                    log_moderation(
+                        msg.chat.id,
+                        None,
+                        tid,
+                        'auto_mute',
+                        f'Автоматическое действие: {len(active)} предупреждения',
+                        duration * 60,
+                    )
+                    storage.mark_dirty()
+                    await storage.save()
+                    action_notice = f"🔇 Автоматически выдан мут на {format_mute_duration(duration)}."
+                except Exception:
+                    logger.exception("Не удалось применить автоматический мут по предупреждениям в чате %s", msg.chat.id)
+                    action_notice = "⚠️ Не удалось применить автоматический мут; подробности записаны в журнал."
+
+    if action_name == 'kick':
+        restrict_right = await bot_can(msg.chat.id, 'can_restrict_members')
+        if restrict_right is not True:
+            action_notice = (
+                "⚠️ Не удалось проверить права бота для автоматического кика."
+                if restrict_right is None
+                else "⚠️ Автокик не выполнен: у бота нет права блокировать участников."
+            )
+        else:
             try:
-                until = datetime.now() + timedelta(minutes=duration)
-                await bot.restrict_chat_member(
-                    msg.chat.id,
-                    tid,
-                    ChatPermissions(can_send_messages=False),
-                    until_date=int(until.timestamp()),
-                )
-                mutes = storage.get_chat(msg.chat.id, 'mutes')
-                if not isinstance(mutes, list):
-                    mutes = []
-                    storage.data['mutes'][str(msg.chat.id)] = mutes
+                await bot.ban_chat_member(msg.chat.id, tid, revoke_messages=False)
+                try:
+                    await bot.unban_chat_member(msg.chat.id, tid, only_if_banned=True)
+                except Exception as unban_exc:
+                    bans_by_chat = storage.data.setdefault('banned_users', {}).setdefault(str(msg.chat.id), [])
+                    bans_by_chat[:] = [
+                        ban for ban in bans_by_chat
+                        if not isinstance(ban, dict) or ban.get('user_id') != tid
+                    ]
+                    bans_by_chat.append({
+                        'user_id': tid,
+                        'banned_by': 'auto',
+                        'reason': f"Автокик по предупреждениям: {reason}",
+                        'date': time.time(),
+                        'permanent': True,
+                    })
+                    log_moderation(
+                        msg.chat.id, None, tid, 'auto_kick_failed',
+                        f"{reason}; не удалось завершить снятием бана",
+                    )
+                    storage.mark_dirty()
+                    await storage.save()
+                    action_notice = (
+                        "⚠️ Автокик не завершён: участник остался заблокирован. "
+                        f"Снимите бан вручную ({html.escape(str(unban_exc)[:120], quote=False)})."
+                    )
                 else:
-                    mutes[:] = [mute for mute in mutes if mute.get('user_id') != tid]
-                mutes.append({
-                    'user_id': tid,
-                    'expire_time': until.timestamp(),
-                    'permanent': False,
-                    'issued_at': time.time(),
-                    'duration_minutes': duration,
-                    'muted_by': 'auto',
-                    'auto_mute': True,
-                    'mute_source': 'warn_action',
-                    'reason': f'Автоматическое действие: {len(active)} предупреждения',
-                })
+                    log_moderation(
+                        msg.chat.id, None, tid, 'auto_kick',
+                        f"Автоматическое действие: {len(active)} предупреждения; {reason}",
+                    )
+                    action_notice = "👢 Пользователь автоматически кикнут по действиям за предупреждения."
                 storage.mark_dirty()
                 await storage.save()
-                action_notice = f"🔇 Автоматически выдан мут на {format_mute_duration(duration)}."
             except Exception:
-                logger.exception("Не удалось применить автоматический мут по предупреждениям в чате %s", msg.chat.id)
-                action_notice = "⚠️ Не удалось применить автоматический мут; подробности записаны в журнал."
+                logger.exception("Не удалось применить автоматический кик по предупреждениям в чате %s", msg.chat.id)
+                action_notice = "⚠️ Не удалось выполнить автоматический кик; подробности записаны в журнал."
 
     should_ban = action_name == 'ban' or (
         action_rule is None and len(active) >= MAX_WARNINGS
     )
     if should_ban:
+        restrict_right = await bot_can(msg.chat.id, 'can_restrict_members')
+        if restrict_right is None:
+            action_notice = "⚠️ Не удалось проверить права бота для автобана."
+            should_ban = False
+        elif not restrict_right:
+            action_notice = "⚠️ Автобан не выполнен: у бота нет права блокировать участников."
+            should_ban = False
+    if should_ban:
         try:
-            await bot.ban_chat_member(msg.chat.id, tid)
+            await bot.ban_chat_member(msg.chat.id, tid, revoke_messages=True)
 
             chat_id_str = str(msg.chat.id)
             if 'banned_users' not in storage.data:
                 storage.data['banned_users'] = {}
             if chat_id_str not in storage.data['banned_users']:
                 storage.data['banned_users'][chat_id_str] = []
-
-            storage.data['banned_users'][chat_id_str].append({
+            banned_users = storage.data['banned_users'][chat_id_str]
+            banned_users[:] = [
+                ban for ban in banned_users
+                if not isinstance(ban, dict) or ban.get('user_id') != tid
+            ]
+            banned_users.append({
                 'user_id': tid,
                 'banned_by': msg.from_user.id,
                 'reason': f"Достигнут лимит предупреждений ({MAX_WARNINGS})",
-                'date': time.time()
+                'date': time.time(),
+                'permanent': True,
             })
 
+            log_moderation(
+                msg.chat.id,
+                None,
+                tid,
+                'auto_ban',
+                f"Достигнут лимит предупреждений ({MAX_WARNINGS})",
+            )
             storage.mark_dirty()
             await storage.save()
 
-            await msg.answer(
+            await send_moderation_notice(
+                msg,
                 f"🚫 {mention(msg.chat.id, tid)} забанен по действию за предупреждения\n"
                 f"📊 {len(active)}/{MAX_WARNINGS}\n"
                 f"📝 Причина: {html.escape(str(reason), quote=False)}",
@@ -8284,7 +10779,8 @@ async def cmd_warn(msg: Message, cmd_name: str = 'пред'):
             logger.warning(f"Не удалось забанить пользователя {tid} после предупреждений: {e}")
 
     # Уведомление в чат
-    await msg.answer(
+    await send_moderation_notice(
+        msg,
         "⚠️ <b>Предупреждение выдано</b>\n"
         f"{UI_LINE}\n"
         f"👤 Пользователь: {mention(msg.chat.id, tid)}\n"
@@ -8344,7 +10840,7 @@ async def cmd_warn_actions(msg: Message, cmd_name: str = 'варннастрой
         ):
             count = rule.get('count')
             action = rule.get('action')
-            if not isinstance(count, int) or action not in {'mute', 'ban', 'none'}:
+            if not isinstance(count, int) or action not in {'mute', 'ban', 'kick', 'none'}:
                 continue
             if action == 'mute':
                 duration = rule.get('duration')
@@ -8353,7 +10849,11 @@ async def cmd_warn_actions(msg: Message, cmd_name: str = 'варннастрой
                     if isinstance(duration, int) and duration > 0 else 'мут (неверный срок)'
                 )
             else:
-                action_text = 'бан' if action == 'ban' else 'без автоматического действия'
+                action_text = (
+                    'бан' if action == 'ban'
+                    else 'кик' if action == 'kick'
+                    else 'без автоматического действия'
+                )
             formatted_rules.append(f"• {count} предупреждений — {action_text}")
         rules_text = '\n'.join(formatted_rules) or '• Действия не настроены'
         return await msg.answer(
@@ -8363,6 +10863,7 @@ async def cmd_warn_actions(msg: Message, cmd_name: str = 'варннастрой
             "Настройка (ранг 2+):\n"
             "<code>!варннастройка ЧИСЛО мут МИНУТЫ</code>\n"
             "<code>!варннастройка ЧИСЛО бан</code>\n"
+            "<code>!варннастройка ЧИСЛО кик</code>\n"
             "<code>!варннастройка ЧИСЛО выкл</code>\n"
             "<code>!варннастройка сбросить</code> — вернуть значения по умолчанию"
         )
@@ -8394,7 +10895,7 @@ async def cmd_warn_actions(msg: Message, cmd_name: str = 'варннастрой
             if (
                 isinstance(rule, dict)
                 and isinstance(rule.get('count'), int)
-                and rule.get('action') in {'mute', 'ban', 'none'}
+                and rule.get('action') in {'mute', 'ban', 'kick', 'none'}
                 and rule['count'] != count
             )
         ]
@@ -8407,6 +10908,11 @@ async def cmd_warn_actions(msg: Message, cmd_name: str = 'варннастрой
             if len(parts) != 2:
                 return await msg.answer("❌ Для действия «бан» не указывайте длительность.")
             updated_rules.append({'count': count, 'action': 'ban', 'duration': 0})
+            settings['warn_actions'] = sorted(updated_rules, key=lambda item: item['count'])
+        elif action == 'кик':
+            if len(parts) != 2:
+                return await msg.answer("❌ Для действия «кик» не указывайте длительность.")
+            updated_rules.append({'count': count, 'action': 'kick', 'duration': 0})
             settings['warn_actions'] = sorted(updated_rules, key=lambda item: item['count'])
         elif action == 'мут':
             if len(parts) != 3:
@@ -8421,7 +10927,7 @@ async def cmd_warn_actions(msg: Message, cmd_name: str = 'варннастрой
             settings['warn_actions'] = sorted(updated_rules, key=lambda item: item['count'])
         else:
             return await msg.answer(
-                "❌ Действие должно быть «мут», «бан» или «выкл»."
+                "❌ Действие должно быть «мут», «кик», «бан» или «выкл»."
             )
 
     storage.invalidate_chat_settings_cache(msg.chat.id)
@@ -8747,8 +11253,14 @@ async def cmd_ban_list(msg: Message, cmd_name: str = 'банлист'):
         )
         reason = html.escape(str(ban.get('reason') or 'Без причины')[:120], quote=False)
         if isinstance(ban.get('user_id'), int):
+            expire_time = ban.get('expire_time')
+            expiration_text = (
+                f"; до {datetime.fromtimestamp(expire_time).strftime('%d.%m.%Y %H:%M')}"
+                if isinstance(expire_time, (int, float))
+                else "; бессрочно"
+            )
             entries.append(
-                f"• {mention(msg.chat.id, ban['user_id'])} — с {date_text}; {reason}; "
+                f"• {mention(msg.chat.id, ban['user_id'])} — с {date_text}{expiration_text}; {reason}; "
                 f"выдал: {mention(msg.chat.id, ban.get('banned_by', 'неизвестно'))}"
             )
         elif isinstance(ban.get('sender_chat_id'), int):
@@ -8889,35 +11401,50 @@ async def cmd_unwarn(msg: Message, cmd_name: str = 'снятьпред'):
             removed_warning = u['warnings'][active[idx][0]]
             del u['warnings'][active[idx][0]]
 
+            log_moderation(
+                msg.chat.id,
+                msg.from_user.id,
+                tid,
+                'unwarn',
+                str(removed_warning.get('reason') or ''),
+            )
             storage.mark_dirty()
             await storage.save()
 
             logger.info(f"Снято предупреждение #{idx + 1} у {tid}")
 
-            chat_msg = await msg.answer(
+            await send_moderation_notice(
+                msg,
                 f"✅ Снято предупреждение #{idx + 1} у {mention(msg.chat.id, tid)}\n"
                 f"📝 Причина была: {html.escape(str(removed_warning.get('reason') or 'Без причины'), quote=False)}",
                 disable_web_page_preview=True,
             )
-            await asyncio.sleep(3)
-            try:
-                await chat_msg.delete()
-            except Exception:
-                pass
             return
         else:
             return await msg.answer(ui_error("Предупреждение не найдено", f"У пользователя {mention(msg.chat.id, tid)} нет предупреждения под номером {idx + 1}.", "!снятьпред @user 1"), disable_web_page_preview=True)
 
     before_count = len(active)
+    removed_reasons = [
+        str(warning.get('reason') or '')
+        for _, warning in active
+    ]
     for idx, _ in sorted(active, key=lambda x: x[0], reverse=True):
         del u['warnings'][idx]
 
+    log_moderation(
+        msg.chat.id,
+        msg.from_user.id,
+        tid,
+        'unwarn',
+        '; '.join(reason for reason in removed_reasons if reason)[:500],
+    )
     storage.mark_dirty()
     await storage.save()
 
     logger.info(f"Снято {before_count} предупреждений у {tid}")
 
-    await msg.answer(
+    await send_moderation_notice(
+        msg,
         f"✅ Снято <b>{before_count}</b> предупреждений у {mention(msg.chat.id, tid)}",
         disable_web_page_preview=True,
     )
@@ -8927,6 +11454,8 @@ async def cmd_del(msg: Message, cmd_name: str = '-смс'):
     if not await require_telegram_admin(msg):
         return
     if not await require_access(msg, cmd_name, 1, title='Недостаточно прав', message='Эта команда доступна только модераторам и выше.', example='! -смс'):
+        return
+    if not await require_bot_right(msg, 'can_delete_messages', 'удаления сообщений'):
         return
     if msg.reply_to_message:
         try:
@@ -8943,6 +11472,8 @@ async def cmd_pin(msg: Message, cmd_name: str = 'пин'):
         return
     if not await require_access(msg, cmd_name, 2, title='Недостаточно прав', message='Эта команда доступна только модераторам 2+ и выше.', example='!пин'):
         return
+    if not await require_bot_right(msg, 'can_pin_messages', 'закрепления сообщений'):
+        return
     if msg.reply_to_message:
         try:
             await msg.reply_to_message.pin()
@@ -8956,6 +11487,8 @@ async def cmd_purge(msg: Message, cmd_name: str = 'очистить'):
     if not await require_telegram_admin(msg):
         return
     if not await require_access(msg, cmd_name, 2, title='Недостаточно прав', message='Эта команда доступна только модераторам 2+ и выше.', example='!очистить'):
+        return
+    if not await require_bot_right(msg, 'can_delete_messages', 'удаления сообщений'):
         return
 
     if not msg.reply_to_message:
@@ -10036,9 +12569,9 @@ def get_games_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 MINESWEEPER_DIFFICULTIES = {
-    'easy': ('Лёгкая', 5, 5),
-    'medium': ('Средняя', 9, 15),
-    'hard': ('Тяжёлая', 12, 30),
+    'easy': ('Лёгкая', 5, 5, 5),
+    'medium': ('Средняя', 7, 7, 15),
+    'hard': ('Тяжёлая', 8, 9, 30),
 }
 minesweeper_games = {}
 
@@ -10047,9 +12580,9 @@ def get_minesweeper_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🟢 Лёгкая · 5×5", callback_data="mines_difficulty_easy"),
-            InlineKeyboardButton(text="🟡 Средняя · 9×9", callback_data="mines_difficulty_medium"),
+            InlineKeyboardButton(text="🟡 Средняя · 7×7", callback_data="mines_difficulty_medium"),
         ],
-        [InlineKeyboardButton(text="🔴 Тяжёлая · 12×12", callback_data="mines_difficulty_hard")],
+        [InlineKeyboardButton(text="🔴 Тяжёлая · 8×9", callback_data="mines_difficulty_hard")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="game_back_to_menu")],
     ])
 
@@ -10059,8 +12592,8 @@ def get_minesweeper_menu_text() -> str:
         "💣 <b>САПЁР</b>\n"
         "Выберите сложность:\n\n"
         "🟢 Лёгкая — поле 5×5, 5 мин\n"
-        "🟡 Средняя — поле 9×9, 15 мин\n"
-        "🔴 Тяжёлая — поле 12×12, 30 мин\n\n"
+        "🟡 Средняя — поле 7×7, 15 мин\n"
+        "🔴 Тяжёлая — поле 8 столбцов × 9 строк, 30 мин\n\n"
         "Сначала выберите режим внизу поля, затем нажимайте клетки."
     )
 
@@ -10303,7 +12836,7 @@ async def minesweeper_difficulty_handler(call: CallbackQuery):
         await call.answer("❌ Неизвестная сложность", show_alert=True)
         return
 
-    name, size, mine_count = settings
+    name, width, height, mine_count = settings
     game_id = f"{random.getrandbits(32):08x}"
     while game_id in minesweeper_games:
         game_id = f"{random.getrandbits(32):08x}"
@@ -10311,13 +12844,15 @@ async def minesweeper_difficulty_handler(call: CallbackQuery):
         'chat_id': call.message.chat.id,
         'player_id': call.from_user.id,
         'difficulty': name,
-        'size': size,
+        'width': width,
+        'height': height,
         'mine_count': mine_count,
-        'mines': set(random.sample(range(size * size), mine_count)),
+        'mines': set(random.sample(range(width * height), mine_count)),
         'revealed': set(),
         'flags': set(),
         'mode': 'open',
         'status': 'active',
+        'first_open': True,
         'started_at': time.time(),
     }
     save_activity(call.message.chat.id, call.from_user.id, 'games')
@@ -10325,11 +12860,11 @@ async def minesweeper_difficulty_handler(call: CallbackQuery):
     await call.answer()
 
 
-def minesweeper_adjacent_cells(index: int, size: int):
-    row, col = divmod(index, size)
-    for next_row in range(max(0, row - 1), min(size, row + 2)):
-        for next_col in range(max(0, col - 1), min(size, col + 2)):
-            neighbor = next_row * size + next_col
+def minesweeper_adjacent_cells(index: int, width: int, height: int):
+    row, col = divmod(index, width)
+    for next_row in range(max(0, row - 1), min(height, row + 2)):
+        for next_col in range(max(0, col - 1), min(width, col + 2)):
+            neighbor = next_row * width + next_col
             if neighbor != index:
                 yield neighbor
 
@@ -10337,7 +12872,7 @@ def minesweeper_adjacent_cells(index: int, size: int):
 def minesweeper_neighbor_count(game: dict, index: int) -> int:
     return sum(
         neighbor in game['mines']
-        for neighbor in minesweeper_adjacent_cells(index, game['size'])
+        for neighbor in minesweeper_adjacent_cells(index, game['width'], game['height'])
     )
 
 
@@ -10346,20 +12881,21 @@ async def draw_minesweeper_board(message: Message, game_id: str):
     if not game:
         return
 
-    size = game['size']
+    width = game['width']
+    height = game['height']
     game_over = game['status'] != 'active'
     keyboard = []
     number_labels = ('▫️', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣')
-    page_rows = 6 if size > 9 else size
-    page_count = (size + page_rows - 1) // page_rows
+    page_rows = 6 if height > 9 else height
+    page_count = (height + page_rows - 1) // page_rows
     page = min(game.get('page', 0), page_count - 1)
     game['page'] = page
     first_row = page * page_rows
-    last_row = min(first_row + page_rows, size)
+    last_row = min(first_row + page_rows, height)
     for row_index in range(first_row, last_row):
         row = []
-        for col_index in range(size):
-            index = row_index * size + col_index
+        for col_index in range(width):
+            index = row_index * width + col_index
             if index in game['flags']:
                 label = '🚩'
             elif index in game['revealed']:
@@ -10411,7 +12947,7 @@ async def draw_minesweeper_board(message: Message, game_id: str):
         ])
         flags_text = f"Флажки: {len(game['flags'])}/{game['mine_count']}\n"
         title = (
-            f"💣 <b>Сапёр · {game['difficulty']} ({size}×{size})</b>\n"
+            f"💣 <b>Сапёр · {game['difficulty']} ({width}×{height})</b>\n"
             f"{flags_text}Режим: {mode_text}"
             + (f" · Страница {page + 1}/{page_count}" if page_count > 1 else "")
         )
@@ -10438,8 +12974,8 @@ async def minesweeper_action_handler(call: CallbackQuery):
             await call.answer("❌ Это игра другого игрока.", show_alert=True)
             return
         page = int(page_text)
-        page_rows = 6 if game['size'] > 9 else game['size']
-        page_count = (game['size'] + page_rows - 1) // page_rows
+        page_rows = 6 if game['height'] > 9 else game['height']
+        page_count = (game['height'] + page_rows - 1) // page_rows
         if page < 0 or page >= page_count:
             await call.answer("❌ Такой страницы нет.", show_alert=True)
             return
@@ -10479,7 +13015,7 @@ async def minesweeper_action_handler(call: CallbackQuery):
         return
 
     index = int(index_text)
-    if index < 0 or index >= game['size'] * game['size']:
+    if index < 0 or index >= game['width'] * game['height']:
         await call.answer("❌ Некорректная клетка.", show_alert=True)
         return
 
@@ -10495,17 +13031,17 @@ async def minesweeper_action_handler(call: CallbackQuery):
         if index in game['flags']:
             await call.answer("Сначала снимите флажок с клетки.")
             return
-        if index in game['mines'] and not game['revealed']:
-            game['mines'].remove(index)
-            safe_cells = (
-                set(range(game['size'] * game['size']))
-                - game['mines']
-                - {index}
-            )
-            if safe_cells:
-                replacement = random.choice(tuple(safe_cells))
-                game['mines'].add(replacement)
-                game['flags'].discard(replacement)
+        if game['first_open']:
+            safe_start = set(minesweeper_adjacent_cells(index, game['width'], game['height']))
+            safe_start.add(index)
+            available_cells = [
+                cell
+                for cell in range(game['width'] * game['height'])
+                if cell not in safe_start
+            ]
+            game['mines'] = set(random.sample(available_cells, game['mine_count']))
+            game['flags'] = game['flags'] & set(available_cells)
+            game['first_open'] = False
 
         if index in game['mines']:
             game['status'] = 'lost'
@@ -10518,8 +13054,8 @@ async def minesweeper_action_handler(call: CallbackQuery):
                     continue
                 game['revealed'].add(cell)
                 if minesweeper_neighbor_count(game, cell) == 0:
-                    pending.extend(minesweeper_adjacent_cells(cell, game['size']))
-            if len(game['revealed']) == game['size'] * game['size'] - game['mine_count']:
+                    pending.extend(minesweeper_adjacent_cells(cell, game['width'], game['height']))
+            if len(game['revealed']) == game['width'] * game['height'] - game['mine_count']:
                 game['status'] = 'won'
 
     await draw_minesweeper_board(call.message, game_id)
@@ -11453,8 +13989,25 @@ def ttt_winning_line(board: list) -> list:
 async def cleanup_games():
     """Очистка старых игр"""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(120)
         now = time.time()
+        storage._cleanup_old_games()
+        _prune_chat_default_permissions_cache(time.monotonic())
+
+        for store, ttl in (
+            (birthday_wizards, BDAY_WIZARD_TTL),
+            (meme_sessions, MEME_SESSION_TTL),
+            (activity_graph_wizards, ACTIVITY_GRAPH_WIZARD_TTL),
+        ):
+            expired = [
+                key
+                for key, value in store.items()
+                if not isinstance(value, dict)
+                or not isinstance(value.get('created_at'), (int, float))
+                or now - value['created_at'] > ttl
+            ]
+            for key in expired:
+                store.pop(key, None)
 
         expired = [gid for gid, game in active_games.items()
                    if now - game.get('started_at', now) > 3600]
@@ -11546,11 +14099,109 @@ async def cmd_rps(msg: Message, cmd_name: str = 'кнб'):
 
 # ==================== Опросы ====================
 
+POLL_DRAFTS: Dict[str, Dict[str, Any]] = {}
+POLL_DRAFT_TTL = 60 * 60
+POLL_DEADLINE_OPTIONS = (
+    (300, '5 мин.'),
+    (600, '10 мин.'),
+    (3600, '1 час'),
+    (86400, '1 день'),
+)
+POLL_SETTING_LABELS = (
+    ('names', 'Имена участников'),
+    ('multiple', 'Несколько ответов'),
+    ('adding', 'Добавление вариантов'),
+    ('revoting', 'Изменение ответа'),
+    ('shuffle', 'Случайный порядок'),
+)
+
+
+def _cleanup_poll_drafts():
+    now = time.time()
+    expired = [
+        draft_id for draft_id, draft in POLL_DRAFTS.items()
+        if now - draft['created_at'] > POLL_DRAFT_TTL
+    ]
+    for draft_id in expired:
+        POLL_DRAFTS.pop(draft_id, None)
+
+
+def _poll_settings_keyboard(draft_id: str, draft: Dict[str, Any]) -> InlineKeyboardMarkup:
+    settings = draft['settings']
+    rows = []
+    callback_prefix = f'pollcfg:{draft_id}:'
+
+    for setting, label in POLL_SETTING_LABELS:
+        enabled = settings[setting]
+        rows.append([
+            InlineKeyboardButton(
+                text=f'{"✅" if enabled else "▫️"} {label}',
+                callback_data=f'{callback_prefix}{setting}',
+            )
+        ])
+
+    correct_enabled = settings['correct']
+    rows.append([
+        InlineKeyboardButton(
+            text=f'{"✅" if correct_enabled else "▫️"} Правильный ответ',
+            callback_data=f'{callback_prefix}correct',
+        )
+    ])
+    if correct_enabled:
+        correct_options = set(settings['correct_options'])
+        for start in range(0, len(draft['options']), 2):
+            option_buttons = []
+            for index in range(start, min(start + 2, len(draft['options']))):
+                marker = '✅' if index in correct_options else '▫️'
+                label = draft['options'][index][:30]
+                option_buttons.append(InlineKeyboardButton(
+                    text=f'{marker} {index + 1}. {label}',
+                    callback_data=f'{callback_prefix}answer{index}',
+                ))
+            rows.append(option_buttons)
+
+    deadline = settings['deadline']
+    rows.append([
+        InlineKeyboardButton(
+            text=f'{"✅" if deadline else "▫️"} Ограничение срока',
+            callback_data=f'{callback_prefix}deadline',
+        )
+    ])
+    if deadline:
+        rows.append([
+            InlineKeyboardButton(
+                text=f'{"🔘" if deadline == seconds else "▫️"} {label}',
+                callback_data=f'{callback_prefix}time{seconds}',
+            )
+            for seconds, label in POLL_DEADLINE_OPTIONS
+        ])
+
+    rows.extend([
+        [InlineKeyboardButton(text='Подтвердить', callback_data=f'{callback_prefix}confirm')],
+        [InlineKeyboardButton(text='Отмена', callback_data=f'{callback_prefix}cancel')],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _poll_settings_text(draft: Dict[str, Any]) -> str:
+    question = html.escape(draft['question'])
+    options = '\n'.join(
+        f'{index}. {html.escape(option)}'
+        for index, option in enumerate(draft['options'], start=1)
+    )
+    return (
+        f'⚙️ <b>Настройки опроса</b>\n\n'
+        f'<b>Вопрос:</b> {question}\n'
+        f'<b>Варианты:</b>\n{options}\n\n'
+        f'Выберите настройки кнопками и нажмите «Подтвердить».'
+    )
+
+
 async def cmd_poll(msg: Message, cmd_name: str = 'опрос'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
         return
     save_activity(msg.chat.id, msg.from_user.id, 'commands')
-    
+
     command_text = strip_command_prefix(msg.text, msg.chat.id)
     _, separator, text = command_text.partition(' ')
     if not separator and command_text.casefold() in {'опрос', 'poll'}:
@@ -11558,40 +14209,176 @@ async def cmd_poll(msg: Message, cmd_name: str = 'опрос'):
     elif not separator:
         text = command_text
     text = text.strip()
-    
+
     if not text:
-        return await msg.answer("❌ <code>!опрос Вопрос? | Да | Нет</code>")
-    
-    # Парсим по разделителю |
-    parts = [p.strip() for p in text.split('|') if p.strip()]
-    if len(parts) < 3:
-        return await msg.answer("❌ Нужен вопрос и минимум 2 варианта ответа. Пример: <code>!опрос Это опрос? | Да | Нет</code>")
-    
-    question, options = parts[0], parts[1:11]
-    if len(options) < 2:
-        return await msg.answer("❌ Минимум 2 варианта ответа")
-    
-    # Проверяем что вопрос не пустой
-    if not question or question == text:
-        return await msg.answer("❌ Введите вопрос перед первым |")
-
-    try:
-        poll_msg = await msg.answer_poll(
-            question=question,
-            options=options,
-            is_anonymous=False,
-            type='regular',
-            allows_multiple_answers=False,
+        return await msg.answer(
+            "❌ <code>!опрос Вопрос?</code> или "
+            "<code>!опрос Вопрос? / Вариант 1 / Вариант 2</code>"
         )
-    except Exception as e:
-        logger.exception("Ошибка создания реального опроса")
-        return await msg.answer(f"❌ Не удалось создать опрос: {e}")
 
-    # Удаляем исходное сообщение с командой
+    parts = [part.strip() for part in re.split(r'[/\\]', text)]
+    question = parts[0]
+    if not question:
+        return await msg.answer("❌ Укажите вопрос. Например: <code>!опрос Пойдём гулять?</code>")
+
+    if len(parts) == 1:
+        options = ['Да', 'Нет']
+    else:
+        options = [option for option in parts[1:] if option][:10]
+        if len(options) < 2:
+            return await msg.answer(
+                "❌ Добавьте минимум 2 варианта, разделяя их символом <code>/</code> или <code>\\</code>."
+            )
+
+    _cleanup_poll_drafts()
+    draft_id = uuid.uuid4().hex[:10]
+    draft = {
+        'owner_id': msg.from_user.id,
+        'chat_id': msg.chat.id,
+        'source_message_id': msg.message_id,
+        'created_at': time.time(),
+        'question': question,
+        'options': options,
+        'settings': {
+            'names': True,
+            'multiple': True,
+            'adding': True,
+            'revoting': True,
+            'shuffle': True,
+            'correct': False,
+            'correct_options': [],
+            'deadline': None,
+        },
+    }
+
     try:
-        await msg.delete()
-    except Exception as e:
-        logger.debug(f"Не удалось удалить сообщение с опросом: {e}")
+        menu_message = await msg.answer(
+            _poll_settings_text(draft),
+            reply_markup=_poll_settings_keyboard(draft_id, draft),
+        )
+    except TelegramAPIError:
+        logger.exception("Не удалось открыть настройки опроса")
+        raise
+
+    draft['menu_message_id'] = menu_message.message_id
+    POLL_DRAFTS[draft_id] = draft
+
+
+@router.callback_query(F.data.startswith('pollcfg:'))
+async def poll_settings_callback(call: CallbackQuery):
+    if not call.message or not call.from_user:
+        return await call.answer()
+
+    _cleanup_poll_drafts()
+    try:
+        _, draft_id, action = call.data.split(':', 2)
+    except (AttributeError, ValueError):
+        return await call.answer("Настройки опроса недоступны.", show_alert=True)
+
+    draft = POLL_DRAFTS.get(draft_id)
+    if not draft:
+        return await call.answer("Срок настройки истёк. Создайте опрос заново.", show_alert=True)
+    if (
+        call.from_user.id != draft['owner_id']
+        or call.message.chat.id != draft['chat_id']
+        or call.message.message_id != draft['menu_message_id']
+    ):
+        return await call.answer("Эти настройки создал другой пользователь.", show_alert=True)
+
+    settings = draft['settings']
+    if action == 'cancel':
+        POLL_DRAFTS.pop(draft_id, None)
+        await call.message.edit_text("Создание опроса отменено.", reply_markup=None)
+        return await call.answer()
+
+    if action == 'confirm':
+        if settings['correct'] and not settings['correct_options']:
+            return await call.answer(
+                "Выберите хотя бы один правильный вариант.",
+                show_alert=True,
+            )
+
+        poll_kwargs = {
+            'question': draft['question'],
+            'options': draft['options'],
+            'is_anonymous': not settings['names'],
+            'type': 'quiz' if settings['correct'] else 'regular',
+            'allows_multiple_answers': settings['multiple'],
+            'allow_adding_options': settings['adding'],
+            'allows_revoting': settings['revoting'],
+            'shuffle_options': settings['shuffle'],
+        }
+        if settings['correct']:
+            poll_kwargs['correct_option_ids'] = settings['correct_options']
+        if settings['deadline']:
+            poll_kwargs['close_date'] = datetime.now(timezone.utc) + timedelta(
+                seconds=settings['deadline']
+            )
+
+        try:
+            await call.message.answer_poll(**poll_kwargs)
+        except TelegramAPIError as exc:
+            logger.exception("Ошибка создания реального опроса")
+            return await call.answer(
+                f"Не удалось создать опрос: {str(exc)[:150]}",
+                show_alert=True,
+            )
+
+        POLL_DRAFTS.pop(draft_id, None)
+        try:
+            await call.message.edit_text("✅ Опрос создан.", reply_markup=None)
+        except TelegramAPIError:
+            logger.exception("Не удалось обновить меню после создания опроса")
+        try:
+            await call.bot.delete_message(
+                chat_id=draft['chat_id'],
+                message_id=draft['source_message_id'],
+            )
+        except TelegramAPIError as exc:
+            logger.debug("Не удалось удалить сообщение с командой опроса: %s", exc)
+        return await call.answer()
+
+    if action in dict(POLL_SETTING_LABELS):
+        settings[action] = not settings[action]
+    elif action == 'correct':
+        settings['correct'] = not settings['correct']
+        settings['correct_options'] = []
+    elif action.startswith('answer'):
+        try:
+            option_index = int(action[6:])
+        except ValueError:
+            return await call.answer("Неизвестный вариант ответа.", show_alert=True)
+        if not 0 <= option_index < len(draft['options']):
+            return await call.answer("Такого варианта ответа нет.", show_alert=True)
+        selected = set(settings['correct_options'])
+        if option_index in selected:
+            selected.remove(option_index)
+        else:
+            selected.add(option_index)
+        settings['correct_options'] = sorted(selected)
+    elif action == 'deadline':
+        settings['deadline'] = None if settings['deadline'] else POLL_DEADLINE_OPTIONS[0][0]
+    elif action.startswith('time'):
+        try:
+            seconds = int(action[4:])
+        except ValueError:
+            return await call.answer("Неизвестный срок опроса.", show_alert=True)
+        if seconds not in {value for value, _ in POLL_DEADLINE_OPTIONS}:
+            return await call.answer("Неизвестный срок опроса.", show_alert=True)
+        settings['deadline'] = seconds
+    else:
+        return await call.answer("Неизвестная настройка.", show_alert=True)
+
+    try:
+        await call.message.edit_text(
+            _poll_settings_text(draft),
+            reply_markup=_poll_settings_keyboard(draft_id, draft),
+        )
+    except TelegramBadRequest as exc:
+        if 'message is not modified' not in str(exc).casefold():
+            logger.exception("Не удалось обновить настройки опроса")
+            return await call.answer("Не удалось обновить настройки.", show_alert=True)
+    return await call.answer()
 
 
 # ==================== Интеграции ====================
@@ -11810,6 +14597,208 @@ async def cmd_weather(msg: Message, cmd_name: str = 'погода'):
     except Exception as e:
         logger.error(f"Ошибка погоды: {e}")
         await status_msg.edit_text(f"❌ Не удалось получить погоду для '{safe_city}'")
+
+
+CANDY_STEAL_SUCCESS_TEXTS = (
+    "🐻 Валера дождался, пока Паша отвлёкся, и стащил {candy_amount}.",
+    "🍬 Валера устроил набег на сладости и принёс {candy_amount}.",
+    "🧊 Пока Паша заглядывал в холодильник, Валера прихватил {candy_amount}.",
+    "🤫 Валера прошмыгнул мимо Паши и спрятал {candy_amount}.",
+    "🎉 Валера так ловко отвлёк Пашу, что утащил {candy_amount}.",
+    "🍭 Паша отвернулся всего на секунду — Валера уже унёс {candy_amount}.",
+    "🥷 Валера включил режим ниндзя и вынес {candy_amount}.",
+    "📦 Валера обнаружил сладкий тайник Паши и забрал оттуда {candy_amount}.",
+    "😋 Валера уверяет, что конфеты сами прыгнули к нему. Он прихватил {candy_amount}.",
+    "🚙 Валера подъехал на воображаемом джипе и увёз {candy_amount}.",
+    "🔍 Пока Паша искал пропажу, Валера уже унёс {candy_amount}.",
+    "✨ Валера провёл блестящую операцию и прихватил {candy_amount}.",
+    "🧸 Валера спрятался за игрушками и незаметно забрал {candy_amount}.",
+    "🎬 В новой серии «Познавателя» Валера успешно добыл {candy_amount}.",
+    "🧁 Валера отвлёк Пашу разговором о сладостях и прихватил {candy_amount}.",
+    "👀 Паша моргнул — и Валера уже уносит {candy_amount}.",
+    "🗝️ Валера подобрал ключ к сладкому шкафчику и достал {candy_amount}.",
+    "🎒 Валера вернулся из вылазки и принёс {candy_amount}.",
+    "🌟 Валера сегодня особенно ловкий: он утащил {candy_amount}, а Паша заметил пропажу.",
+    "🏃 Валера быстро смылся и унёс {candy_amount}.",
+)
+
+CANDY_STEAL_FAILURE_TEXTS = (
+    "🚨 Паша услышал шуршание обёртки и поймал Валеру на месте.",
+    "👀 Паша заметил, как Валера потянулся к конфетам, — операция сорвалась.",
+    "🧊 Валера открыл холодильник, но Паша уже ждал его у дверцы.",
+    "🤫 Валера старался красться тихо, но фантик выдал его с головой.",
+    "🐻 Валера почти добрался до сладостей, однако Паша вовремя обернулся.",
+    "📦 Валера нашёл тайник, но Паша успел закрыть его раньше.",
+    "🎬 Неудачный дубль: Паша поймал Валеру до того, как тот добрался до конфет.",
+    "🕵️ Паша раскрыл сладкий заговор Валеры. Добычи сегодня не будет.",
+    "😅 Валера споткнулся о собственную хитрость — Паша всё заметил.",
+    "🔔 Дверца холодильника тихонько звякнула, и Паша тут же поймал Валеру.",
+    "🏃 Валера попытался скрыться, но Паша оказался быстрее.",
+    "🧸 Игрушки не помогли Валере спрятаться: Паша его обнаружил.",
+    "🍬 Паша пересчитал запасы прямо перед вылазкой. Валера остался ни с чем.",
+    "🚫 Паша сказал «не сегодня» и убрал конфеты подальше от Валеры.",
+    "🫣 Валера слишком увлёкся выбором конфет и не заметил вернувшегося Пашу.",
+    "🔦 Паша включил свет в самый неподходящий момент — Валера попался.",
+    "🛑 Сладкая операция отменена: Паша заметил подозрительное движение.",
+    "😮 Валера потянулся за конфетой, а Паша уже стоял за спиной.",
+    "🧤 Перчатки не спасли: Паша узнал Валеру по характерному шороху фантика.",
+    "📹 Камера в комнате всё записала — Паша успел остановить Валеру.",
+)
+
+CANDY_STEAL_COOLDOWN_TEXTS = (
+    "🐻 Валера затаился после вылазки. Новая попытка через {wait}.",
+    "🤫 Паша пока начеку — Валере стоит выждать {wait}.",
+    "🍬 Валера устроил перекус и восстановит силы через {wait}.",
+    "🧊 Холодильник под наблюдением. Возвращайся через {wait}.",
+    "🥷 Валера залёг на дно. До следующей вылазки {wait}.",
+    "🔍 Паша пересчитывает сладости — подожди {wait}.",
+    "😇 Валера делает вид, что ни при чём. Попробуй снова через {wait}.",
+    "📋 Сладкая операция ещё не готова к повтору. Осталось {wait}.",
+    "🗺️ Валера прокладывает новый маршрут. Запасись терпением на {wait}.",
+    "🍬 Фантики ещё шуршат — пора подождать {wait}.",
+    "👀 Паша пока не отвлекается. Новая попытка через {wait}.",
+    "🤐 Валера ждёт, когда в комнате станет потише. Осталось {wait}.",
+    "🔐 Конфетный тайник пока под присмотром. Возвращайся через {wait}.",
+    "🎭 Валера отвлекает Пашу разговором, но повторить вылазку сможет через {wait}.",
+    "🚙 Джип Валеры на сладком пит-стопе. До старта {wait}.",
+    "📝 План требует паузы — следующая вылазка через {wait}.",
+    "🐻 Валера шепчет: «Нужно выждать ещё {wait}».",
+    "🕵️ Паша всё ещё рядом с запасами. Попробуй снова через {wait}.",
+    "⚡ Сладкая миссия перезаряжается. Осталось {wait}.",
+    "😋 Валера копит хитрость для нового захода. Ждать {wait}.",
+)
+
+
+def _candy_steal_reward_range(streak: int) -> Tuple[int, int]:
+    return min(1 + streak, 10), min(3 + 2 * streak, 50)
+
+
+def _format_candy_count(count: int, *, accusative: bool = False) -> str:
+    last_two_digits = count % 100
+    last_digit = count % 10
+    if 11 <= last_two_digits <= 14:
+        noun = 'конфет'
+    elif last_digit == 1:
+        noun = 'конфету' if accusative else 'конфета'
+    elif 2 <= last_digit <= 4:
+        noun = 'конфеты'
+    else:
+        noun = 'конфет'
+    return f'{count} {noun}'
+
+
+async def cmd_steal_candy(
+    msg: Message,
+    args: str = '',
+    cmd_name: str = 'украсть',
+):
+    if args or msg.reply_to_message:
+        return await rp_handler(msg)
+
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    user = storage.get_user(msg.chat.id, msg.from_user.id)
+    now = time.time()
+    candies = user.get('candies', 0)
+    if not isinstance(candies, int) or isinstance(candies, bool) or candies < 0:
+        candies = 0
+
+    next_at = user.get('candy_steal_next_at', 0)
+    if not isinstance(next_at, (int, float)) or isinstance(next_at, bool):
+        next_at = 0
+
+    remaining = next_at - now
+    if remaining > 0:
+        minutes = max(1, int(remaining / 60 + 0.999))
+        cooldown_text = random.choice(CANDY_STEAL_COOLDOWN_TEXTS).format(
+            wait=f"<b>{format_mute_duration(minutes)}</b>",
+        )
+        return await msg.answer(
+            f"{cooldown_text}\n\n"
+            f"🍬 В запасе: <b>{_format_candy_count(candies)}</b>."
+        )
+
+    successes = user.get('candy_steal_successes', 0)
+    if not isinstance(successes, int) or isinstance(successes, bool) or successes < 0:
+        successes = 0
+    streak = user.get('candy_steal_streak', 0)
+    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 0:
+        streak = 0
+
+    if random.random() < 0.15:
+        lost = min(candies, (candies + 9) // 10)
+        candies -= lost
+        user['candies'] = candies
+        user['candy_steal_streak'] = 0
+        user['candy_steal_next_at'] = now + 3 * 60 * 60
+        storage.mark_dirty()
+        await storage.save()
+        failure_text = random.choice(CANDY_STEAL_FAILURE_TEXTS)
+        return await msg.answer(
+            f"{failure_text}\n\n"
+            f"📉 Потеряно: <b>{_format_candy_count(lost)}</b>.\n"
+            f"🍬 В запасе: <b>{_format_candy_count(candies)}</b>.\n"
+            f"🔥 Серия успехов сброшена.\n"
+            f"⏳ Новая вылазка через <b>3 часа</b>."
+        )
+
+    min_candies, max_candies = _candy_steal_reward_range(streak)
+    stolen = random.randint(min_candies, max_candies)
+    candies += stolen
+    streak += 1
+    user['candies'] = candies
+    user['candy_steal_successes'] = successes + 1
+    user['candy_steal_streak'] = streak
+    user['candy_steal_next_at'] = now + 24 * 60 * 60
+    storage.mark_dirty()
+    await storage.save()
+    success_text = random.choice(CANDY_STEAL_SUCCESS_TEXTS).format(
+        candy_amount=_format_candy_count(stolen, accusative=True),
+    )
+    next_min_candies, next_max_candies = _candy_steal_reward_range(streak)
+    return await msg.answer(
+        f"{success_text}\n\n"
+        f"🍬 <b>Запас:</b> {_format_candy_count(candies)}\n"
+        f"🔥 <b>Серия успехов:</b> {streak}\n"
+        f"🎯 <b>Следующая добыча:</b> {next_min_candies}–{next_max_candies} 🍬\n"
+        f"⏳ <b>Новая вылазка:</b> через 24 часа."
+    )
+
+
+async def cmd_candy_balance(msg: Message, cmd_name: str = 'баланс'):
+    if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
+        return
+
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
+    user = storage.get_user(msg.chat.id, msg.from_user.id)
+    candies = user.get('candies', 0)
+    if not isinstance(candies, int) or isinstance(candies, bool) or candies < 0:
+        candies = 0
+    streak = user.get('candy_steal_streak', 0)
+    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 0:
+        streak = 0
+    min_candies, max_candies = _candy_steal_reward_range(streak)
+
+    next_at = user.get('candy_steal_next_at', 0)
+    if not isinstance(next_at, (int, float)) or isinstance(next_at, bool):
+        next_at = 0
+    remaining = next_at - time.time()
+    if remaining > 0:
+        minutes = max(1, int(remaining / 60 + 0.999))
+        next_attempt = random.choice(CANDY_STEAL_COOLDOWN_TEXTS).format(
+            wait=f"<b>{format_mute_duration(minutes)}</b>",
+        )
+    else:
+        next_attempt = "⏳ Валера уже готов к новой вылазке!"
+
+    await msg.answer(
+        f"🍬 <b>Запас Валеры:</b> {_format_candy_count(candies)}\n"
+        f"🔥 <b>Серия успехов:</b> {streak}\n"
+        f"🎯 <b>Следующая добыча:</b> {min_candies}–{max_candies} 🍬\n"
+        f"{next_attempt}"
+    )
 
 
 async def cmd_random_joke(msg: Message, cmd_name: str = 'шутка'):
@@ -12629,14 +15618,31 @@ async def cmd_nick(msg: Message, cmd_name: str = 'ник'):
         f"✅ Ник для {mention(msg.chat.id, target_id)} изменён!\n📝 {old} → <b>{safe_new_name}</b>")
 
 
+REPORT_LAST: Dict[Tuple[int, int], float] = {}
+
+
 async def cmd_report(msg: Message, cmd_name: str = 'репорт'):
     if not check_access(msg.from_user.id, msg.chat.id, cmd_name, 0):
         return
-    save_activity(msg.chat.id, msg.from_user.id, 'commands')
-
     parts = (msg.text or '').split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         return await msg.answer("❌ Напишите текст жалобы: <code>!репорт описание</code>")
+
+    key = (msg.chat.id, msg.from_user.id)
+    now = time.monotonic()
+    if now - REPORT_LAST.get(key, 0) < 300:
+        return await msg.answer("⏳ Жалобу можно отправлять раз в 5 минут.")
+    REPORT_LAST[key] = now
+    if len(REPORT_LAST) > 5000:
+        cutoff = now - 600
+        for cache_key, timestamp in list(REPORT_LAST.items()):
+            if timestamp < cutoff:
+                del REPORT_LAST[cache_key]
+        if len(REPORT_LAST) > 5000:
+            oldest = sorted(REPORT_LAST.items(), key=lambda item: item[1])
+            for cache_key, _ in oldest[:len(REPORT_LAST) - 5000]:
+                REPORT_LAST.pop(cache_key, None)
+    save_activity(msg.chat.id, msg.from_user.id, 'commands')
 
     report_text = html.escape(parts[1].strip()[:1500], quote=False)
     try:
@@ -12732,7 +15738,13 @@ FUNCTION_MIN_RANK = {
     'cmd_rank_rename': 5,
     'cmd_prefix': 5,
     'cmd_mute': 1, 'cmd_unmute': 1,
-    'cmd_ban': 3, 'cmd_unban': 3,
+    'cmd_ban': 3, 'cmd_unban': 3, 'cmd_kick': 3,
+    'cmd_moderation_history': 1, 'cmd_moderation_log': 1,
+    'cmd_moderation_stats': 1, 'cmd_reason_templates': 2,
+    'cmd_moderation_auto_delete': 5,
+    'cmd_join_requests': 5, 'cmd_filters': 5, 'cmd_captcha': 5,
+    'cmd_raid_mode': 5, 'cmd_freeze_chat': 5, 'cmd_unfreeze_chat': 5,
+    'cmd_channel_autohide': 5,
     'cmd_warn': 1,
     'cmd_mute_list': 1,
     'cmd_ban_list': 3,
@@ -12786,6 +15798,13 @@ DK_CATEGORIES = {
         (['мут', 'размут', '-мут'], None),
         (['мутлист', 'муты', 'мутылист', 'список мутов', 'mutelist', 'mutes'], None),
         (['бан', 'разбан', '-бан'], None),
+        (['кик'], None),
+        (['история', 'лог'], None),
+        (['модстат'], None),
+        (['причины'], None),
+        (['автоудаление'], None),
+        (['заявки'], None),
+        (['фильтр', 'капча', 'рейд', 'закрыть', 'открыть', 'каналы'], None),
         (['банлист', 'баны', 'список банов', 'banlist', 'bans'], None),
         (['пред', 'варн', 'warn'], None),
         (['преды', 'варны', 'warns'], None),
@@ -13269,19 +16288,136 @@ async def cmd_ping(msg: Message, cmd_name: str = 'общий сбор'):
         await msg.answer("❌ Не удалось получить список администраторов чата.")
 
 
-async def cmd_backup(msg: Message, cmd_name: str = 'бэкап'):
-    if not is_bot_superadmin(msg.from_user.id):
-        return await msg.answer("❌ Эта команда доступна только главным администраторам бота.")
+def log_superadmin_action(actor_id: int, action: str, details: str = ''):
+    entries = storage.data.setdefault('superadmin_audit', [])
+    if not isinstance(entries, list):
+        entries = []
+        storage.data['superadmin_audit'] = entries
+    now = time.time()
+    entries.append({
+        'ts': now,
+        'actor': actor_id,
+        'action': action,
+        'details': str(details)[:500],
+    })
+    cutoff = now - 90 * 86400
+    storage.data['superadmin_audit'] = [
+        entry for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get('ts'), (int, float))
+        and entry['ts'] > cutoff
+    ][-500:]
+    storage.mark_dirty()
+
+
+async def require_private_admin_chat(msg: Message) -> bool:
+    if msg.chat.type == 'private':
+        return True
+    await msg.answer("❌ Эта команда доступна главным администраторам только в личном чате с ботом.")
+    return False
+
+
+def _format_bytes(size: Optional[int]) -> str:
+    if size is None:
+        return "н/д"
+    value = float(size)
+    for unit in ('Б', 'КБ', 'МБ', 'ГБ', 'ТБ'):
+        if value < 1024 or unit == 'ТБ':
+            return f"{value:.1f} {unit}" if unit != 'Б' else f"{int(value)} Б"
+        value /= 1024
+    return f"{value:.1f} ТБ"
+
+
+def _read_log_tail(max_bytes: int = 256 * 1024) -> List[str]:
+    path = Path(LOG_FILE)
+    with path.open('rb') as log_file:
+        log_file.seek(0, os.SEEK_END)
+        size = log_file.tell()
+        log_file.seek(max(0, size - max_bytes))
+        data = log_file.read()
+    if size > max_bytes:
+        data = data.split(b'\n', 1)[-1]
+    return data.decode('utf-8', 'replace').splitlines()
+
+
+def _get_rss_mb() -> Optional[float]:
+    if os.name == 'nt':
+        try:
+            import ctypes
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ('cb', ctypes.c_ulong),
+                    ('PageFaultCount', ctypes.c_ulong),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t),
+                ]
+
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            process = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                process, ctypes.byref(counters), counters.cb
+            ):
+                return counters.WorkingSetSize / (1024 * 1024)
+        except (AttributeError, OSError):
+            return None
+        return None
+
+    try:
+        with open('/proc/self/status', encoding='utf-8') as status_file:
+            for line in status_file:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+@superadmin_only
+async def cmd_backup(msg: Message, args: str = '', cmd_name: str = 'бэкап'):
+    if args.strip().casefold() == 'файл':
+        if not await require_private_admin_chat(msg):
+            return
+        created_at = await storage.create_backup()
+        backups = await storage.list_backups()
+        backup_meta = next(
+            (item for item in backups if abs(float(item['ts']) - created_at) < 0.000001),
+            None,
+        )
+        if not backup_meta or not backup_meta.get('path') or not backup_meta.get('exists'):
+            return await msg.answer("❌ Не удалось найти файл созданного бэкапа.")
+        log_superadmin_action(msg.from_user.id, 'backup_export', f"id={backup_meta['id']}")
+        await storage.flush()
+        await msg.answer_document(
+            FSInputFile(backup_meta['path'], filename=Path(backup_meta['path']).name),
+            caption=f"Снимок базы данных #{backup_meta['id']}",
+        )
+        return
+
     created_at = await storage.create_backup()
+    backups = await storage.list_backups()
+    backup_meta = next(
+        (item for item in backups if abs(float(item['ts']) - created_at) < 0.000001),
+        None,
+    )
+    log_superadmin_action(
+        msg.from_user.id, 'backup_create',
+        f"id={backup_meta['id']}" if backup_meta else "snapshot created",
+    )
+    await storage.flush()
     await msg.answer(
-        f"✅ Бэкап сохранён в отдельный SQLite-файл ({BACKUP_DIR}) "
-        f"({datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S')})"
+        f"✅ Бэкап сохранён ({datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S')})."
     )
 
 
+@superadmin_only
 async def cmd_list_bot_chats(msg: Message):
-    if not is_bot_superadmin(msg.from_user.id):
-        return await msg.answer("❌ Эта команда доступна только главным администраторам бота.")
 
     bot_info = await bot.get_me()
     known_chats = storage.data.setdefault('bot_chats', {})
@@ -13340,35 +16476,437 @@ async def cmd_list_bot_chats(msg: Message):
     await send_chunked_text(msg, text)
 
 
-async def cmd_restore(msg: Message, cmd_name: str = 'восстановить'):
-    if not is_bot_superadmin(msg.from_user.id):
-        return await msg.answer("❌ Эта команда доступна только главным администраторам бота.")
-    backup = await storage.get_latest_backup()
-    if not backup:
-        return await msg.answer("❌ Нет бэкапов")
-    if not isinstance(backup, dict) or not isinstance(backup.get('ts'), (int, float)):
-        logger.error("Последний бэкап не содержит корректную временную метку")
-        return await msg.answer("❌ Последний бэкап повреждён или имеет неподдерживаемый формат.")
-    backup_data = backup.get('data') if isinstance(backup, dict) else None
-    if not validate_backup_data(backup_data):
-        logger.error("Последний бэкап имеет некорректную структуру")
-        return await msg.answer("❌ Последний бэкап повреждён или имеет неподдерживаемый формат.")
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+def _backup_restore_keyboard(owner_id: int, backup: dict) -> InlineKeyboardMarkup:
+    ts_token = int(round(float(backup['ts']) * 1_000_000))
+    backup_id = int(backup['id'])
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text="✅ Да, восстановить",
-            callback_data=f"restore_confirm_{msg.from_user.id}_{backup['ts']}",
+            text=f"✅ Да, восстановить #{backup_id}",
+            callback_data=f"restore_confirm_{owner_id}_{ts_token}_{backup_id}",
         ),
         InlineKeyboardButton(
             text="❌ Отмена",
-            callback_data=f"restore_cancel_{msg.from_user.id}_{backup['ts']}",
+            callback_data=f"restore_cancel_{owner_id}_{ts_token}_{backup_id}",
+        ),
+    ]])
+
+
+async def _prompt_restore_confirmation(
+    msg: Message, backup: dict, owner_id: int, *, edit: bool = False
+):
+    created = datetime.fromtimestamp(float(backup['ts'])).strftime('%Y-%m-%d %H:%M:%S')
+    text = (
+        "⚠️ <b>Подтвердите восстановление</b>\n"
+        f"Будет выбран бэкап <code>#{backup['id']}</code> от {created}.\n"
+        "Текущие данные будут заменены содержимым выбранной копии."
+    )
+    keyboard = _backup_restore_keyboard(owner_id, backup)
+    if edit:
+        await msg.edit_text(text, reply_markup=keyboard)
+    else:
+        await msg.answer(text, reply_markup=keyboard)
+
+
+@superadmin_only
+async def cmd_restore(msg: Message, args: str = '', cmd_name: str = 'восстановить'):
+    backup_id = None
+    if args.strip():
+        try:
+            backup_id = int(args.strip())
+        except ValueError:
+            return await msg.answer("Использование: <code>!восстановить [id]</code>.")
+        if backup_id <= 0:
+            return await msg.answer("ID бэкапа должен быть положительным числом.")
+    backup = await storage.get_backup(backup_id) if backup_id is not None else await storage.get_latest_backup()
+    if not backup:
+        return await msg.answer("❌ Нет бэкапов")
+    if not isinstance(backup, dict) or not isinstance(backup.get('ts'), (int, float)):
+        logger.error("Бэкап %s не содержит корректную временную метку", backup_id)
+        return await msg.answer("❌ Бэкап повреждён или имеет неподдерживаемый формат.")
+    backup_data = backup.get('data')
+    if not validate_backup_data(backup_data):
+        logger.error("Бэкап %s имеет некорректную структуру", backup.get('id'))
+        return await msg.answer("❌ Бэкап повреждён или имеет неподдерживаемый формат.")
+    await _prompt_restore_confirmation(msg, backup, msg.from_user.id)
+
+
+@superadmin_only
+async def cmd_backups(msg: Message):
+    backups = await storage.list_backups()
+    if not backups:
+        return await msg.answer("📭 Сохранённых бэкапов пока нет.")
+
+    lines = ["💾 <b>Резервные копии</b>"]
+    keyboard_rows = []
+    for backup in backups[:10]:
+        created = datetime.fromtimestamp(float(backup['ts'])).strftime('%Y-%m-%d %H:%M:%S')
+        size = _format_bytes(backup['size'])
+        state = "✅" if backup['exists'] else "⚠️ файл отсутствует"
+        lines.append(
+            f"• <code>#{backup['id']}</code> — {created}, {size} {state}"
+        )
+        if backup['exists']:
+            keyboard_rows.append([InlineKeyboardButton(
+                text=f"Восстановить #{backup['id']}",
+                callback_data=f"restore_select_{msg.from_user.id}_{backup['id']}",
+            )])
+    await msg.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None,
+    )
+
+
+@superadmin_only
+async def cmd_logs(msg: Message, args: str = ''):
+    if not await require_private_admin_chat(msg):
+        return
+    tokens = args.split()
+    levels = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+    level = next((token.upper() for token in tokens if token.upper() in levels), None)
+    count = 40
+    for token in tokens:
+        if token.isdigit():
+            count = int(token)
+            break
+    count = max(1, min(count, 300))
+    try:
+        lines = await asyncio.to_thread(_read_log_tail)
+    except OSError as exc:
+        return await msg.answer(f"❌ Не удалось прочитать лог: {html.escape(str(exc))}")
+    if level:
+        lines = [line for line in lines if f" - {level} - " in line]
+    lines = lines[-count:]
+    if not lines:
+        return await msg.answer("📭 Подходящих записей в хвосте лога нет.")
+    header = f"📜 <b>Лог: {len(lines)} строк" + (f", уровень {level}" if level else "") + "</b>\n"
+    body = "\n".join(lines)
+    if len(body) > 3500:
+        return await msg.answer_document(
+            BufferedInputFile(body.encode('utf-8'), filename='valera_log.txt'),
+            caption=header,
+        )
+    await msg.answer(header + f"<pre>{html.escape(body, quote=False)}</pre>")
+
+
+@superadmin_only
+async def cmd_status(msg: Message):
+    database_path = Path(DATABASE_FILE)
+    wal_path = Path(str(database_path) + '-wal')
+    db_size = database_path.stat().st_size if database_path.exists() else 0
+    wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+    chat_count, user_count = storage._connection.execute(
+        "SELECT COUNT(DISTINCT chat_id), COUNT(*) FROM users"
+    ).fetchone()
+    active_chats = len(storage.get_known_group_chat_ids())
+    rss_mb = _get_rss_mb()
+    now = time.time()
+    database_mtimes = [
+        path.stat().st_mtime for path in (database_path, wal_path) if path.exists()
+    ]
+    stat_mtime = max(database_mtimes) if database_mtimes else None
+    last_save = (
+        datetime.fromtimestamp(stat_mtime).strftime('%Y-%m-%d %H:%M:%S')
+        if stat_mtime else "неизвестно"
+    )
+    cache_sizes = (
+        f"user {len(user_cache._cache)}, mention {len(mention_cache._cache)}, "
+        f"settings {len(chat_settings_cache._cache)}, антиспам {len(anti_spam_admin_cache._cache)}, "
+        f"права {len(bot_rights_cache._cache)}, фразы {len(phrase_match_cache._cache)}, "
+        f"индексы пользователей {len(storage._chat_user_index)}"
+    )
+    other_tasks = sum(
+        1 for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    )
+    uptime = max(0, int(now - PROCESS_START_TIME))
+    lines = [
+        "🩺 <b>Состояние бота</b>",
+        f"⏱️ Аптайм: {uptime // 86400}д {(uptime % 86400) // 3600}ч {(uptime % 3600) // 60}м",
+        f"📦 aiogram: {html.escape(aiogram.__version__)}",
+        f"💬 Групп: {active_chats}; чатов с данными в SQLite: {chat_count}; пользователей: {user_count}",
+        f"💾 База: {_format_bytes(db_size)}; WAL: {_format_bytes(wal_size)}",
+        f"🔄 Версии сохранения: {storage._change_version}/{storage._saved_version}",
+        f"🕒 Последняя запись БД: {last_save}",
+        f"🧠 RSS: {rss_mb:.1f} МБ" if rss_mb is not None else "🧠 RSS: недоступен",
+        f"♻️ Кэши: {cache_sizes}",
+        f"⚙️ Незавершённых задач asyncio: {other_tasks}",
+    ]
+    await msg.answer("\n".join(lines))
+
+
+PROCESS_START_TIME = time.time()
+
+
+@superadmin_only
+async def cmd_save_now(msg: Message):
+    users_written = (
+        sum(len(users) for users in storage.data.get('users', {}).values())
+        if storage._replace_all_users else len(storage._dirty_users)
+    )
+    started = time.perf_counter()
+    storage.mark_dirty()
+    await storage.flush()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    await msg.answer(f"✅ Сохранение завершено: {users_written} пользователей, {elapsed_ms:.1f} мс.")
+
+
+@superadmin_only
+async def cmd_bot_rights(msg: Message, args: str):
+    try:
+        chat_id = int(args.strip())
+    except ValueError:
+        return await msg.answer("Использование: <code>!права &lt;chat_id&gt;</code>.")
+    try:
+        member = await bot.get_chat_member(chat_id, bot.id)
+    except TelegramAPIError as exc:
+        return await msg.answer(f"❌ Не удалось получить права бота: {html.escape(str(exc))}")
+    rights = (
+        ('Удалять сообщения', 'can_delete_messages'),
+        ('Ограничивать участников', 'can_restrict_members'),
+        ('Закреплять сообщения', 'can_pin_messages'),
+        ('Приглашать участников', 'can_invite_users'),
+        ('Управлять чатом', 'can_manage_chat'),
+        ('Назначать администраторов', 'can_promote_members'),
+    )
+    lines = [f"🔐 <b>Права бота в чате <code>{chat_id}</code></b>", f"Статус: {member.status}"]
+    for title, field in rights:
+        allowed = member.status == 'creator' or (
+            member.status == 'administrator' and bool(getattr(member, field, False))
+        )
+        lines.append(f"{'✅' if allowed else '❌'} {title}")
+    await msg.answer("\n".join(lines))
+
+
+@superadmin_only
+async def cmd_reset_caches(msg: Message):
+    for cache in (
+        user_cache, mention_cache, chat_settings_cache, anti_spam_admin_cache,
+        bot_rights_cache, raid_join_cache, phrase_match_cache,
+    ):
+        cache.clear()
+    chat_owner_sync_cache.clear()
+    chat_default_permissions_cache.clear()
+    storage._chat_user_index.clear()
+    await msg.answer("✅ Кэши очищены.")
+
+
+@superadmin_only
+async def cmd_export_user(msg: Message, args: str):
+    if not await require_private_admin_chat(msg):
+        return
+    parts = args.split()
+    if len(parts) != 2:
+        return await msg.answer("Использование: <code>!юзер &lt;chat_id&gt; &lt;user_id&gt;</code>.")
+    try:
+        chat_id, user_id = map(int, parts)
+    except ValueError:
+        return await msg.answer("chat_id и user_id должны быть числами.")
+    chat_key, user_key = str(chat_id), str(user_id)
+    user_data = storage.data.get('users', {}).get(chat_key, {}).get(user_key)
+    if user_data is None:
+        row = storage._connection.execute(
+            "SELECT value_json FROM users WHERE chat_id = ? AND user_id = ?",
+            (chat_key, user_key),
+        ).fetchone()
+        if row:
+            user_data = json.loads(row[0])
+    if not isinstance(user_data, dict):
+        return await msg.answer("📭 Профиль не найден.")
+    payload = json.dumps(user_data, ensure_ascii=False, indent=2, default=str).encode('utf-8')
+    await msg.answer_document(
+        BufferedInputFile(payload, filename=f"user_{chat_id}_{user_id}.json"),
+        caption=f"Профиль {user_id} в чате {chat_id}",
+    )
+
+
+def _inspect_database_sync(database_path: str) -> dict:
+    connection = sqlite3.connect(database_path, timeout=30)
+    try:
+        connection.execute("PRAGMA busy_timeout=30000")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        tables = [
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        counts = {}
+        for table in tables:
+            escaped = table.replace('"', '""')
+            counts[table] = connection.execute(
+                f'SELECT COUNT(*) FROM "{escaped}"'
+            ).fetchone()[0]
+        return {'integrity': integrity, 'checkpoint': checkpoint, 'counts': counts}
+    finally:
+        connection.close()
+
+
+@superadmin_only
+async def cmd_database_info(msg: Message):
+    if not await require_private_admin_chat(msg):
+        return
+    try:
+        result = await asyncio.to_thread(_inspect_database_sync, str(Path(DATABASE_FILE)))
+    except sqlite3.Error as exc:
+        logger.exception("Не удалось выполнить диагностику SQLite")
+        return await msg.answer(f"❌ Ошибка диагностики БД: {html.escape(str(exc))}")
+    db_path = Path(DATABASE_FILE)
+    wal_path = Path(str(db_path) + '-wal')
+    checkpoint = result['checkpoint'] or (0, 0, 0)
+    lines = [
+        "🗄️ <b>Диагностика SQLite</b>",
+        f"База: {_format_bytes(db_path.stat().st_size if db_path.exists() else 0)}",
+        f"WAL после checkpoint: {_format_bytes(wal_path.stat().st_size if wal_path.exists() else 0)}",
+        f"Integrity check: <code>{html.escape(str(result['integrity']))}</code>",
+        f"WAL checkpoint (busy/log/checkpointed): <code>{checkpoint}</code>",
+        "Строки: " + ", ".join(
+            f"{html.escape(table)}={count}" for table, count in result['counts'].items()
+        ),
+    ]
+    await msg.answer("\n".join(lines))
+
+
+@superadmin_only
+async def cmd_gc(msg: Message):
+    before = _get_rss_mb()
+    collected = await asyncio.to_thread(gc.collect)
+    after = _get_rss_mb()
+    before_text = f"{before:.1f} МБ" if before is not None else "н/д"
+    after_text = f"{after:.1f} МБ" if after is not None else "н/д"
+    await msg.answer(
+        f"♻️ GC собрал объектов: {collected}\nRSS: {before_text} → {after_text}"
+    )
+
+
+@superadmin_only
+async def cmd_broadcast(msg: Message, args: str):
+    if not await require_private_admin_chat(msg):
+        return
+    text = args.strip()
+    if not text:
+        return await msg.answer("Использование: <code>!рассылка &lt;текст&gt;</code>.")
+    if len(text) > 4000:
+        return await msg.answer("❌ Текст рассылки не должен превышать 4000 символов.")
+    now = time.time()
+    for old_token, old_pending in list(pending_broadcasts.items()):
+        if now - old_pending.get('created_at', 0) > 5 * 60:
+            pending_broadcasts.pop(old_token, None)
+    token = uuid.uuid4().hex[:12]
+    pending_broadcasts[token] = {
+        'owner': msg.from_user.id,
+        'text': text,
+        'created_at': now,
+    }
+    escaped_preview = html.escape(text[:700], quote=False)
+    if len(text) > 700:
+        escaped_preview += "…"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Отправить",
+            callback_data=f"broadcast_confirm_{msg.from_user.id}_{token}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"broadcast_cancel_{msg.from_user.id}_{token}",
+        ),
+    ]])
+    count = len([
+        chat_id for chat_id in storage.get_known_group_chat_ids()
+        if str(chat_id) not in storage.data.get('blocked_chats', {})
+    ])
+    await msg.answer(
+        f"⚠️ <b>Предпросмотр рассылки</b> для {count} групп:\n\n{escaped_preview}",
+        reply_markup=keyboard,
+    )
+
+
+pending_broadcasts: Dict[str, dict] = {}
+
+
+@superadmin_only
+async def cmd_leave_chat(msg: Message, args: str):
+    try:
+        chat_id = int(args.strip())
+    except ValueError:
+        return await msg.answer("Использование: <code>!выйти &lt;chat_id&gt;</code>.")
+    record = storage.data.get('bot_chats', {}).get(str(chat_id), {})
+    title = html.escape(str(record.get('title', chat_id)), quote=False) if isinstance(record, dict) else str(chat_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Выйти",
+            callback_data=f"leave_confirm_{msg.from_user.id}_{chat_id}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"leave_cancel_{msg.from_user.id}_{chat_id}",
         ),
     ]])
     await msg.answer(
-        "⚠️ <b>Подтвердите восстановление</b>\n"
-        "Текущие данные будут заменены содержимым последнего бэкапа.",
+        f"⚠️ Подтвердите выход из чата <b>{title}</b> (<code>{chat_id}</code>).",
         reply_markup=keyboard,
     )
+
+
+@superadmin_only
+async def cmd_block_chat(msg: Message, args: str, unblock: bool = False):
+    try:
+        chat_id = int(args.strip())
+    except ValueError:
+        usage = "!разблок чата" if unblock else "!блок чата"
+        return await msg.answer(f"Использование: <code>{usage} &lt;chat_id&gt;</code>.")
+    action = 'unblock' if unblock else 'block'
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Подтвердить",
+            callback_data=f"chatblock_{action}_{msg.from_user.id}_{chat_id}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"chatblock_cancel_{msg.from_user.id}_{chat_id}",
+        ),
+    ]])
+    verb = "разблокировать" if unblock else "заблокировать"
+    await msg.answer(
+        f"⚠️ Подтвердите: {verb} обработку сообщений чата <code>{chat_id}</code>?",
+        reply_markup=keyboard,
+    )
+
+
+@superadmin_only
+async def cmd_restart(msg: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🔄 Перезапустить",
+            callback_data=f"restart_confirm_{msg.from_user.id}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"restart_cancel_{msg.from_user.id}",
+        ),
+    ]])
+    await msg.answer(
+        "⚠️ Подтвердите graceful shutdown. Процесс завершится после сохранения данных "
+        "и перезапустится только при настроенном супервизоре.",
+        reply_markup=keyboard,
+    )
+
+
+@superadmin_only
+async def cmd_superadmin_audit(msg: Message):
+    entries = storage.data.get('superadmin_audit', [])
+    if not isinstance(entries, list) or not entries:
+        return await msg.answer("📭 Аудит действий главных администраторов пока пуст.")
+    lines = ["📜 <b>Последние действия суперадминов</b>"]
+    for entry in entries[-20:][::-1]:
+        if not isinstance(entry, dict):
+            continue
+        stamp = entry.get('ts', 0)
+        when = datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M:%S') if isinstance(stamp, (int, float)) else "?"
+        actor = html.escape(str(entry.get('actor', '?')))
+        action = html.escape(str(entry.get('action', '?')))
+        details = html.escape(str(entry.get('details', ''))[:180], quote=False)
+        lines.append(f"• {when} — <code>{actor}</code>: <b>{action}</b> {details}")
+    await send_chunked_text(msg, "\n".join(lines))
 
 
 def validate_backup_data(data: Any) -> bool:
@@ -13394,42 +16932,51 @@ async def restore_backup_callback(call: CallbackQuery):
     if not call.message:
         return await call.answer("❌ Сообщение восстановления недоступно.", show_alert=True)
 
-    try:
-        _, action, requester_id, backup_ts = call.data.split('_', maxsplit=3)
-        requester_id = int(requester_id)
-        backup_ts = float(backup_ts)
-    except (ValueError, AttributeError):
+    parts = call.data.split('_')
+    if len(parts) == 4 and parts[1] == 'select':
+        try:
+            owner_id, backup_id = int(parts[2]), int(parts[3])
+        except ValueError:
+            return await call.answer("❌ Кнопка восстановления недействительна.", show_alert=True)
+        if call.from_user.id != owner_id or not is_bot_superadmin(call.from_user.id):
+            return await call.answer("❌ Это действие доступно только его инициатору.", show_alert=True)
+        try:
+            backup = await storage.get_backup(backup_id)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            logger.exception("Не удалось прочитать выбранный бэкап %s", backup_id)
+            return await call.answer(f"❌ Не удалось прочитать бэкап: {str(exc)[:180]}", show_alert=True)
+        if not backup or not validate_backup_data(backup.get('data')):
+            return await call.answer("❌ Бэкап отсутствует или повреждён.", show_alert=True)
+        await _prompt_restore_confirmation(call.message, backup, owner_id, edit=True)
+        return await call.answer()
+
+    if len(parts) != 5 or parts[1] not in {'confirm', 'cancel'}:
         logger.warning("Получены некорректные данные callback восстановления")
         return await call.answer("❌ Кнопка восстановления недействительна.", show_alert=True)
-
-    if call.from_user.id != requester_id:
-        return await call.answer("❌ Подтвердить восстановление может только инициатор.", show_alert=True)
-    if not is_bot_superadmin(call.from_user.id):
-        return await call.answer(
-            "❌ Восстанавливать данные могут только главные администраторы бота.",
-            show_alert=True,
-        )
-    backup = await storage.get_latest_backup()
-    current_backup_ts = backup.get('ts') if isinstance(backup, dict) else None
-    if (
-        not isinstance(current_backup_ts, (int, float))
-        or float(current_backup_ts) != backup_ts
-    ):
-        return await call.answer("❌ Список бэкапов изменился. Запустите восстановление заново.", show_alert=True)
-    if action == 'cancel':
+    try:
+        owner_id, ts_token, backup_id = int(parts[2]), int(parts[3]), int(parts[4])
+    except ValueError:
+        return await call.answer("❌ Кнопка восстановления недействительна.", show_alert=True)
+    if call.from_user.id != owner_id or not is_bot_superadmin(call.from_user.id):
+        return await call.answer("❌ Это действие доступно только его инициатору.", show_alert=True)
+    if parts[1] == 'cancel':
         await call.message.edit_text("✅ Восстановление отменено.", reply_markup=None)
         return await call.answer()
-    if action != 'confirm':
-        return await call.answer("❌ Неизвестное действие.", show_alert=True)
 
-    backup_data = backup.get('data') if isinstance(backup, dict) else None
-    if not validate_backup_data(backup_data):
-        logger.error("Последний бэкап имеет некорректную структуру при подтверждении")
-        await call.message.edit_text("❌ Бэкап повреждён или имеет неподдерживаемый формат.", reply_markup=None)
-        return await call.answer("Восстановление не выполнено.", show_alert=True)
+    try:
+        backup = await storage.get_backup(backup_id)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        logger.exception("Не удалось прочитать бэкап %s при подтверждении", backup_id)
+        return await call.answer(f"❌ Не удалось прочитать бэкап: {str(exc)[:180]}", show_alert=True)
+    if (
+        not backup
+        or int(round(float(backup['ts']) * 1_000_000)) != ts_token
+        or not validate_backup_data(backup.get('data'))
+    ):
+        return await call.answer("❌ Выбранный бэкап изменился или повреждён.", show_alert=True)
 
     restored_data = DataStorage._get_default_data()
-    restored_data.update(backup_data)
+    restored_data.update(backup['data'])
     restored_data['backups'] = []
     storage.data = restored_data
     storage._loaded_user_chats = set(restored_data['users'])
@@ -13437,21 +16984,182 @@ async def restore_backup_callback(call: CallbackQuery):
     storage._dirty_users.clear()
     storage._deleted_user_keys.clear()
     storage._deleted_user_chats.clear()
-    user_cache.clear()
-    chat_settings_cache.clear()
-    mention_cache.clear()
-    anti_spam_admin_cache.clear()
+    for cache in (
+        user_cache, chat_settings_cache, mention_cache, anti_spam_admin_cache,
+        bot_rights_cache, raid_join_cache, phrase_match_cache,
+    ):
+        cache.clear()
     chat_owner_sync_cache.clear()
-    phrase_match_cache.clear()
+    chat_default_permissions_cache.clear()
     storage._chat_user_index.clear()
     active_games.clear()
     minesweeper_games.clear()
     wordle.games.clear()
     activity_graph_wizards.clear()
     storage.mark_dirty()
-    await storage.save()
-    await call.message.edit_text("✅ Данные восстановлены из последнего бэкапа.", reply_markup=None)
+    log_superadmin_action(owner_id, 'backup_restore', f"id={backup_id}")
+    await storage.flush()
+    await call.message.edit_text(
+        f"✅ Данные восстановлены из бэкапа #{backup_id}.",
+        reply_markup=None,
+    )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith('broadcast_'))
+async def broadcast_callback(call: CallbackQuery):
+    if not call.message:
+        return await call.answer("Сообщение рассылки недоступно.", show_alert=True)
+    try:
+        _, action, owner_token, token = call.data.split('_', maxsplit=3)
+        owner_id = int(owner_token)
+    except (ValueError, AttributeError):
+        return await call.answer("Кнопка рассылки недействительна.", show_alert=True)
+    if call.from_user.id != owner_id or not is_bot_superadmin(owner_id):
+        return await call.answer("Подтвердить рассылку может только её инициатор.", show_alert=True)
+    pending = pending_broadcasts.get(token)
+    if not pending or pending.get('owner') != owner_id:
+        return await call.answer("Предпросмотр устарел. Создайте рассылку заново.", show_alert=True)
+    if time.time() - pending.get('created_at', 0) > 5 * 60:
+        pending_broadcasts.pop(token, None)
+        return await call.answer("Предпросмотр истёк. Создайте рассылку заново.", show_alert=True)
+    if action == 'cancel':
+        pending_broadcasts.pop(token, None)
+        await call.message.edit_text("✅ Рассылка отменена.", reply_markup=None)
+        return await call.answer()
+    if action != 'confirm':
+        return await call.answer("Неизвестное действие.", show_alert=True)
+
+    pending_broadcasts.pop(token, None)
+    targets = [
+        chat_id for chat_id in storage.get_known_group_chat_ids()
+        if str(chat_id) not in storage.data.get('blocked_chats', {})
+    ]
+    await call.answer("Рассылка запущена.")
+    await call.message.edit_text(f"⏳ Отправляю сообщение в {len(targets)} групп…")
+    delivered = 0
+    errors = 0
+    broadcast_text = pending['text']
+    for index, chat_id in enumerate(targets):
+        try:
+            await telegram_call_with_retry(
+                bot.send_message,
+                chat_id,
+                broadcast_text,
+                parse_mode=None,
+                disable_web_page_preview=True,
+            )
+            delivered += 1
+        except TelegramAPIError as exc:
+            errors += 1
+            logger.warning("Рассылка не доставлена в чат %s: %s", chat_id, exc)
+        if index + 1 < len(targets):
+            await asyncio.sleep(1)
+    log_superadmin_action(
+        owner_id, 'broadcast',
+        f"delivered={delivered}, errors={errors}, targets={len(targets)}",
+    )
+    await storage.flush()
+    await call.message.edit_text(
+        f"✅ Рассылка завершена.\nДоставлено: {delivered}\nОшибок: {errors}"
+    )
+
+
+@router.callback_query(F.data.startswith('leave_'))
+async def leave_chat_callback(call: CallbackQuery):
+    if not call.message:
+        return await call.answer("Сообщение подтверждения недоступно.", show_alert=True)
+    try:
+        _, action, owner_token, chat_token = call.data.split('_', maxsplit=3)
+        owner_id, chat_id = int(owner_token), int(chat_token)
+    except (ValueError, AttributeError):
+        return await call.answer("Кнопка выхода недействительна.", show_alert=True)
+    if call.from_user.id != owner_id or not is_bot_superadmin(owner_id):
+        return await call.answer("Подтвердить действие может только его инициатор.", show_alert=True)
+    if action == 'cancel':
+        await call.message.edit_text("✅ Выход отменён.", reply_markup=None)
+        return await call.answer()
+    if action != 'confirm':
+        return await call.answer("Неизвестное действие.", show_alert=True)
+    try:
+        await bot.leave_chat(chat_id)
+    except TelegramAPIError as exc:
+        logger.warning("Не удалось покинуть чат %s: %s", chat_id, exc)
+        await call.message.edit_text(
+            f"❌ Не удалось выйти из чата: {html.escape(str(exc)[:250])}",
+            reply_markup=None,
+        )
+        return await call.answer("Ошибка Telegram.", show_alert=True)
+    record = storage.data.setdefault('bot_chats', {}).setdefault(str(chat_id), {})
+    if not isinstance(record, dict):
+        record = {}
+        storage.data['bot_chats'][str(chat_id)] = record
+    record['status'] = 'left'
+    record.setdefault('title', str(chat_id))
+    record.setdefault('type', 'supergroup')
+    log_superadmin_action(owner_id, 'leave_chat', f"chat_id={chat_id}")
+    await storage.flush()
+    await call.message.edit_text(f"✅ Бот вышел из чата <code>{chat_id}</code>.", reply_markup=None)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('chatblock_'))
+async def block_chat_callback(call: CallbackQuery):
+    if not call.message:
+        return await call.answer("Сообщение подтверждения недоступно.", show_alert=True)
+    try:
+        _, action, owner_token, chat_token = call.data.split('_', maxsplit=3)
+        owner_id, chat_id = int(owner_token), int(chat_token)
+    except (ValueError, AttributeError):
+        return await call.answer("Кнопка блокировки недействительна.", show_alert=True)
+    if call.from_user.id != owner_id or not is_bot_superadmin(owner_id):
+        return await call.answer("Подтвердить действие может только его инициатор.", show_alert=True)
+    if action == 'cancel':
+        await call.message.edit_text("✅ Действие отменено.", reply_markup=None)
+        return await call.answer()
+    if action not in {'block', 'unblock'}:
+        return await call.answer("Неизвестное действие.", show_alert=True)
+    blocked = storage.data.setdefault('blocked_chats', {})
+    if action == 'block':
+        blocked[str(chat_id)] = {'actor': owner_id, 'ts': time.time()}
+    else:
+        blocked.pop(str(chat_id), None)
+    log_superadmin_action(owner_id, f"chat_{action}", f"chat_id={chat_id}")
+    await storage.flush()
+    result = "заблокирован" if action == 'block' else "разблокирован"
+    await call.message.edit_text(
+        f"✅ Чат <code>{chat_id}</code> {result} для обработки сообщений.",
+        reply_markup=None,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('restart_'))
+async def restart_callback(call: CallbackQuery):
+    if not call.message:
+        return await call.answer("Сообщение подтверждения недоступно.", show_alert=True)
+    try:
+        _, action, owner_token = call.data.split('_', maxsplit=2)
+        owner_id = int(owner_token)
+    except (ValueError, AttributeError):
+        return await call.answer("Кнопка перезапуска недействительна.", show_alert=True)
+    if call.from_user.id != owner_id or not is_bot_superadmin(owner_id):
+        return await call.answer("Подтвердить перезапуск может только его инициатор.", show_alert=True)
+    if action == 'cancel':
+        await call.message.edit_text("✅ Перезапуск отменён.", reply_markup=None)
+        return await call.answer()
+    if action != 'confirm':
+        return await call.answer("Неизвестное действие.", show_alert=True)
+    if shutdown_event is None:
+        return await call.answer("Обработчик завершения ещё не запущен.", show_alert=True)
+    log_superadmin_action(owner_id, 'restart', 'graceful shutdown requested')
+    await storage.flush()
+    await call.message.edit_text(
+        "✅ Данные сохранены. Завершаю процесс; перезапуск зависит от настроек супервизора.",
+        reply_markup=None,
+    )
+    await call.answer()
+    shutdown_event.set()
 
 
 async def cmd_forward(msg: Message, cmd_name: str = 'перед'):
@@ -13477,9 +17185,6 @@ async def cmd_forward(msg: Message, cmd_name: str = 'перед'):
 
 
 # ==================== Репутация ====================
-
-pending_reputation_actions: Dict[str, dict] = {}
-
 
 def _reputation_direction_state(value: object, now: float) -> dict:
     if not isinstance(value, dict):
@@ -13574,17 +17279,22 @@ async def give_reputation(
     msg: Message,
     remove: bool = False,
     *,
-    confirmed: bool = False,
     reply_on_success: bool = True,
+    giver_id: Optional[int] = None,
+    receiver_id: Optional[int] = None,
 ) -> Optional[int]:
     """Начисляет или снимает один балл репутации."""
     try:
-        giver_id = msg.from_user.id
+        giver_id = giver_id if giver_id is not None else (
+            msg.from_user.id if msg.from_user else None
+        )
         receiver_user = msg.reply_to_message.from_user if msg.reply_to_message else None
-        if not receiver_user:
+        receiver_id = receiver_id if receiver_id is not None else (
+            receiver_user.id if receiver_user else None
+        )
+        if giver_id is None or receiver_id is None:
             await msg.answer("❌ Не удалось определить пользователя, которому меняется репутация.")
             return None
-        receiver_id = receiver_user.id
 
         giver = storage.get_user(msg.chat.id, giver_id, use_cache=False)
         receiver = storage.get_user(msg.chat.id, receiver_id, use_cache=False)
@@ -13593,7 +17303,6 @@ async def give_reputation(
         today = kaliningrad_now().strftime('%Y-%m-%d')
         action = 'Снижение репутации' if remove else 'Выдача репутации'
         daily_limit = REPUTATION_REMOVE_DAILY_LIMIT if remove else REPUTATION_DAILY_LIMIT
-        last_action_key = 'last_rep_removed_time_by_target' if remove else 'last_rep_time_by_target'
         daily_actions_key = 'rep_removed_today' if remove else 'rep_given_today'
         reply_to_receiver = "снимали" if remove else "повышали"
 
@@ -13613,7 +17322,7 @@ async def give_reputation(
             action_label = "-реп (снять 1 балл)" if remove else "+реп (добавить 1 балл)"
             msg_text = (
                 f"⏳ <b>Кулдаун на {action_label}</b>\n"
-                f"Следующее изменение репутации можно подтвердить через "
+                f"Следующее изменение репутации будет доступно через "
                 f"<b>{_format_reputation_wait(remaining)}</b>.\n"
                 f"Сейчас пауза — {_format_reputation_wait(cooldown)}; она растёт при частых действиях."
             )
@@ -13649,38 +17358,6 @@ async def give_reputation(
             await msg.answer(f"⭐ Вы уже {reply_to_receiver} репутацию этому пользователю сегодня.")
             return None
 
-        if not confirmed:
-            for token, pending in list(pending_reputation_actions.items()):
-                if now - pending.get('created_at', 0) > REPUTATION_CONFIRMATION_TTL:
-                    pending_reputation_actions.pop(token, None)
-
-            token = uuid.uuid4().hex
-            pending_reputation_actions[token] = {
-                'created_at': now,
-                'chat_id': msg.chat.id,
-                'giver_id': giver_id,
-                'receiver_id': receiver_id,
-                'remove': remove,
-                'source_message': msg,
-            }
-            action_text = 'снять 1 балл репутации у' if remove else 'добавить 1 балл репутации'
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text='✅ Подтвердить', callback_data=f'repconfirm:yes:{token}'),
-                InlineKeyboardButton(text='✖️ Отмена', callback_data=f'repconfirm:no:{token}'),
-            ]])
-            try:
-                await msg.answer(
-                    f"⚠️ <b>Подтвердите действие</b>\n"
-                    f"Вы хотите {action_text} {mention(msg.chat.id, receiver_id)}?\n"
-                    "Репутация изменится только после нажатия кнопки. Подтверждение действует 3 минуты.",
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pending_reputation_actions.pop(token, None)
-                raise
-            return None
-
         current_reputation = receiver.get('reputation', 0)
         receiver['reputation'] = current_reputation - 1 if remove else current_reputation + 1
         logger.info(
@@ -13692,11 +17369,6 @@ async def give_reputation(
         )
 
         # Обновляем данные дающего
-        cooldowns = giver.get(last_action_key, {})
-        if not isinstance(cooldowns, dict):
-            cooldowns = {}
-        cooldowns[str(receiver_id)] = now
-        giver[last_action_key] = cooldowns
         direction_state['count'] = min(64, direction_state['count'] + 1)
         direction_state['last_at'] = now
         cooldown_state['last_activity_at'] = now
@@ -13741,75 +17413,108 @@ async def give_reputation(
         return None
 
 
-@router.callback_query(F.data.startswith('repconfirm:'))
-async def reputation_confirmation_callback(call: CallbackQuery):
-    if not call.from_user or not call.message:
-        await call.answer()
-        return
-    try:
-        _, action, token = call.data.split(':', 2)
-    except (AttributeError, TypeError, ValueError):
-        await call.answer('Эта кнопка больше не действует.', show_alert=True)
-        return
-    if action not in {'yes', 'no'}:
-        await call.answer('Неизвестное действие.', show_alert=True)
-        return
+# ==================== Проверка наказаний ====================
 
-    pending = pending_reputation_actions.get(token)
-    if not pending:
-        await call.answer('Подтверждение уже недоступно. Отправьте реакцию ещё раз.', show_alert=True)
+async def process_captcha_pending(now: float) -> None:
+    pending_all = storage.data.get('captcha_pending', {})
+    if not isinstance(pending_all, dict):
+        logger.error("Некорректное хранилище ожидающих проверок капчи")
         return
-    if pending.get('chat_id') != call.message.chat.id:
-        await call.answer('Эта кнопка относится к другому чату.', show_alert=True)
-        return
-    if time.time() - pending.get('created_at', 0) > REPUTATION_CONFIRMATION_TTL:
-        if call.from_user.id != pending.get('giver_id'):
-            await call.answer('Подтвердить это действие может только его автор.', show_alert=True)
-            return
-        pending_reputation_actions.pop(token, None)
-        await call.message.edit_text(
-            '⌛ <b>Подтверждение истекло.</b>\nОтправьте реакцию ещё раз, чтобы создать новый запрос.',
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
-        )
-        await call.answer('Подтверждение истекло. Отправьте реакцию ещё раз.', show_alert=True)
-        return
-    if call.from_user.id != pending.get('giver_id'):
-        await call.answer('Подтвердить это действие может только его автор.', show_alert=True)
-        return
+    changed = False
+    for chat_id_text, pending_chat in list(pending_all.items()):
+        if not isinstance(pending_chat, dict):
+            logger.warning("Некорректная очередь капчи в чате %s", chat_id_text)
+            pending_all.pop(chat_id_text, None)
+            changed = True
+            continue
+        try:
+            chat_id = int(chat_id_text)
+        except (TypeError, ValueError):
+            logger.warning("Некорректный идентификатор чата в очереди капчи: %r", chat_id_text)
+            pending_all.pop(chat_id_text, None)
+            changed = True
+            continue
+        for user_id_text, pending in list(pending_chat.items()):
+            if not isinstance(pending, dict):
+                pending_chat.pop(user_id_text, None)
+                changed = True
+                continue
+            expires_at = pending.get('expires_at')
+            retry_at = pending.get('next_retry_at', 0)
+            if not isinstance(expires_at, (int, float)) or not isinstance(retry_at, (int, float)):
+                logger.warning("Некорректная запись капчи для %s в чате %s", user_id_text, chat_id)
+                pending_chat.pop(user_id_text, None)
+                changed = True
+                continue
+            if now < retry_at or (now < expires_at and not pending.get('verified')):
+                continue
+            try:
+                user_id = int(user_id_text)
+                member = await bot.get_chat_member(chat_id, user_id)
+                if member.status in ('left', 'kicked', 'administrator', 'creator'):
+                    pending_chat.pop(user_id_text, None)
+                    changed = True
+                    continue
+                if pending.get('verified'):
+                    await restore_chat_default_permissions(chat_id, user_id)
+                else:
+                    if await bot_can(chat_id, 'can_restrict_members') is not True:
+                        raise RuntimeError("У бота нет права ограничивать участников")
+                    await bot.ban_chat_member(chat_id, user_id, revoke_messages=False)
+                    await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+                    log_moderation(chat_id, None, user_id, 'kick', 'Капча не пройдена')
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"🚪 Участник с ID <code>{user_id}</code> удалён: капча не пройдена.",
+                        )
+                    except (TelegramAPIError, asyncio.TimeoutError) as notice_exc:
+                        logger.debug("Не удалось уведомить чат %s о кике по капче: %s", chat_id, notice_exc)
+                pending_chat.pop(user_id_text, None)
+                changed = True
+            except (TelegramAPIError, asyncio.TimeoutError, RuntimeError, ValueError) as exc:
+                failures = pending.get('failures', 0)
+                failures = failures if isinstance(failures, int) and failures >= 0 else 0
+                failures += 1
+                pending['failures'] = failures
+                pending['next_retry_at'] = now + min(86400, MUTE_CHECK_INTERVAL * (2 ** min(failures, 10)))
+                changed = True
+                logger.warning(
+                    "Не удалось завершить капчу для %s в чате %s (попытка %s): %s",
+                    user_id_text, chat_id, failures, exc,
+                )
+        if not pending_chat:
+            pending_all.pop(chat_id_text, None)
+            changed = True
+    if changed:
+        storage.mark_dirty()
+        await storage.save()
 
-    pending_reputation_actions.pop(token, None)
-    empty_keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-    if action == 'no':
-        await call.message.edit_text(
-            '✖️ <b>Изменение репутации отменено.</b>',
-            reply_markup=empty_keyboard,
-        )
-        await call.answer()
+
+async def process_expired_chat_freezes(now: float) -> None:
+    chat_settings = storage.data.get('chat_settings', {})
+    if not isinstance(chat_settings, dict):
         return
-    total_reputation = await give_reputation(
-        pending['source_message'],
-        remove=pending['remove'],
-        confirmed=True,
-        reply_on_success=False,
-    )
-    if total_reputation is None:
-        result_text = (
-            '⚠️ <b>Изменение не выполнено.</b>\n'
-            'Возможно, за это время изменился кулдаун или дневной лимит.'
-        )
-    else:
-        change = '-1' if pending['remove'] else '+1'
-        result_text = (
-            f"⭐ {change} {mention(call.message.chat.id, pending['receiver_id'])}\n"
-            f"📊 Репутация: {total_reputation}"
-        )
-    await call.message.edit_text(result_text, reply_markup=empty_keyboard)
-    await call.answer()
+    for chat_id_text, settings in list(chat_settings.items()):
+        if not isinstance(settings, dict):
+            continue
+        freeze_state = settings.get('chat_freeze')
+        if not isinstance(freeze_state, dict):
+            continue
+        expires_at = freeze_state.get('expires_at')
+        retry_at = freeze_state.get('next_retry_at', 0)
+        if not isinstance(expires_at, (int, float)) or not isinstance(retry_at, (int, float)):
+            logger.error("Некорректная заморозка в чате %s", chat_id_text)
+            continue
+        if now < expires_at or now < retry_at:
+            continue
+        try:
+            await restore_chat_freeze(int(chat_id_text))
+        except (TelegramAPIError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning("Не удалось восстановить разрешения чата %s: %s", chat_id_text, exc)
 
 
-# ==================== Проверка мутов ====================
-
-async def check_mutes():
+async def check_punishments():
     while True:
         await asyncio.sleep(MUTE_CHECK_INTERVAL)
         try:
@@ -13852,6 +17557,19 @@ async def check_mutes():
                         removed_any = True
                         try:
                             user_id = int(m['user_id'])
+                            issued_at = m.get('issued_at')
+                            duration_seconds = (
+                                max(0, m['expire_time'] - issued_at)
+                                if isinstance(issued_at, (int, float)) else None
+                            )
+                            log_moderation(
+                                int(cid),
+                                None,
+                                user_id,
+                                'unmute',
+                                f"Срок мута истёк: {m.get('reason') or 'Без причины'}",
+                                duration_seconds,
+                            )
                             is_anti_spam_mute = (
                                 m.get('mute_source') == 'anti_spam'
                                 or str(m.get('reason') or '').startswith('Антиспам:')
@@ -13925,8 +17643,61 @@ async def check_mutes():
                 if removed_any:
                     storage.mark_dirty()
                     await storage.save()
+
+            bans_by_chat = storage.data.get('banned_users', {})
+            if isinstance(bans_by_chat, dict):
+                for cid, bans in list(bans_by_chat.items()):
+                    if not isinstance(bans, list):
+                        continue
+                    changed = False
+                    for ban in list(bans):
+                        if (
+                            not isinstance(ban, dict)
+                            or not isinstance(ban.get('user_id'), int)
+                            or ban.get('permanent') is True
+                            or not isinstance(ban.get('expire_time'), (int, float))
+                            or now < ban['expire_time']
+                            or (
+                                isinstance(ban.get('next_unban_retry_at'), (int, float))
+                                and now < ban['next_unban_retry_at']
+                            )
+                        ):
+                            continue
+                        try:
+                            await bot.unban_chat_member(
+                                int(cid), ban['user_id'], only_if_banned=True
+                            )
+                        except Exception as e:
+                            failures = ban.get('unban_failures', 0)
+                            failures = (failures if isinstance(failures, int) else 0) + 1
+                            ban['unban_failures'] = failures
+                            ban['next_unban_retry_at'] = now + min(
+                                86400,
+                                MUTE_CHECK_INTERVAL * (2 ** min(failures, 10)),
+                            )
+                            changed = True
+                            logger.warning(
+                                "Не удалось снять истёкший бан пользователя %s в чате %s "
+                                "(попытка %s): %s",
+                                ban['user_id'], cid, failures, e
+                            )
+                        else:
+                            bans.remove(ban)
+                            log_moderation(
+                                int(cid),
+                                None,
+                                ban['user_id'],
+                                'unban',
+                                f"Срок временного бана истёк: {ban.get('reason') or 'Без причины'}",
+                            )
+                            changed = True
+                    if changed:
+                        storage.mark_dirty()
+                        await storage.save()
+            await process_captcha_pending(now)
+            await process_expired_chat_freezes(now)
         except Exception as e:
-            logger.error(f"Ошибка проверки мутов: {e}")
+            logger.error(f"Ошибка проверки наказаний: {e}")
 
 
 # ==================== Автосохранение ====================
@@ -13943,29 +17714,343 @@ async def auto_save_task():
 
 # ==================== Команды с префиксом ! ====================
 
+@router.edited_message()
+async def handle_edited_message_anti_spam(msg: Message):
+    await handle_anti_spam(msg)
+
+
+@router.chat_join_request()
+async def handle_chat_join_request(request):
+    chat_id = request.chat.id
+    settings = storage.get_chat_settings(chat_id)
+    mode = settings.get('join_request_mode', 'off')
+    if mode == 'off':
+        return
+    if mode not in {'on', 'admin'}:
+        logger.warning("Неизвестный режим заявок в чате %s: %r", chat_id, mode)
+        return
+    if (await bot_can(chat_id, 'can_invite_users')) is not True:
+        return
+
+    user = request.from_user
+    if mode == 'on':
+        try:
+            await bot.approve_chat_join_request(chat_id, user.id)
+        except (TelegramAPIError, asyncio.TimeoutError) as exc:
+            logger.warning("Не удалось автоматически одобрить заявку %s в чате %s: %s", user.id, chat_id, exc)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text='✅ Одобрить',
+            callback_data=f'joinreq:approve:{chat_id}:{user.id}',
+        ),
+        InlineKeyboardButton(
+            text='❌ Отклонить',
+            callback_data=f'joinreq:decline:{chat_id}:{user.id}',
+        ),
+    ]])
+    try:
+        await bot.send_message(
+            chat_id,
+            f"📨 Запрос на вступление от {mention(chat_id, user)} "
+            f"(ID <code>{user.id}</code>).",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось уведомить чат %s о заявке %s: %s", chat_id, user.id, exc)
+
+
+@router.callback_query(F.data.startswith('joinreq:'))
+async def handle_join_request_decision(call: CallbackQuery):
+    parts = (call.data or '').split(':')
+    if len(parts) != 4 or parts[1] not in {'approve', 'decline'}:
+        return await call.answer("Некорректная заявка.", show_alert=True)
+    try:
+        chat_id = int(parts[2])
+        user_id = int(parts[3])
+    except ValueError:
+        return await call.answer("Некорректная заявка.", show_alert=True)
+    if not call.message or call.message.chat.id != chat_id:
+        return await call.answer("Заявка не относится к этому чату.", show_alert=True)
+    if not await is_telegram_admin(chat_id, call.from_user.id):
+        return await call.answer("Решать заявки могут только Telegram-администраторы.", show_alert=True)
+    if (await bot_can(chat_id, 'can_invite_users')) is not True:
+        return await call.answer("У бота нет права управлять заявками.", show_alert=True)
+
+    action = parts[1]
+    try:
+        if action == 'approve':
+            await bot.approve_chat_join_request(chat_id, user_id)
+        else:
+            await bot.decline_chat_join_request(chat_id, user_id)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось обработать заявку %s в чате %s: %s", user_id, chat_id, exc)
+        return await call.answer("Не удалось обработать заявку; проверьте, не была ли она уже закрыта.", show_alert=True)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.debug("Не удалось убрать кнопки заявки в чате %s: %s", chat_id, exc)
+    status_text = 'Заявка одобрена.' if action == 'approve' else 'Заявка отклонена.'
+    await call.answer(status_text)
+
+
+def captcha_signature(chat_id: int, user_id: int, expires_at: int) -> str:
+    payload = f"{chat_id}:{user_id}:{expires_at}".encode('ascii')
+    return hmac.new(BOT_TOKEN.encode('utf-8'), payload, hashlib.sha256).hexdigest()[:16]
+
+
+async def start_member_captcha(chat_id: int, member: User) -> bool:
+    if await bot_can(chat_id, 'can_restrict_members') is not True:
+        logger.error("Капча не запущена в чате %s: бот не может ограничивать участников", chat_id)
+        return False
+
+    expires_at = int(time.time()) + CAPTCHA_TTL_SECONDS
+    pending_all = storage.data.setdefault('captcha_pending', {})
+    pending_chat = pending_all.setdefault(str(chat_id), {})
+    if not isinstance(pending_chat, dict):
+        logger.error("Некорректное хранилище капчи для чата %s", chat_id)
+        return False
+    pending_chat[str(member.id)] = {
+        'expires_at': expires_at,
+        'verified': False,
+        'next_retry_at': 0,
+    }
+    storage.mark_dirty()
+    await storage.save()
+
+    try:
+        await bot.restrict_chat_member(
+            chat_id,
+            member.id,
+            ChatPermissions(can_send_messages=False),
+            until_date=expires_at,
+        )
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        pending_chat.pop(str(member.id), None)
+        if not pending_chat:
+            pending_all.pop(str(chat_id), None)
+        storage.mark_dirty()
+        await storage.save()
+        logger.warning("Не удалось ограничить нового участника %s в чате %s для капчи: %s", member.id, chat_id, exc)
+        return False
+
+    signature = captcha_signature(chat_id, member.id, expires_at)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text='Я человек',
+            callback_data=f'captcha:{member.id}:{expires_at}:{signature}',
+        )
+    ]])
+    try:
+        await bot.send_message(
+            chat_id,
+            f"🧩 {mention(chat_id, member)}, подтвердите, что вы человек, в течение 5 минут.",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось отправить капчу пользователю %s в чате %s: %s", member.id, chat_id, exc)
+        try:
+            await restore_chat_default_permissions(chat_id, member.id)
+        except (TelegramAPIError, asyncio.TimeoutError, RuntimeError) as restore_exc:
+            logger.error("Не удалось снять ограничение капчи с %s в чате %s: %s", member.id, chat_id, restore_exc)
+            pending_chat[str(member.id)]['verified'] = True
+            storage.mark_dirty()
+            await storage.save()
+            return False
+        pending_chat.pop(str(member.id), None)
+        if not pending_chat:
+            pending_all.pop(str(chat_id), None)
+        storage.mark_dirty()
+        await storage.save()
+        return False
+    return True
+
+
+@router.callback_query(F.data.startswith('captcha:'))
+async def handle_captcha_confirmation(call: CallbackQuery):
+    parts = (call.data or '').split(':')
+    if len(parts) != 4 or not call.message:
+        return await call.answer("Кнопка проверки некорректна.", show_alert=True)
+    try:
+        user_id, expires_at = int(parts[1]), int(parts[2])
+    except ValueError:
+        return await call.answer("Кнопка проверки некорректна.", show_alert=True)
+    chat_id = call.message.chat.id
+    expected_signature = captcha_signature(chat_id, user_id, expires_at)
+    if not hmac.compare_digest(parts[3], expected_signature):
+        return await call.answer("Подпись проверки недействительна.", show_alert=True)
+    if call.from_user.id != user_id:
+        return await call.answer("Пройти проверку может только новый участник.", show_alert=True)
+
+    pending_all = storage.data.get('captcha_pending', {})
+    pending_chat = pending_all.get(str(chat_id), {}) if isinstance(pending_all, dict) else {}
+    pending = pending_chat.get(str(user_id)) if isinstance(pending_chat, dict) else None
+    if not isinstance(pending, dict) or pending.get('expires_at') != expires_at:
+        return await call.answer("Проверка уже завершена или истекла.", show_alert=True)
+    if time.time() >= expires_at:
+        return await call.answer("Время проверки истекло.", show_alert=True)
+    if pending.get('verified'):
+        return await call.answer("Проверка уже пройдена.")
+
+    pending['verified'] = True
+    storage.mark_dirty()
+    await storage.save()
+    try:
+        await restore_chat_default_permissions(chat_id, user_id)
+    except (TelegramAPIError, asyncio.TimeoutError, RuntimeError) as exc:
+        logger.warning("Капча пройдена, но права %s в чате %s не восстановлены: %s", user_id, chat_id, exc)
+        return await call.answer("Проверка пройдена; бот повторит восстановление прав.", show_alert=True)
+
+    pending_chat.pop(str(user_id), None)
+    if not pending_chat:
+        pending_all.pop(str(chat_id), None)
+    storage.mark_dirty()
+    await storage.save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.debug("Не удалось убрать кнопку капчи в чате %s: %s", chat_id, exc)
+    await call.answer("Проверка пройдена. Добро пожаловать!")
+
+
+async def record_automatic_warning(chat_id: int, actor_id: int, target_id: int, reason: str) -> None:
+    user_data = storage.get_user(chat_id, target_id)
+    warnings = user_data.setdefault('warnings', [])
+    if not isinstance(warnings, list):
+        logger.error("Некорректный список предупреждений пользователя %s в чате %s", target_id, chat_id)
+        return
+    warnings.append({
+        'reason': reason,
+        'date': time.time(),
+        'expire_date': (datetime.now() + timedelta(days=DEFAULT_WARN_DAYS)).timestamp(),
+        'permanent': False,
+        'warned_by': actor_id,
+    })
+    log_moderation(chat_id, None, target_id, 'auto_warn', reason, DEFAULT_WARN_DAYS * 86400)
+    storage.mark_dirty()
+    await storage.save()
+
+
+async def handle_untrusted_bot_addition(msg: Message, new_member: User) -> bool:
+    adder = msg.from_user
+    if not adder:
+        return False
+    try:
+        adder_status = await bot.get_chat_member(msg.chat.id, adder.id)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось проверить добавившего бота %s в чате %s: %s", adder.id, msg.chat.id, exc)
+        return False
+    if adder_status.status in ('administrator', 'creator'):
+        return False
+    if await bot_can(msg.chat.id, 'can_restrict_members') is not True:
+        logger.error("Не удалось удалить добавленного бот-аккаунта %s из чата %s: нет прав", new_member.id, msg.chat.id)
+        return False
+    try:
+        await bot.ban_chat_member(msg.chat.id, new_member.id, revoke_messages=False)
+        await bot.unban_chat_member(msg.chat.id, new_member.id, only_if_banned=True)
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось удалить добавленного бот-аккаунта %s из чата %s: %s", new_member.id, msg.chat.id, exc)
+        return False
+    await record_automatic_warning(
+        msg.chat.id,
+        adder.id,
+        adder.id,
+        "Добавление бота без прав администратора Telegram",
+    )
+    log_moderation(
+        msg.chat.id,
+        None,
+        new_member.id,
+        'kick',
+        f"Бот добавлен пользователем {adder.id} без прав администратора",
+        target_label=new_member.username or new_member.first_name,
+    )
+    storage.mark_dirty()
+    await storage.save()
+    try:
+        await msg.answer(
+            f"⚠️ {mention(msg.chat.id, adder)} получил предупреждение за добавление бота без прав администратора."
+        )
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logger.warning("Не удалось уведомить чат %s о добавлении бота: %s", msg.chat.id, exc)
+    return True
+
+
+async def track_join_and_enable_raid(chat_id: int) -> None:
+    now = time.monotonic()
+    if len(join_event_times) > 1000:
+        stale_chats = [
+            cid for cid, timestamps in join_event_times.items()
+            if not timestamps or now - timestamps[-1] > RAID_WINDOW_SECONDS
+        ]
+        for cid in stale_chats:
+            join_event_times.pop(cid, None)
+    events = join_event_times.setdefault(chat_id, deque())
+    while events and now - events[0] > RAID_WINDOW_SECONDS:
+        events.popleft()
+    events.append(now)
+    if len(events) < RAID_JOIN_THRESHOLD:
+        return
+    settings = storage.get_chat_settings(chat_id)
+    if not settings.get('raid_mode'):
+        settings['raid_mode'] = True
+        storage.invalidate_chat_settings_cache(chat_id)
+        storage.mark_dirty()
+        await storage.save()
+        logger.warning("Автоантирейд включён в чате %s: %s входов за %s секунд", chat_id, len(events), RAID_WINDOW_SECONDS)
+    if isinstance(settings.get('chat_freeze'), dict):
+        return
+    retry_at = settings.get('raid_freeze_retry_at', 0)
+    if isinstance(retry_at, (int, float)) and time.time() < retry_at:
+        return
+    if await freeze_chat(chat_id, RAID_FREEZE_SECONDS):
+        settings.pop('raid_freeze_retry_at', None)
+    else:
+        settings['raid_freeze_retry_at'] = time.time() + MUTE_CHECK_INTERVAL
+        storage.mark_dirty()
+        await storage.save()
+        logger.error("Автоантирейд включён, но заморозить чат %s не удалось", chat_id)
+
+
 @router.message(F.new_chat_members)
 async def new_member_handler(msg: Message):
     """Приветствие новых участников"""
     cid = str(msg.chat.id)
-    settings = storage.data['welcome_settings'].get(cid, {})
-    if not settings.get('enabled', True):
-        return
+    welcome_settings = storage.data.get('welcome_settings', {}).get(cid, {})
+    chat_settings = storage.get_chat_settings(msg.chat.id)
 
     for new_member in msg.new_chat_members:
         if new_member.is_bot:
+            if new_member.id != bot.id and msg.chat.type in ('group', 'supergroup'):
+                await handle_untrusted_bot_addition(msg, new_member)
             continue
         if new_member.id == bot.id:
             continue
 
+        if msg.chat.type in ('group', 'supergroup'):
+            try:
+                await track_join_and_enable_raid(msg.chat.id)
+            except (TelegramAPIError, asyncio.TimeoutError) as exc:
+                logger.warning("Не удалось включить автоантирейд для чата %s: %s", msg.chat.id, exc)
+            chat_settings = storage.get_chat_settings(msg.chat.id, use_cache=False)
+            if chat_settings.get('captcha_enabled') or chat_settings.get('raid_mode'):
+                await start_member_captcha(msg.chat.id, new_member)
+
+        if not welcome_settings.get('enabled', True):
+            continue
         name = mention(msg.chat.id, new_member)
-        text = settings.get('text')
+        text = welcome_settings.get('text')
         if text:
             text = text.replace('{name}', name).replace('{имя}', name)
         else:
             text = f"👋 Добро пожаловать, {name}!"
 
         try:
-            image_url = settings.get('image_url')
+            image_url = welcome_settings.get('image_url')
             if image_url:
                 try:
                     await bot.send_photo(msg.chat.id, photo=image_url, caption=text)
@@ -13976,6 +18061,7 @@ async def new_member_handler(msg: Message):
         except Exception:
             pass
 
+    if welcome_settings.get('enabled', True):
         try:
             await msg.delete()
         except Exception:
@@ -14044,8 +18130,12 @@ async def setup_bot_commands():
 # ==================== Запуск ====================
 
 async def main():
+    global shutdown_event
     logger.info("🐻 Обкуренный Валера v3.0 запускается...")
+    if TRACEMALLOC_ENABLED and not tracemalloc.is_tracing():
+        tracemalloc.start(10)
     loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=4, thread_name_prefix='valerka'))
     shutdown_event = asyncio.Event()
 
     def request_shutdown(signum, frame):
@@ -14056,11 +18146,21 @@ async def main():
 
     await setup_bot_commands()
     service_tasks = [
-        spawn_background_task(check_mutes()),
+        spawn_background_task(check_punishments()),
         spawn_background_task(auto_save_task()),
         spawn_background_task(cleanup_games()),
+        spawn_background_task(birthday_notifications_task()),
     ]
-    polling_task = spawn_background_task(dp.start_polling(bot, handle_signals=False))
+    allowed_updates = dp.resolve_used_update_types()
+    if 'chat_join_request' not in allowed_updates:
+        allowed_updates.append('chat_join_request')
+    polling_task = spawn_background_task(
+        dp.start_polling(
+            bot,
+            handle_signals=False,
+            allowed_updates=allowed_updates,
+        )
+    )
     shutdown_task = spawn_background_task(shutdown_event.wait())
     try:
         done, _ = await asyncio.wait(
